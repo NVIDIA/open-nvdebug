@@ -164,8 +164,6 @@ Desktop.ini
 # Application-specific
 *.log
 logs/
-*.xlsx
-*.xls
 output/
 results/
 reports/
