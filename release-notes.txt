@@ -1,0 +1,6 @@
+Oct 24, 2025
+===================
+
+nvdebug version 2.0.0
+
+-  Initial release of open-nvdebug
