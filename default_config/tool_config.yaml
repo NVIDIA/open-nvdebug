@@ -1,0 +1,290 @@
+# Open NVDebug Tool Configuration
+# This file contains tool-wide configuration settings overrides.
+
+# Basic configuration
+# Server Baseboard Type
+# The accepted values are as follows can be found by running the command ./nvdebug list-baseboard
+# --------------------------------------------------------------
+# baseboard: ""
+
+# The collection level can be set to L1, L2, or L3 either here or via the CLI --level
+# collection_level: "L1"  # L1, L2, L3
+
+# The execution mode can be set to Local or RemoteClient either here or within the DUT config file 
+# itself in DUTDefaults anchor or within a DUT object.
+# --------------------------------------------------------------
+# execution_mode: "RemoteClient"  # Local, RemoteClient
+
+# Pagination configuration
+# Maximum pages for Redfish pagination to prevent infinite loops
+# --------------------------------------------------------------
+# max_pagination_pages: 100
+
+# Maximum consecutive duplicate URLs before stopping pagination
+# --------------------------------------------------------------
+# max_duplicate_url_retries: 3
+
+# Output configuration
+#   directory: The directory to store the output, default is /tmp/nvdebug, you can set via cli --outdir
+#   create_zip: Whether to create a zip file of the output, default is true, you can set via cli --skipzip to disable as well
+#   create_split_zip: Whether to create a split zip file of the output, default is true, you can set via cli --skipzipsplit to disable as well
+#   zip_split_threshold: The threshold in MB for splitting the zip file, default is 200.0, you can set via cli --zipsplit_threshold
+#   generate_html: Whether to generate a html report of the output, default is true, you can set via cli --skip_html_reports to disable as well
+#                  Note: The legacy field GENERATE_HTML_REPORTS is still supported for backward compatibility
+# --------------------------------------------------------------
+# * Be sure to uncomment the entire output block to use it.
+# --------------------------------------------------------------
+# output:
+#   directory: "/tmp/nvdebug"
+#   create_zip: true
+#   create_split_zip: true
+#   zip_split_threshold: 200.0  # MB
+#   generate_html: true 
+
+# Log sanitization
+#   enabled: Whether to enable log sanitization, default is true, you can set via cli --skip-sanitization to disable as well
+#            Note: The legacy field LogSanitization is still supported for backward compatibility
+# --------------------------------------------------------------
+# * Be sure to uncomment the entire sanitization block to use it.
+# --------------------------------------------------------------
+# sanitization:
+#   enabled: true # default is true, you can set via cli --skip-sanitization to disable as well
+
+# Redfish URI Configuration
+#   prefix_override: Global prefix override for Redfish URIs (optional)
+#   default_uris: Default URI mappings for Redfish endpoints
+# --------------------------------------------------------------
+# * Be sure to uncomment the entire uri_overrides block to use it.
+# --------------------------------------------------------------
+# uri_overrides:
+#   # Global prefix override (optional)
+#   # prefix_override: "/custom/redfish/v1"
+#   
+#   # Default URI mappings (proper case from ResourceType enum)
+#   default_uris:
+#     Systems: "/redfish/v1/Systems"
+#     Chassis: "/redfish/v1/Chassis"
+#     Managers: "/redfish/v1/Managers"
+#     UpdateService: "/redfish/v1/UpdateService"
+#     TaskService: "/redfish/v1/TaskService"
+#     EventService: "/redfish/v1/EventService"
+#     SessionService: "/redfish/v1/SessionService"
+#     AccountService: "/redfish/v1/AccountService"
+#     FirmwareInventory: "/redfish/v1/UpdateService/FirmwareInventory"
+#     SoftwareInventory: "/redfish/v1/UpdateService/SoftwareInventory"
+
+# Redfish session configuration
+#   connection_pool_limit: Total connection pool size for parallel operations
+#   connection_pool_limit_per_host: Connections per host (BMC-friendly)
+#   session_timeout: Session timeout in seconds
+#   keepalive_timeout: Keep connections alive for this duration
+#   ssl: SSL verification (false for BMC self-signed certs)
+#   ttl_dns_cache: DNS cache TTL in seconds
+#   use_dns_cache: Enable DNS caching
+#   force_close: Keep connections alive (false recommended)
+#   enable_cleanup_closed: Clean up closed connections
+#   fallback_connection_pool_limit: Fallback connection pool size (more conservative)
+#   fallback_connection_pool_limit_per_host: Fallback connections per host
+# --------------------------------------------------------------
+# * Be sure to uncomment the entire redfish_session_config block to use it.
+# --------------------------------------------------------------
+# redfish_session_config:
+#   # Connection pool settings
+#   connection_pool_limit: 20          # Total connection pool size
+#   connection_pool_limit_per_host: 8  # Connections per host (BMC-friendly)
+#
+#   # Timeout settings
+#   session_timeout: 300               # Session timeout in seconds (5 minutes)
+#   keepalive_timeout: 300             # Keep connections alive for this duration
+#
+#   # TCP Connector settings
+#   ssl: false                         # Disable SSL verification (BMC self-signed certs)
+#   ttl_dns_cache: 300                 # DNS cache TTL in seconds
+#   use_dns_cache: true                # Enable DNS caching
+#   force_close: false                 # Keep connections alive
+#   enable_cleanup_closed: true        # Clean up closed connections
+#
+#   # Session conflict handling
+#   handle_session_conflicts: true     # Enable automatic session conflict detection and recovery
+#
+#   # Fallback session settings (more conservative)
+#   fallback_connection_pool_limit: 15
+#   fallback_connection_pool_limit_per_host: 6
+
+# Preflight credential validation configuration
+#   validate_credentials_in_preflight: Enable/disable credential validation during preflight checks
+#                                      Default is true. When enabled, preflight will test an authenticated
+#                                      endpoint to verify credentials work, not just that the service is up.
+#   credential_validation_uri: The Redfish URI to test for credential validation
+#                             Default is "/redfish/v1/Systems" which requires authentication on most BMCs.
+#                             Alternative options: "/redfish/v1/Managers", "/redfish/v1/Chassis"
+#                             Note: /redfish/v1 (root) often doesn't require auth, so it's not suitable
+#                                   for credential validation.
+# --------------------------------------------------------------
+# * Be sure to uncomment the entire preflight_config block to use it.
+# --------------------------------------------------------------
+# preflight_config:
+#   validate_credentials_in_preflight: true
+#   credential_validation_uri: "/redfish/v1/Systems"
+
+# Global Directory and Prefix Configuration
+#   TASK_ID_PREFIX: Prefix for task IDs (empty by default, only used if user specifies)
+#   TOOL_TEMP_DIR: Tool temporary directory for operations
+#   BMC_TEMP_DIR: BMC temporary directory for operations
+# --------------------------------------------------------------
+# * Be sure to uncomment the entire block to use it.
+# --------------------------------------------------------------
+# TASK_ID_PREFIX: ""  # Empty by default, only used if user specifies
+# TOOL_TEMP_DIR: "/tmp"  # Tool temporary directory
+# BMC_TEMP_DIR: "/tmp"  # BMC temporary directory
+
+# Skip Flags (Global defaults - can be overridden per-DUT)
+# These flags control which collector groups to skip globally
+# --------------------------------------------------------------
+SKIP_PORT_FW: false
+SKIP_BMC_SSH_LOGS: true
+SKIP_HOST_LOGS: false
+SKIP_IPMI_LOGS: false
+SKIP_REDFISH_OOB_LOGS: false
+
+# Skip Flags (Global defaults - can be overridden per-DUT)
+# These provide more granular control over what to skip
+# --------------------------------------------------------------
+# COLLECTOR_TO_SKIP: This is a list of specific collector IDs to skip, if the
+#                    collector ID is in this list, the collector will be skipped
+#                    Example: COLLECTOR_TO_SKIP: ["R1", "R2"]
+# SYSTEM_ID_TO_SKIP: This is a list of system IDs to skip during collection
+#                    if the system ID is in this list, the system will be skipped
+#                    Example: SYSTEM_ID_TO_SKIP: ["System-1", "System-2"]
+# CHASSIS_ID_TO_SKIP: This is a list of chassis IDs to skip during collection
+#                    if the chassis ID is in this list, the chassis will be skipped
+#                    Example: CHASSIS_ID_TO_SKIP: ["Chassis-1", "Chassis-2"]
+# MANAGER_ID_TO_SKIP: This is a list of manager IDs to skip during collection
+#                    if the manager ID is in this list, the manager will be skipped
+#                    Example: MANAGER_ID_TO_SKIP: ["Manager-1", "Manager-2"]
+# --------------------------------------------------------------
+# * Be sure to uncomment the entire block to use it.
+# --------------------------------------------------------------
+# COLLECTOR_TO_SKIP: []
+# SYSTEM_ID_TO_SKIP: []
+# CHASSIS_ID_TO_SKIP: []
+# MANAGER_ID_TO_SKIP: []
+
+# Expand Query Fields (Global defaults - can be overridden per-DUT)
+# These control the expansion level for various Redfish queries
+# --------------------------------------------------------------
+EXPAND_QUERY_CHASSIS_LEVEL: 1
+EXPAND_QUERY_FIRMWARE_INVENTORY_LEVEL: 1
+EXPAND_QUERY_MANAGER_LEVEL: 1
+EXPAND_QUERY_SYSTEM_LEVEL: 1
+
+# Timeout Fields (Global defaults - can be overridden per-DUT)
+# These control timeouts for various operations
+# --------------------------------------------------------------
+# NVOS_TECH_DUMP_TIMEOUT: 450
+# REDFISH_DUMP_TIMEOUT: 300
+# REDFISH_DEVICE_DUMP_SLEEP_DURATION: 5
+
+# I2C Configuration
+# --------------------------------------------------------------
+# This is the default i2c config for the BMC, it will override the baseboard definition in the 
+# Telemetry Catalog spreadsheet.
+# --------------------------------------------------------------
+# * Be sure to uncomment the entire block to use it.
+# --------------------------------------------------------------
+# i2c_config:
+#   # I2C Bus Numbers
+#   HGX_I2C1_BUS_ADDRESS: "11"
+#   HGX_I2C2_BUS_ADDRESS: "12"
+#   # FPGA Register Table Addresses (Bus 11)
+#   FPGA_REGISTER_TABLE_ADDRESS: "0x0b"
+#   FPGA_SECONDARY_REGISTER_TABLE_ADDRESS: "0x31"
+#   # FPGA AER Table Address (Bus 12)
+#   FPGA_AER_TABLE_ADDRESS: "0x0a"
+#   # HMC Device Address (Bus 11) - This is the actual Virtual EEPROM
+#   HMC_I2C_ADDRESS: "0x54"
+#   VIRTUAL_EEPROM_BUS: "11"
+#   VIRTUAL_EEPROM_ADDR: "0x54"
+#   # Power Management Device (Not present on this BMC)
+#   HGX_I2CTRANSFER_BUS_ADDRESS: "1"
+#   HGX_I2CTRANSFER_WRITE_TO_ADDRESS: "0x28"
+#   # FPGA/SMBPBI Device Address (Bus 12)
+#   FPGA_SMBPBI_ADDRESS: "0x60"
+
+# Firmware Inventory Table Properties
+# --------------------------------------------------------------
+# * Be sure to uncomment the entire block to use it.
+# --------------------------------------------------------------
+# FW_INVENTORY_TABLE_PROPERTIES:
+#   - "Id"
+# #   - "Description"
+# #   - "Manufacturer"
+# #   - "Name"
+# #   - "SoftwareId"
+#   - "Version"
+# #   - "WriteProtected"
+#   - "Updateable"
+
+# NVLink OOB URI
+# --------------------------------------------------------------
+# This is a list of NVLink OOB URIs to be collected.
+# List URIs to be collected for NVLinks, eg. NVL5. If empty, we collect System Event Logs
+# Default URIs below are arbitrary and must be changed to URIs that are relevant to the DUT.
+# --------------------------------------------------------------
+# * Be sure to uncomment the entire block to use it.
+# --------------------------------------------------------------
+# NVLINK_OOB_URI:
+#   - "/redfish/v1/SomeResource/SubResource"
+#   - "/redfish/v1/SomeResource/SubResource2"
+#   - "/redfish/v1/SomeResource/SubResource3"
+
+# Additional OOB URI Collection
+# --------------------------------------------------------------
+# This is a list of additional Redfish URIs to be collected.
+# Default URIs below are arbitrary and must be changed to URIs that are relevant to the DUT.
+# --------------------------------------------------------------
+# * Be sure to uncomment the entire block to use it.
+# --------------------------------------------------------------
+# ADDITIONAL_OOB_URI_COLLECTION:
+#   - "/redfish/v1/SomeResource/SubResource"
+#   - "/redfish/v1/SomeResource/SubResource2"
+#   - "/redfish/v1/SomeResource/SubResource3"
+
+# Custom Dump Services
+# --------------------------------------------------------------
+# This is a list of custom dump services to be collected.
+# Default services below are arbitrary and must be changed to services that are relevant to the DUT.
+# --------------------------------------------------------------
+# * Be sure to uncomment the entire block to use it.
+# --------------------------------------------------------------
+# CUSTOM_DUMP_SERVICES:
+#   - uri: "/redfish/v1/Systems/System_0/LogServices/DumpLogs/Actions/LogService.CollectDiagnosticData"
+#     payload:
+#       DiagnosticDataType: OEM
+#       OEMDiagnosticDataType: SystemDiagnostic
+#     timeout: 1500
+
+# Post Code URI Configuration
+# --------------------------------------------------------------
+# Post Codes configuration
+# Custom PostCodes URI patterns (overrides default PostCodes/Entries)
+# Can be a string or list of strings
+# Supports {system_id} variable substitution
+# Examples:
+#   - "/redfish/v1/Systems/{system_id}/LogServices/CurrentBIOSPostCodes/Entries"
+#   - "/redfish/v1/Systems/{system_id}/LogServices/PreviousBIOSPostCodes/Entries"
+# --------------------------------------------------------------
+# * Be sure to uncomment the entire block to use it.
+# --------------------------------------------------------------
+# POST_CODES_URI: 
+#   - "/redfish/v1/Systems/{system_id}/LogServices/CurrentBIOSPostCodes/Entries"
+#   - "/redfish/v1/Systems/{system_id}/LogServices/PreviousBIOSPostCodes/Entries"
+
+# NVIDIA Bug Report Settings (H11)
+# --------------------------------------------------------------
+# Enables additional log collection for H11 (nvidia-bug-report) when true.
+# This runs nvidia-bug-report.sh with --extra-system-data in addition to the
+# default safe/standard modes. Use with caution as it can hang some systems.
+# Can be overridden per-DUT in dut_config.yaml under DUT_Defaults or individual duts.
+# --------------------------------------------------------------
+# EXTRA_LOG_COLLECTION: true

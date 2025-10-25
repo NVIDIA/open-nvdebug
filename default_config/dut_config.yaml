@@ -1,0 +1,99 @@
+# Currently only supports same type of DUT with the same config file passed through -C option
+# Settings that are common among DUTs can be filled in DUT_Defaults.
+# DUT specific details like BMC IP, etc, can be overriden for each dut object
+DUT_Defaults: &dut_defaults ## User should not modify this line or add anything before this section
+  # Type of the DUT. Allowed options are Compute, SwitchTray and PowerShelf
+  NodeType: "Compute"
+  # Server Baseboard Type
+  # The accepted values are as follows can be found by running the command ./nvdebug list-baseboard
+  #
+  # baseboard: ""
+
+  # BMC IP address
+  # This can also be provided via CLI using the -i option
+  BMC_IP: ""
+
+  # BMC credentials
+  # This can also be provided via CLI using the -u and -p options respectively
+  BMC_USERNAME: ""
+  BMC_PASSWORD: ""
+
+  # BMC SSH Credentials
+  BMC_SSH_USERNAME: ""
+  BMC_SSH_PASSWORD: ""
+  # BMC_SSH_KEY_PATH: ""
+  # BMC_SSH_PASSWORDLESS: false
+  # BMC_SSH_PORT: 22
+
+  # HMC Configuration
+  # HMC_TCP_PORT: 80 # Default is 80, use 443 for HMC with SSL enabled, if provided, HMC_RF_PROTOCOL will be ignored.
+  # HMC_RF_PROTOCOL: "http" # Default is "http", use "https" for HMC with SSL enabled, if provided, HMC_TCP_PORT will be ignored. http defaults to port 80, https defaults to port 443
+
+  # Redfish credentials
+  # If not provided, it is assumed to be the same as the BMC credentials
+  RF_User: ""
+  RF_Pass: ""
+
+  # Port to be used for port forwarding
+  # To collect certain logs from HMC, port forwarding needs to be setup. NVDebug will setup port forwarding using the provided port
+  # If no port is provided below, the default port 18888 will be used
+  TUNNEL_TCP_PORT: ""
+  ipmi_cipher: "-C17"
+
+  # Host details for Host log collection
+  # If IP or credentials are not provided, NVDebug assumes it is running on the host
+  HOST_IP: ""
+  HOST_USERNAME: ""
+  HOST_PASSWORD: ""
+  # HOST_SSH_KEY_PATH: ""
+  # HOST_SSH_PASSWORDLESS: false # Assuming you have configured passwordless sudo, via sudoers. If you have not please either provide a keypath or a password 
+  # HOST_SSH_PORT: 22
+
+  # NVIDIA Bug Report Settings (H11)
+  # Enables additional log collection when set to true. This runs
+  # nvidia-bug-report.sh with --extra-system-data. Use only for deep
+  # diagnostics; may increase runtime or impact system stability.
+  EXTRA_LOG_COLLECTION: false
+
+  # Redfish info
+  RF_DEFAULT_PREFIX: "/redfish/v1" # Redfish service root. Default is "/redfish/v1"
+  RF_AUTH: true # Indicates if REST API authentication is required by the Redfish service. True by default
+  # RF_HMC_ACCESS_METHOD: HostBmcTcpPortForwarding # This is the default access method for HMC. Available options are: HostBmcTcpPortForwarding, HostBmcTcp, HmcTcpPortForwarding, HmcTcp
+
+  # Port forwarding configuration
+  # If set to true, the tool will use port forwarding to collect logs from HMC
+  # USE_PORT_FORWARDING: False
+  # When set to False, the tool expects port forwarding to be setup manually if a port is provided
+  # Set it to true to make the tool handle port forwarding setup
+  # SETUP_PORT_FORWARDING: False
+  # If set to true, the tool will clear any process on the ports defined via TUNNEL_TCP_PORT before setting up port forwarding
+  # FORCE_PORT_FW: False
+  # Port to be used for port forwarding
+  # If no port is provided below, the default port 18888 will be used
+  # TUNNEL_TCP_PORT: 18888
+  
+  # SSH tunnel configuration (for port forwarding)
+  # Local host to bind the tunnel to (default: localhost)
+  # TUNNEL_LOCAL_HOST: "localhost"
+  # SSH options for tunnel creation
+  # SSH_TUNNEL_OPTIONS: "-4 -o StrictHostKeyChecking=no -o LogLevel=ERROR -fNT"
+  # SSH command prefix (e.g., "sshpass -p" for password auth, or empty for key-based auth)
+  # SSH_TUNNEL_PREFIX: "sshpass -p"
+
+  # Specify whether the BMC/Host network is "ipv4" or "ipv6". Default is "ipv4"
+  IP_NETWORK: 'ipv4'
+
+# Create a dut object and inherit defaults.
+# For any specific config details, add them below <<: *dut_defaults
+# dut-1:
+#   <<: *dut_defaults
+#   baseboard: ""
+#   ConfigFileToUse: "<path to config file>"
+#   NodeType: "Compute"
+#   HOST_IP: ""
+#   HOST_USERNAME: ""
+#   HOST_PASSWORD: ""
+#   BMC_IP: ""
+#   BMC_USERNAME: ""
+#   BMC_PASSWORD: ""
+

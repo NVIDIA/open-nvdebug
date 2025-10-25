@@ -1,0 +1,30 @@
+# Core CLI framework
+typer>=0.9.0
+click>=8.1.0
+
+# Rich terminal output
+rich>=13.0.0
+
+# Data validation and configuration
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+
+# Data processing
+pandas>=1.5.0
+openpyxl>=3.1.0  # Required by pandas for Excel file support
+
+# Configuration files
+pyyaml>=6.0
+
+# Async HTTP client
+aiohttp>=3.8.0
+
+# SSH connections
+paramiko>=3.0.0
+asyncssh>=2.13.0
+
+# Async file operations
+aiofiles>=23.0.0
+
+# Table formatting
+tabulate>=0.9.0
