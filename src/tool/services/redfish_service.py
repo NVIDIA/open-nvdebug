@@ -21,32 +21,45 @@ enumeration, telemetry collection, and system management data via REST API.
 """
 
 import asyncio
+import base64
+import binascii
+import copy
+import csv
+import hashlib
 import json
 import logging
 import os
-import random
 import re
 import time
 import traceback
-from asyncio import Semaphore
-from datetime import datetime
+from asyncio import Lock, Semaphore
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
-
-from tabulate import tabulate
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, Union
 
 from ..utils.enums import ENTITY_URI_TO_PLACEHOLDER
-from ..utils.id_filtering import filter_ids, log_filtered_ids, should_skip_id
-from ..utils.temp_dir_config import create_temp_directory, get_bmc_temp_dir
+from ..utils.id_filtering import filter_ids, log_filtered_ids
+from ..utils.streaming import (
+    append_stream_window_to_filename,
+    format_redfish_stream_timestamp,
+    format_stream_window_component,
+    normalize_stream_window,
+)
 from ..utils.timeout_config import (
     get_collector_sleep_duration,
     get_collector_timeout,
     get_expand_level,
-    get_nvos_tech_dump_timeout,
 )
 from .base_service import BaseService
 
 logger = logging.getLogger(__name__)
+
+
+def validate_redfish_uri(uri, expected_host=None):
+    """Thin wrapper: lazy-imports from utils.validation to avoid circular dependency."""
+    from ..utils.validation import validate_redfish_uri as _impl
+
+    return _impl(uri, expected_host=expected_host)
 
 
 class RedfishService(BaseService):
@@ -76,6 +89,186 @@ class RedfishService(BaseService):
 
         # Per-DUT semaphores for limiting concurrent operations
         self._dut_semaphores = {}
+        self._redfish_request_captures: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._redfish_capture_locks: Dict[Tuple[str, str], Lock] = {}
+
+    def _get_tool_config_int(self, key: str, default: int) -> int:
+        """Read an integer from runtime tool_config with a safe fallback."""
+        tool_config = getattr(self.dut_manager, "tool_config", {}) or {}
+        try:
+            value = int(tool_config.get(key, default))
+            return value if value > 0 else default
+        except (TypeError, ValueError):
+            return default
+
+    def _get_redfish_request_capture_key(
+        self, dut_id: str, collector_id: Optional[str] = None
+    ) -> Optional[Tuple[str, str]]:
+        """Return the per-collector key used for Redfish request capture."""
+        resolved_collector_id = collector_id or self._get_current_collector_id()
+        if (
+            not dut_id
+            or not resolved_collector_id
+            or resolved_collector_id == "unknown"
+        ):
+            return None
+        return dut_id, resolved_collector_id
+
+    async def _start_redfish_request_capture(
+        self, dut_id: str, collector_id: Optional[str] = None
+    ) -> None:
+        """Initialize Redfish request capture for a collector execution."""
+        key = self._get_redfish_request_capture_key(dut_id, collector_id)
+        if key:
+            lock = self._redfish_capture_locks.setdefault(key, Lock())
+            async with lock:
+                self._redfish_request_captures[key] = {
+                    "captured_at": datetime.now(timezone.utc).isoformat(),
+                    "requests": [],
+                }
+
+    async def _clear_redfish_request_capture(
+        self, dut_id: str, collector_id: Optional[str] = None
+    ) -> None:
+        """Clear any pending Redfish request capture state."""
+        key = self._get_redfish_request_capture_key(dut_id, collector_id)
+        if key:
+            lock = self._redfish_capture_locks.setdefault(key, Lock())
+            async with lock:
+                self._redfish_request_captures.pop(key, None)
+                self._redfish_capture_locks.pop(key, None)
+
+    async def _record_redfish_request_capture(
+        self,
+        dut_id: str,
+        request_info: Dict[str, Any],
+        response_info: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        collector_id: Optional[str] = None,
+    ) -> None:
+        """Capture a Redfish request/response pair for the active collector."""
+        key = self._get_redfish_request_capture_key(dut_id, collector_id)
+        if not key:
+            return
+
+        lock = self._redfish_capture_locks.setdefault(key, Lock())
+        async with lock:
+            capture_state = self._redfish_request_captures.get(key)
+            if capture_state is None:
+                # Some collector flows make Redfish calls without explicitly invoking
+                # _start_redfish_request_capture first. Initialize lazily so request
+                # capture still works and runtime logs do not get flooded with WARNs.
+                capture_state = {
+                    "captured_at": datetime.now(timezone.utc).isoformat(),
+                    "requests": [],
+                }
+                self._redfish_request_captures[key] = capture_state
+
+            entry: Dict[str, Any] = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "request": self._sanitize_for_capture(request_info),
+            }
+            if response_info is not None:
+                entry["response"] = self._sanitize_for_capture(response_info)
+            if metadata:
+                entry["metadata"] = self._sanitize_for_capture(metadata)
+
+            capture_state["requests"].append(entry)
+
+    async def _get_collector_output_dir(
+        self, dut_id: str, collector_id: Optional[str]
+    ) -> Optional[Path]:
+        """Get the collector output directory path for Redfish artifacts."""
+        if not collector_id or not self.logger:
+            return None
+
+        sentinel_path = await self.logger.create_collector_log_file(
+            dut_id, "redfish", collector_id, ".collector_dir_sentinel"
+        )
+        if not sentinel_path:
+            return None
+
+        collector_dir = Path(sentinel_path).parent
+        sentinel_file = collector_dir / ".collector_dir_sentinel"
+        if sentinel_file.exists():
+            try:
+                sentinel_file.unlink()
+            except Exception as e:
+                await self._log_runtime(
+                    "DEBUG",
+                    "RedfishService",
+                    f"Failed to apply stream window to Redfish CSV filename {csv_filename}: {str(e)}",
+                    dut_id,
+                )
+
+        return collector_dir
+
+    async def _attach_redfish_request_capture(
+        self,
+        dut_id: str,
+        result: Optional[Dict[str, Any]],
+        collector_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Persist the Redfish request/response artifact and reference it from collector context."""
+        key = self._get_redfish_request_capture_key(dut_id, collector_id)
+        capture_state = None
+        if key:
+            lock = self._redfish_capture_locks.setdefault(key, Lock())
+            async with lock:
+                capture_state = self._redfish_request_captures.pop(key, None)
+                self._redfish_capture_locks.pop(key, None)
+        captured_requests = (capture_state or {}).get("requests", [])
+        if not captured_requests or not isinstance(result, dict):
+            return result
+
+        resolved_collector_id = collector_id or self._get_current_collector_id()
+        collector_dir = await self._get_collector_output_dir(
+            dut_id, resolved_collector_id
+        )
+        if not collector_dir or not self.logger:
+            return result
+
+        artifact_name = "redfish_request_response_log.json"
+        artifact_path = await self.logger.create_collector_log_file(
+            dut_id, "redfish", resolved_collector_id, artifact_name
+        )
+
+        try:
+            with artifact_path.open("w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "captured_at": capture_state.get("captured_at"),
+                        "collector_id": resolved_collector_id,
+                        "dut_id": dut_id,
+                        "requests": captured_requests,
+                    },
+                    handle,
+                    indent=2,
+                )
+        except Exception as exc:
+            await self._log_runtime(
+                "WARN",
+                "RedfishService",
+                f"Failed to persist Redfish request log for {resolved_collector_id}: {exc}",
+                dut_id,
+            )
+            return result
+
+        context = result.setdefault("context", {})
+        output_files = result.setdefault("output_files", [])
+        artifact_path_str = str(artifact_path)
+        if artifact_path_str not in output_files:
+            output_files.append(artifact_path_str)
+
+        context_output_files = context.setdefault("output_files", [])
+        if artifact_path_str not in context_output_files:
+            context_output_files.append(artifact_path_str)
+
+        context["request_response_capture"] = {
+            "artifact": artifact_name,
+            "captured_requests": len(captured_requests),
+        }
+        return result
 
     def _get_dut_semaphore(
         self, dut_id: str, semaphore_type: str = "requests"
@@ -104,6 +297,245 @@ class RedfishService(BaseService):
             self._dut_semaphores[key] = asyncio.Semaphore(limit)
 
         return self._dut_semaphores[key]
+
+    def _get_connection_host(self, dut_id: str) -> Optional[str]:
+        """
+        Get the BMC host/IP for a given DUT, used for SSRF validation.
+
+        Args:
+            dut_id: DUT ID.
+
+        Returns:
+            The BMC IP/hostname string, or None if unavailable.
+        """
+        try:
+            if self.dut_manager:
+                dut = self.dut_manager.get_dut(dut_id)
+                if dut and hasattr(dut, "credentials") and dut.credentials:
+                    return getattr(dut.credentials, "bmc_ip", None)
+        except Exception:
+            pass
+        return None
+
+    def _deep_merge_config(
+        self, base_config: Dict[str, Any], override_config: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Recursively merge collector config overrides, replacing lists wholesale."""
+        merged = dict(base_config)
+        for key, value in override_config.items():
+            if (
+                key in merged
+                and isinstance(merged[key], dict)
+                and isinstance(value, dict)
+            ):
+                merged[key] = self._deep_merge_config(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+
+    def _extract_member_uris_from_data(
+        self,
+        data: Any,
+        link_path: Optional[Any] = "Members",
+        member_uri_path: Optional[Any] = "@odata.id",
+    ) -> List[str]:
+        """Extract a list of Redfish member URIs from a collection or link array."""
+        if link_path in (None, ""):
+            source = data
+        else:
+            source = self._extract_nested_value(data, link_path)
+
+        if isinstance(source, dict) and "Members" in source:
+            source = source.get("Members", [])
+
+        uris: List[str] = []
+
+        if isinstance(source, list):
+            for item in source:
+                if isinstance(item, str):
+                    candidate_uri = item
+                elif isinstance(item, dict):
+                    if member_uri_path in (None, ""):
+                        candidate_uri = item.get("@odata.id")
+                    else:
+                        candidate_uri = self._extract_nested_value(
+                            item, member_uri_path
+                        )
+                else:
+                    continue
+
+                if candidate_uri and validate_redfish_uri(candidate_uri):
+                    uris.append(candidate_uri)
+
+        elif isinstance(source, str) and validate_redfish_uri(source):
+            uris.append(source)
+
+        return uris
+
+    def _value_matches_filter_condition(
+        self, value: Any, condition: Dict[str, Any]
+    ) -> bool:
+        """Evaluate a single filter condition against a scalar or list value."""
+        values = value if isinstance(value, list) else [value]
+
+        if "equals" in condition:
+            expected = str(condition["equals"]).lower()
+            return any(
+                str(item).lower() == expected for item in values if item is not None
+            )
+
+        if "contains" in condition:
+            needle = str(condition["contains"]).lower()
+            return any(
+                needle in str(item).lower() for item in values if item is not None
+            )
+
+        if "regex" in condition:
+            pattern = re.compile(str(condition["regex"]), re.IGNORECASE)
+            return any(pattern.search(str(item)) for item in values if item is not None)
+
+        return False
+
+    def _member_matches_filters(
+        self,
+        member_uri: str,
+        member_data: Optional[Dict[str, Any]],
+        filters: Optional[Dict[str, Any]],
+    ) -> bool:
+        """Apply optional URI and payload filters to a candidate member resource."""
+        if not filters:
+            return True
+
+        include_uri_patterns = filters.get("include_uri_patterns", [])
+        exclude_uri_patterns = filters.get("exclude_uri_patterns", [])
+
+        if include_uri_patterns and not any(
+            re.search(pattern, member_uri, re.IGNORECASE)
+            for pattern in include_uri_patterns
+        ):
+            return False
+
+        if exclude_uri_patterns and any(
+            re.search(pattern, member_uri, re.IGNORECASE)
+            for pattern in exclude_uri_patterns
+        ):
+            return False
+
+        include_conditions = filters.get("include_conditions", [])
+        if include_conditions:
+            if not member_data:
+                return False
+            if not any(
+                self._value_matches_filter_condition(
+                    self._extract_nested_value(member_data, condition.get("path")),
+                    condition,
+                )
+                for condition in include_conditions
+            ):
+                return False
+
+        exclude_conditions = filters.get("exclude_conditions", [])
+        if exclude_conditions and member_data:
+            if any(
+                self._value_matches_filter_condition(
+                    self._extract_nested_value(member_data, condition.get("path")),
+                    condition,
+                )
+                for condition in exclude_conditions
+            ):
+                return False
+
+        return True
+
+    def _set_nested_value(self, data: Any, path: Any, value: Any) -> bool:
+        """
+        Set a nested value on a dictionary/list using dot/bracket notation.
+
+        Returns:
+            True if the path existed and the value was updated, otherwise False.
+        """
+        if data is None or path is None:
+            return False
+
+        tokens = (
+            list(path)
+            if isinstance(path, (list, tuple))
+            else self._split_path_tokens(path)
+        )
+        if not tokens:
+            return False
+
+        current = data
+        for token in tokens[:-1]:
+            if isinstance(token, int):
+                if isinstance(current, list) and 0 <= token < len(current):
+                    current = current[token]
+                else:
+                    return False
+            else:
+                if isinstance(current, dict) and token in current:
+                    current = current[token]
+                else:
+                    return False
+
+        last_token = tokens[-1]
+        if isinstance(last_token, int):
+            if isinstance(current, list) and 0 <= last_token < len(current):
+                current[last_token] = value
+                return True
+            return False
+
+        if isinstance(current, dict):
+            current[last_token] = value
+            return True
+
+        return False
+
+    def _apply_list_filters_to_data(
+        self, data: Any, list_filters: Optional[List[Dict[str, Any]]]
+    ) -> Any:
+        """
+        Filter configured list fields within a payload before saving it.
+        """
+        if not isinstance(data, dict) or not list_filters:
+            return data
+
+        filtered_data = copy.deepcopy(data)
+
+        for filter_config in list_filters:
+            list_path = filter_config.get("path")
+            if not list_path:
+                continue
+
+            items = self._extract_nested_value(filtered_data, list_path)
+            if not isinstance(items, list):
+                continue
+
+            uri_path = filter_config.get("member_uri_path", "@odata.id")
+            member_filters = filter_config.get("filters", {})
+
+            filtered_items = []
+            for item in items:
+                member_uri = ""
+                if isinstance(item, dict):
+                    extracted_uri = self._extract_nested_value(item, uri_path)
+                    member_uri = str(extracted_uri) if extracted_uri else ""
+                elif isinstance(item, str):
+                    member_uri = item
+
+                if self._member_matches_filters(
+                    member_uri, item if isinstance(item, dict) else None, member_filters
+                ):
+                    filtered_items.append(item)
+
+            if self._set_nested_value(filtered_data, list_path, filtered_items):
+                count_path = filter_config.get("count_path")
+                if count_path:
+                    self._set_nested_value(
+                        filtered_data, count_path, len(filtered_items)
+                    )
+
+        return filtered_data
 
     """
     Validation
@@ -139,6 +571,51 @@ class RedfishService(BaseService):
             f"[{collector_id}] Starting {entity_type} validation with patterns: {entity_id_patterns or 'default'}",
             dut_id,
         )
+
+        # Check for entity ID overrides — bypasses all discovery/filtering
+        override_key_map = {
+            "Systems": "SYSTEM_ID_OVERRIDE",
+            "Managers": "MANAGER_ID_OVERRIDE",
+            "Chassis": "CHASSIS_ID_OVERRIDE",
+        }
+        context_key_map = {
+            "Systems": ("filtered_systems", "system_count"),
+            "Managers": ("filtered_managers", "manager_count"),
+            "Chassis": ("filtered_chassis", "chassis_count"),
+        }
+        override_key = override_key_map.get(entity_type)
+        if override_key and self.dut_manager:
+            dut_config = self.dut_manager.get_dut_config(dut_id)
+            id_overrides = dut_config.get(override_key, [])
+            if not id_overrides:
+                id_overrides = (self.dut_manager.tool_config or {}).get(
+                    override_key
+                ) or []
+            if id_overrides:
+                ctx_key, count_key = context_key_map[entity_type]
+                await self._log_runtime(
+                    "INFO",
+                    "RedfishService",
+                    f"[{collector_id}] {override_key} set to {id_overrides}, skipping discovery",
+                    dut_id,
+                )
+                return {
+                    "success": True,
+                    "context": {
+                        ctx_key: [
+                            {
+                                "id": eid,
+                                "model": "",
+                                "name": eid,
+                                "discovery_source": "id_override",
+                            }
+                            for eid in id_overrides
+                        ],
+                        count_key: len(id_overrides),
+                        "filter_mode": "override",
+                        "discovery_method": "id_override",
+                    },
+                }
 
         # Check if we should use pattern-based filtering or traditional filtering
         baseboard_patterns = kwargs.get("baseboard_patterns", {})
@@ -188,7 +665,7 @@ class RedfishService(BaseService):
                 **kwargs_without_collector,
             )
 
-        return await self._validate_entities_generic(
+        result = await self._validate_entities_generic(
             dut_id,
             entity_type,
             check_hgx_prefix,
@@ -196,6 +673,45 @@ class RedfishService(BaseService):
             baseboard_aware,
             **kwargs,
         )
+
+        # Fallback: if generic filtering yielded 0 entities, try redfish_entity_defaults patterns
+        context_key_map = {
+            "Systems": "filtered_systems",
+            "Managers": "filtered_managers",
+            "Chassis": "filtered_chassis",
+        }
+        ctx_key = context_key_map.get(entity_type, "filtered_entities")
+        filtered = result.get("context", {}).get(ctx_key, [])
+        if not filtered and self.dut_manager:
+            baseboard_manager = self.dut_manager._get_baseboard_manager()
+            if baseboard_manager:
+                dut_config = self.dut_manager.get_dut_config(dut_id)
+                target_baseboard = dut_config.get("baseboard") or dut_config.get(
+                    "TargetBaseboard", ""
+                )
+                fallback_patterns = baseboard_manager.get_entity_patterns(
+                    target_baseboard, entity_type
+                )
+                if isinstance(fallback_patterns, list) and fallback_patterns:
+                    await self._log_runtime(
+                        "INFO",
+                        "RedfishService",
+                        f"[{collector_id}] Generic filtering yielded 0 {entity_type}, "
+                        f"retrying with redfish_entity_defaults patterns: {fallback_patterns}",
+                        dut_id,
+                    )
+                    kwargs_without_collector = {
+                        k: v for k, v in kwargs.items() if k != "collector_id"
+                    }
+                    result = await self._validate_entities_with_patterns(
+                        dut_id,
+                        entity_type,
+                        fallback_patterns,
+                        collector_id,
+                        **kwargs_without_collector,
+                    )
+
+        return result
 
     async def validate_connection(self, dut_id: str) -> Tuple[bool, str]:
         """
@@ -241,7 +757,7 @@ class RedfishService(BaseService):
                     await self._log_runtime(
                         "INFO",
                         "RedfishService",
-                        f"Using preflight results for Redfish validation - connection already verified",
+                        "Using preflight results for Redfish validation - connection already verified",
                         dut_id,
                     )
                     return {
@@ -329,9 +845,10 @@ class RedfishService(BaseService):
             baseboard_aware: Whether to apply baseboard-specific filtering logic
         """
         try:
-            # Log validation start
+            # Log validation start — filter_mode here is the parameter default; the actual
+            # resolved mode (after baseboard-aware lookup) is logged at INFO when filtering completes.
             await self._log_runtime(
-                "INFO",
+                "DEBUG",
                 "RedfishService",
                 f"Starting {entity_type} validation with filter_mode={filter_mode}, baseboard_aware={baseboard_aware}",
                 dut_id,
@@ -396,6 +913,72 @@ class RedfishService(BaseService):
                 dut_id,
             )
 
+            # Resolve filter mode and hgx_prefix once per DUT call — the baseboard
+            # does not change between entities, so recomputing inside the loop is wasteful
+            # and causes the summary log to report the wrong mode.
+            dut_config = self.dut_manager.get_dut_config(dut_id)
+            hgx_prefix = dut_config.get(config["config_prefix"], "HGX")
+            resolved_filter_mode = filter_mode
+            skip_id_type = {
+                "Systems": "system",
+                "Managers": "manager",
+                "Chassis": "chassis",
+            }.get(entity_type)
+
+            if baseboard_aware and kwargs.get("baseboard_filtering"):
+                dut_baseboard = dut_config.get("baseboard") or dut_config.get(
+                    "TargetBaseboard", ""
+                )
+                baseboard_filtering = kwargs.get("baseboard_filtering", {})
+                baseboard_manager = self.dut_manager._get_baseboard_manager()
+                await baseboard_manager.log_baseboard_info(dut_id)
+                resolved_filter_mode = (
+                    await baseboard_manager.apply_baseboard_filtering(
+                        dut_id,
+                        dut_baseboard,
+                        baseboard_filtering,
+                        "all_platforms",
+                    )
+                )
+                await self._log_runtime(
+                    "DEBUG",
+                    "RedfishService",
+                    f"Baseboard-aware filtering: dut_baseboard='{dut_baseboard}', resolved_filter_mode='{resolved_filter_mode}' (default was '{filter_mode}')",
+                    dut_id,
+                )
+
+            if discovered_entities and skip_id_type:
+                original_entities = [str(entity_id) for entity_id in discovered_entities]
+                filtered_discovered_entities = filter_ids(
+                    original_entities, skip_id_type, dut_config
+                )
+                if len(filtered_discovered_entities) != len(original_entities):
+                    await log_filtered_ids(
+                        original_entities,
+                        filtered_discovered_entities,
+                        skip_id_type,
+                        self.logger,
+                        dut_id,
+                    )
+                    await self._log_runtime(
+                        "INFO",
+                        "RedfishService",
+                        f"Applied {entity_type} skip list before validation requests: {filtered_discovered_entities}",
+                        dut_id,
+                    )
+                discovered_entities = filtered_discovered_entities
+
+                if not discovered_entities:
+                    return {
+                        "success": True,
+                        "context": {
+                            config["context_key"]: [],
+                            config["count_key"]: 0,
+                            "filter_mode": resolved_filter_mode,
+                            "discovery_method": "dynamic_discovery",
+                        },
+                    }
+
             if discovered_entities:
                 await self._log_runtime(
                     "INFO",
@@ -406,7 +989,6 @@ class RedfishService(BaseService):
                 filtered_entities = []
 
                 for entity_id in discovered_entities:
-                    # Use configured URI for entity type
                     entity_uri = self.get_configured_uri(dut_id, config["uri_key"])
                     entity_uri_full = f"{entity_uri}/{entity_id}"
 
@@ -416,94 +998,21 @@ class RedfishService(BaseService):
 
                     if success:
                         model = entity_data.get("Model", "")
-                        # Get HGX prefix from config, fallback to "HGX"
-                        dut_config = self.dut_manager.get_dut_config(dut_id)
-                        hgx_prefix = dut_config.get(config["config_prefix"], "HGX")
-                        # Check if HGX prefix is in the entity_id (system/manager/chassis ID), not the model
                         is_hgx = hgx_prefix in entity_id
 
-                        # Apply filtering based on filter_mode and baseboard awareness
-                        include_entity = False
-
-                        if baseboard_aware and kwargs.get("baseboard_filtering"):
-                            # Get DUT config to check baseboard type
-                            dut_config = self.dut_manager.get_dut_config(dut_id)
-                            dut_baseboard = dut_config.get("baseboard", "")
-
-                            # Get baseboard filtering rules from params
-                            baseboard_filtering = kwargs.get("baseboard_filtering", {})
-
-                            await self._log_runtime(
-                                "DEBUG",
-                                "RedfishService",
-                                f"Baseboard-aware filtering: dut_baseboard='{dut_baseboard}', baseboard_filtering={baseboard_filtering}, original_filter_mode='{filter_mode}'",
-                                dut_id,
-                            )
-
-                            # Use BaseboardManager to apply filtering rules
-                            baseboard_manager = (
-                                self.dut_manager._get_baseboard_manager()
-                            )
-
-                            # Log baseboard info for debugging
-                            await baseboard_manager.log_baseboard_info(dut_id)
-
-                            # When baseboard_aware=True, we should use the YAML configuration
-                            # The BaseboardManager will handle the "default" key from baseboard_filtering
-                            effective_filter_mode = await baseboard_manager.apply_baseboard_filtering(
-                                dut_id,
-                                dut_baseboard,
-                                baseboard_filtering,
-                                "all_platforms",  # This should only be used if no "default" in YAML
-                            )
-
-                            # Log baseboard detection
-                            await self._log_runtime(
-                                "DEBUG",
-                                "RedfishService",
-                                f"Entity {entity_id} (model={model}, is_hgx={is_hgx}): dut_baseboard={dut_baseboard}, effective_filter_mode={effective_filter_mode}",
-                                dut_id,
-                            )
-
-                            # Apply the effective filter mode
-                            if effective_filter_mode == "hgx_only":
-                                include_entity = is_hgx or not check_hgx_prefix
-                            elif effective_filter_mode == "all_platforms":
-                                include_entity = True
-                            elif effective_filter_mode == "non_hgx_only":
-                                include_entity = not is_hgx
-                            else:
-                                # Fallback to original filter_mode
-                                if filter_mode == "hgx_only":
-                                    include_entity = is_hgx or not check_hgx_prefix
-                                elif filter_mode == "all_platforms":
-                                    include_entity = True
-                                elif filter_mode == "non_hgx_only":
-                                    include_entity = not is_hgx
-                                else:
-                                    include_entity = is_hgx or not check_hgx_prefix
+                        if resolved_filter_mode == "hgx_only":
+                            include_entity = is_hgx or not check_hgx_prefix
+                        elif resolved_filter_mode == "all_platforms":
+                            include_entity = True
+                        elif resolved_filter_mode == "non_hgx_only":
+                            include_entity = not is_hgx
                         else:
-                            # Non-baseboard-aware filtering (original logic)
-                            if filter_mode == "hgx_only":
-                                include_entity = is_hgx or not check_hgx_prefix
-                            elif filter_mode == "all_platforms":
-                                include_entity = True
-                            elif filter_mode == "non_hgx_only":
-                                include_entity = not is_hgx
-                            else:
-                                # Default to hgx_only for backward compatibility
-                                include_entity = is_hgx or not check_hgx_prefix
+                            include_entity = is_hgx or not check_hgx_prefix
 
-                        # Log filtering decision
-                        effective_filter_mode_used = (
-                            effective_filter_mode
-                            if "effective_filter_mode" in locals()
-                            else filter_mode
-                        )
                         await self._log_runtime(
                             "DEBUG",
                             "RedfishService",
-                            f"Entity {entity_id}: include_entity={include_entity} (effective_filter_mode='{effective_filter_mode_used}')",
+                            f"Entity {entity_id}: include_entity={include_entity} (resolved_filter_mode='{resolved_filter_mode}')",
                             dut_id,
                         )
 
@@ -521,7 +1030,7 @@ class RedfishService(BaseService):
                 await self._log_runtime(
                     "INFO",
                     "RedfishService",
-                    f"Filtered {entity_type} using mode '{filter_mode}': {len(filtered_entities)} entities found",
+                    f"Filtered {entity_type} using mode '{resolved_filter_mode}': {len(filtered_entities)} entities found",
                     dut_id,
                 )
 
@@ -540,7 +1049,7 @@ class RedfishService(BaseService):
                     "context": {
                         config["context_key"]: filtered_entities,
                         config["count_key"]: len(filtered_entities),
-                        "filter_mode": filter_mode,
+                        "filter_mode": resolved_filter_mode,
                         "discovery_method": "dynamic_discovery",
                     },
                 }
@@ -595,6 +1104,33 @@ class RedfishService(BaseService):
                 )
 
             entities_list = response.get("Members", [])
+            if entities_list and skip_id_type:
+                entity_ids = [
+                    str(entity.get("@odata.id", "")).rstrip("/").split("/")[-1]
+                    for entity in entities_list
+                ]
+                filtered_entity_ids = filter_ids(entity_ids, skip_id_type, dut_config)
+                if len(filtered_entity_ids) != len(entity_ids):
+                    await log_filtered_ids(
+                        entity_ids,
+                        filtered_entity_ids,
+                        skip_id_type,
+                        self.logger,
+                        dut_id,
+                    )
+                    await self._log_runtime(
+                        "INFO",
+                        "RedfishService",
+                        f"Applied {entity_type} skip list before fallback validation requests: {filtered_entity_ids}",
+                        dut_id,
+                    )
+                filtered_entity_id_set = set(filtered_entity_ids)
+                entities_list = [
+                    entity
+                    for entity, entity_id in zip(entities_list, entity_ids)
+                    if entity_id in filtered_entity_id_set
+                ]
+
             await self._log_runtime(
                 "DEBUG",
                 "RedfishService",
@@ -612,73 +1148,16 @@ class RedfishService(BaseService):
 
                 if success:
                     model = entity_data.get("Model", "")
-                    # Get HGX prefix from config, fallback to "HGX"
-                    dut_config = self.dut_manager.get_dut_config(dut_id)
-                    hgx_prefix = dut_config.get(config["config_prefix"], "HGX")
                     is_hgx = hgx_prefix in model
 
-                    # Apply filtering based on filter_mode and baseboard awareness
-                    include_entity = False
-
-                    if baseboard_aware and kwargs.get("baseboard_filtering"):
-                        # Get DUT config to check baseboard type
-                        dut_config = self.dut_manager.get_dut_config(dut_id)
-                        target_baseboard = dut_config.get("TargetBaseboard", "")
-
-                        # Get baseboard filtering rules from params
-                        baseboard_filtering = kwargs.get("baseboard_filtering", {})
-
-                        # Determine which filter mode to use based on baseboard
-                        effective_filter_mode = filter_mode  # Default fallback
-
-                        # Check for exact baseboard match first (highest priority)
-                        if target_baseboard in baseboard_filtering:
-                            effective_filter_mode = baseboard_filtering[
-                                target_baseboard
-                            ]
-                        else:
-                            # Check for baseboard type/group match (e.g., "HGX", "NVL", "GH200")
-                            matched_group = None
-                            for (
-                                baseboard_type,
-                                filter_rule,
-                            ) in baseboard_filtering.items():
-                                if baseboard_type in target_baseboard:
-                                    matched_group = baseboard_type
-                                    effective_filter_mode = filter_rule
-                                    break
-
-                            # If no match found, keep the original filter_mode (code default)
-                            # No need for explicit "default" in YAML
-
-                        # Apply the effective filter mode
-                        if effective_filter_mode == "hgx_only":
-                            include_entity = is_hgx or not check_hgx_prefix
-                        elif effective_filter_mode == "all_platforms":
-                            include_entity = True
-                        elif effective_filter_mode == "non_hgx_only":
-                            include_entity = not is_hgx
-                        else:
-                            # Fallback to original filter_mode
-                            if filter_mode == "hgx_only":
-                                include_entity = is_hgx or not check_hgx_prefix
-                            elif filter_mode == "all_platforms":
-                                include_entity = True
-                            elif filter_mode == "non_hgx_only":
-                                include_entity = not is_hgx
-                            else:
-                                include_entity = is_hgx or not check_hgx_prefix
+                    if resolved_filter_mode == "hgx_only":
+                        include_entity = is_hgx or not check_hgx_prefix
+                    elif resolved_filter_mode == "all_platforms":
+                        include_entity = True
+                    elif resolved_filter_mode == "non_hgx_only":
+                        include_entity = not is_hgx
                     else:
-                        # Non-baseboard-aware filtering (original logic)
-                        if filter_mode == "hgx_only":
-                            include_entity = is_hgx or not check_hgx_prefix
-                        elif filter_mode == "all_platforms":
-                            include_entity = True
-                        elif filter_mode == "non_hgx_only":
-                            include_entity = not is_hgx
-                        else:
-                            # Default to hgx_only for backward compatibility
-                            include_entity = is_hgx or not check_hgx_prefix
+                        include_entity = is_hgx or not check_hgx_prefix
 
                     if include_entity:
                         filtered_entities.append(
@@ -694,7 +1173,7 @@ class RedfishService(BaseService):
             await self._log_runtime(
                 "INFO",
                 "RedfishService",
-                f"Filtered {entity_type} using mode '{filter_mode}': {len(filtered_entities)} entities found",
+                f"Filtered {entity_type} using mode '{resolved_filter_mode}': {len(filtered_entities)} entities found",
                 dut_id,
             )
 
@@ -703,7 +1182,7 @@ class RedfishService(BaseService):
                 "context": {
                     config["context_key"]: filtered_entities,
                     config["count_key"]: len(filtered_entities),
-                    "filter_mode": filter_mode,
+                    "filter_mode": resolved_filter_mode,
                     "discovery_method": "direct_request",
                 },
             }
@@ -985,10 +1464,206 @@ class RedfishService(BaseService):
         """
         import fnmatch
 
+        regex_special_chars = re.compile(r"[\\\^\$\+\?\{\}\(\)\|]")
+
         for pattern in patterns:
-            if fnmatch.fnmatch(entity_id, pattern):
+            if regex_special_chars.search(pattern):
+                if re.search(pattern, entity_id):
+                    return True
+            elif fnmatch.fnmatch(entity_id, pattern):
                 return True
         return False
+
+    def validate_system_configs_schema(
+        self,
+        system_configs: Dict[str, Any],
+        dut_id: str = None,
+    ) -> Tuple[bool, List[str]]:
+        """
+        Validate system_configs structure before use.
+
+        This is a safeguard to ensure system_configs has the expected structure
+        and contains valid configuration entries.
+
+        Required fields per system config:
+        - diagnostic_type (str)
+        - payload_template (dict)
+
+        Optional fields:
+        - device_id_key (str)
+        - device_id_prefix (str)
+
+        Args:
+            system_configs: Dictionary of system patterns to config mappings
+            dut_id: Optional DUT ID for logging
+
+        Returns:
+            Tuple of (is_valid, list_of_error_messages)
+        """
+        errors = []
+
+        if not isinstance(system_configs, dict):
+            return False, ["system_configs must be a dictionary"]
+
+        if len(system_configs) == 0:
+            # Empty dict is valid but will fall back to device config
+            return True, []
+
+        for pattern, config in system_configs.items():
+            # Validate pattern is a string
+            if not isinstance(pattern, str):
+                errors.append(f"Pattern must be string, got {type(pattern).__name__}")
+                continue
+
+            # Validate pattern is not empty
+            if not pattern.strip():
+                errors.append("Pattern cannot be an empty string")
+                continue
+
+            # Validate config is a dict
+            if not isinstance(config, dict):
+                errors.append(
+                    f"Config for pattern '{pattern}' must be dict, got {type(config).__name__}"
+                )
+                continue
+
+            # Check for nested system_configs (prevent recursion)
+            if "system_configs" in config:
+                errors.append(
+                    f"Pattern '{pattern}' contains nested system_configs (not allowed)"
+                )
+                continue
+
+            # Validate required fields
+            if "diagnostic_type" not in config:
+                errors.append(
+                    f"Pattern '{pattern}' missing required field: diagnostic_type"
+                )
+
+            if "payload_template" not in config:
+                errors.append(
+                    f"Pattern '{pattern}' missing required field: payload_template"
+                )
+
+            # Validate field types if present
+            if "diagnostic_type" in config and not isinstance(
+                config["diagnostic_type"], str
+            ):
+                errors.append(f"Pattern '{pattern}': diagnostic_type must be string")
+
+            if "payload_template" in config and not isinstance(
+                config["payload_template"], dict
+            ):
+                errors.append(f"Pattern '{pattern}': payload_template must be dict")
+
+            if "device_id_key" in config and not isinstance(
+                config["device_id_key"], str
+            ):
+                errors.append(f"Pattern '{pattern}': device_id_key must be string")
+
+            if "device_id_prefix" in config and not isinstance(
+                config["device_id_prefix"], str
+            ):
+                errors.append(f"Pattern '{pattern}': device_id_prefix must be string")
+
+        return len(errors) == 0, errors
+
+    async def resolve_system_config(
+        self,
+        system_id: str,
+        device_config: Dict[str, Any],
+        dut_id: str = None,
+        device_type: str = None,
+    ) -> Dict[str, Any]:
+        """
+        Resolve system-specific diagnostic configuration.
+
+        This method enables per-system configuration for platforms with multiple
+        systems (e.g., platforms with separate compute and baseboard systems).
+
+        Resolution order (highest to lowest priority):
+        1. Exact system match in system_configs (e.g., "System_0")
+        2. Pattern match in system_configs using fnmatch (e.g., "System_*")
+        3. Device-level config (backward compatible fallback)
+
+        Args:
+            system_id: The system ID being processed (e.g., "System_0", "HGX_Baseboard_0")
+            device_config: The device configuration dict from diagnostic_configs
+            dut_id: Optional DUT ID for logging
+            device_type: Optional device type for logging context
+
+        Returns:
+            Resolved configuration dict for this system. Returns the original
+            device_config unchanged if no system_configs key exists (backward compatible).
+        """
+        import fnmatch
+
+        system_configs = device_config.get("system_configs")
+
+        # SAFEGUARD: Log which code path is taken for debugging
+        if not system_configs:
+            await self._log_runtime(
+                "DEBUG",
+                "RedfishService",
+                f"[resolve_system_config] No system_configs for device_type={device_type}, "
+                f"system_id={system_id} - using existing config path (backward compatible)",
+                dut_id,
+            )
+            # Return original config unchanged - backward compatible
+            return device_config
+
+        # Validate schema before proceeding
+        is_valid, errors = self.validate_system_configs_schema(system_configs, dut_id)
+        if not is_valid:
+            await self._log_runtime(
+                "WARNING",
+                "RedfishService",
+                f"[resolve_system_config] Invalid system_configs schema for device_type={device_type}: {errors}. "
+                f"Falling back to device config.",
+                dut_id,
+            )
+            # Return device config without system_configs key
+            return {k: v for k, v in device_config.items() if k != "system_configs"}
+
+        await self._log_runtime(
+            "DEBUG",
+            "RedfishService",
+            f"[resolve_system_config] Found system_configs for device_type={device_type}, "
+            f"resolving config for system_id={system_id}, patterns available: {list(system_configs.keys())}",
+            dut_id,
+        )
+
+        # 1. Check exact system match FIRST (highest priority)
+        if system_id in system_configs:
+            await self._log_runtime(
+                "INFO",
+                "RedfishService",
+                f"[resolve_system_config] EXACT MATCH: system_id={system_id} -> using system-specific config",
+                dut_id,
+            )
+            return system_configs[system_id]
+
+        # 2. Check pattern match using fnmatch
+        for pattern, config in system_configs.items():
+            if fnmatch.fnmatch(system_id, pattern):
+                await self._log_runtime(
+                    "INFO",
+                    "RedfishService",
+                    f"[resolve_system_config] PATTERN MATCH: system_id={system_id} matched pattern='{pattern}'",
+                    dut_id,
+                )
+                return config
+
+        # 3. Fallback to device-level config
+        await self._log_runtime(
+            "DEBUG",
+            "RedfishService",
+            f"[resolve_system_config] NO MATCH: system_id={system_id} did not match any pattern in {list(system_configs.keys())}, "
+            f"using device-level fallback config",
+            dut_id,
+        )
+        # Return device config without system_configs key (to avoid passing it downstream)
+        return {k: v for k, v in device_config.items() if k != "system_configs"}
 
     async def _resolve_patterns_for_baseboard(
         self,
@@ -1064,21 +1739,27 @@ class RedfishService(BaseService):
                     dut_id,
                 )
 
-        # Fall back to default patterns if no specific patterns found
-        if patterns_to_use is None:
-            patterns_to_use = default_patterns or [
-                "*"
-            ]  # Default to all if no patterns specified
-            await self._log_runtime(
-                "DEBUG",
-                "RedfishService",
-                f"Using fallback patterns: {patterns_to_use}",
-                dut_id,
+        # Fall back to baseboard-level entity defaults from baseboards.yaml
+        if patterns_to_use is None and baseboard_manager:
+            baseboard_defaults = baseboard_manager.get_entity_patterns(
+                target_baseboard, entity_type
             )
+            if isinstance(baseboard_defaults, list) and baseboard_defaults:
+                patterns_to_use = baseboard_defaults
+                await self._log_runtime(
+                    "INFO",
+                    "RedfishService",
+                    f"Using redfish_entity_defaults for {target_baseboard} ({entity_type}): {patterns_to_use}",
+                    dut_id,
+                )
+
+        # Final fallback to caller-provided default patterns or wildcard
+        if patterns_to_use is None:
+            patterns_to_use = default_patterns or ["*"]
             await self._log_runtime(
                 "INFO",
                 "RedfishService",
-                f"Using default patterns: {patterns_to_use}",
+                f"Using fallback patterns: {patterns_to_use}",
                 dut_id,
             )
 
@@ -1382,6 +2063,38 @@ class RedfishService(BaseService):
             filtered_uris = []
             filter_criteria = filter_criteria or {}
 
+            # Normalize ID pattern configuration (supports strings, lists, and regex detection)
+            id_pattern_entries: List[Tuple[str, bool]] = []
+            raw_id_patterns: List[str] = []
+            if "id_pattern" in filter_criteria:
+                raw_patterns = filter_criteria["id_pattern"]
+                if isinstance(raw_patterns, (list, tuple, set)):
+                    raw_pattern_list = [str(pattern) for pattern in raw_patterns]
+                else:
+                    raw_pattern_list = [str(raw_patterns)]
+
+                raw_id_patterns = raw_pattern_list
+                explicit_regex_flag = filter_criteria.get("id_pattern_regex")
+                regex_special_chars = re.compile(r"[\\\^\$\*\+\?\{\}\[\]\|]")
+
+                for pattern in raw_pattern_list:
+                    use_regex = explicit_regex_flag
+                    if use_regex is None:
+                        use_regex = bool(regex_special_chars.search(pattern))
+                    id_pattern_entries.append((pattern, bool(use_regex)))
+
+            def matches_id_patterns(entity_name: str) -> bool:
+                if not id_pattern_entries:
+                    return False
+                for pattern, use_regex in id_pattern_entries:
+                    if use_regex:
+                        if re.search(pattern, entity_name):
+                            return True
+                    else:
+                        if pattern.lower() in entity_name.lower():
+                            return True
+                return False
+
             # Get DUT baseboard for filtering if baseboard_aware is enabled
             dut_baseboard = None
             effective_filter_mode = "hgx_only"  # Default
@@ -1404,35 +2117,51 @@ class RedfishService(BaseService):
 
             # If id_pattern is specified but no matching entities found in discovery,
             # try to enumerate based on the pattern (common for nested GPU chassis)
-            if "id_pattern" in filter_criteria:
-                id_pattern = filter_criteria["id_pattern"]
-                # Check if any discovered entities match the pattern
+            if id_pattern_entries:
                 matching_discovered = [
-                    e for e in discovered_entities if id_pattern.lower() in e.lower()
+                    e for e in discovered_entities if matches_id_patterns(e)
                 ]
 
-                if not matching_discovered:
+                non_regex_patterns = [
+                    pattern
+                    for pattern, use_regex in id_pattern_entries
+                    if not use_regex
+                ]
+
+                if not matching_discovered and non_regex_patterns:
                     await self._log_runtime(
                         "INFO",
                         "RedfishService",
-                        f"No {entity_type.lower()} matching pattern '{id_pattern}' found in standard discovery. Attempting enumeration...",
+                        f"No {entity_type.lower()} matching patterns {raw_id_patterns} found in standard discovery. Attempting enumeration for non-regex patterns...",
                         dut_id,
                     )
 
-                    # Try common enumeration patterns for the id_pattern
-                    # For "HGX_GPU", try HGX_GPU_0, HGX_GPU_1, HGX_GPU_2, HGX_GPU_3, etc.
-                    enumeration_attempts = []
-                    for i in range(8):  # Try 0-7 for common GPU counts
-                        enumeration_attempts.append(f"{id_pattern}_{i}")
+                    def _build_candidate(base_pattern: str, index: int) -> str:
+                        if base_pattern.endswith("_"):
+                            return f"{base_pattern}{index}"
+                        return f"{base_pattern}_{index}"
 
-                    # Also try SXM variants for GPU chassis
-                    if "GPU" in id_pattern.upper():
-                        for i in range(8):
-                            enumeration_attempts.append(f"{id_pattern}_SXM_{i}")
+                    enumeration_attempts = []
+                    for base_pattern in non_regex_patterns:
+                        trimmed_pattern = base_pattern.strip()
+                        for i in range(8):  # Try 0-7 for common GPU counts
+                            enumeration_attempts.append(
+                                _build_candidate(trimmed_pattern, i)
+                            )
+
+                        if "GPU" in trimmed_pattern.upper():
+                            for i in range(8):
+                                enumeration_attempts.append(
+                                    f"{trimmed_pattern.rstrip('_')}_SXM_{i}"
+                                )
 
                     # Probe each potential entity to see if it exists
                     enumerated_entities = []
+                    seen_attempts = set()
                     for potential_id in enumeration_attempts:
+                        if potential_id in seen_attempts:
+                            continue
+                        seen_attempts.add(potential_id)
                         entity_uri = f"{config['uri_base']}/{potential_id}"
                         success, _, _ = await self.dispatch_request(
                             dut_id, "GET", entity_uri
@@ -1453,7 +2182,6 @@ class RedfishService(BaseService):
                             f"Found {len(enumerated_entities)} {entity_type.lower()} via enumeration: {enumerated_entities}",
                             dut_id,
                         )
-                        # Add enumerated entities to the discovered list for processing
                         discovered_entities = (
                             list(discovered_entities) + enumerated_entities
                         )
@@ -1493,25 +2221,22 @@ class RedfishService(BaseService):
                 include_entity = False
 
                 # Check ID pattern first (if specified)
-                if "id_pattern" in filter_criteria:
-                    id_pattern = filter_criteria["id_pattern"]
-                    if id_pattern.lower() in entity_id.lower():
-                        # Use custom target URI if specified, otherwise use default entity URI
-                        if "target_uri" in filter_criteria:
-                            target_uri = filter_criteria["target_uri"].format(
-                                **{config["id_placeholder"]: entity_id}
-                            )
-                            filtered_uris.append(target_uri)
-                        else:
-                            filtered_uris.append(entity_uri)
-                        include_entity = True
-                        await self._log_runtime(
-                            "INFO",
-                            "RedfishService",
-                            f"Found {entity_type.lower()} matching ID pattern '{id_pattern}': {entity_id}",
-                            dut_id,
+                if id_pattern_entries and matches_id_patterns(entity_id):
+                    if "target_uri" in filter_criteria:
+                        target_uri = filter_criteria["target_uri"].format(
+                            **{config["id_placeholder"]: entity_id}
                         )
-                        continue
+                        filtered_uris.append(target_uri)
+                    else:
+                        filtered_uris.append(entity_uri)
+                    include_entity = True
+                    await self._log_runtime(
+                        "INFO",
+                        "RedfishService",
+                        f"Found {entity_type.lower()} matching ID pattern(s) {raw_id_patterns}: {entity_id}",
+                        dut_id,
+                    )
+                    continue
 
                 # Check for specific path in entity data
                 if "check_path" in filter_criteria:
@@ -1653,6 +2378,130 @@ class RedfishService(BaseService):
                 "context": {output_variable: []},
             }
 
+    async def _derive_uri_suffixes(
+        self,
+        dut_id: str,
+        source_list: Union[str, List[str]] = None,
+        output_variable: str = None,
+        suffix: str = "",
+        strip_trailing_slash: bool = True,
+        ensure_unique: bool = True,
+        include_uri_patterns: List[str] = None,
+        exclude_uri_patterns: List[str] = None,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """
+        Derive a new list of URIs by appending a suffix to each source URI.
+
+        Args:
+            dut_id: Device under test ID.
+            source_list: List of URIs or reference to a context variable (e.g., "${rot_cert_uris}").
+            output_variable: Context variable name to store derived URIs.
+            suffix: Suffix to append to each URI (e.g., "/CertChain").
+            strip_trailing_slash: Whether to remove trailing slash before appending suffix.
+            ensure_unique: Whether to de-duplicate derived URIs.
+            include_uri_patterns: Optional regex patterns; only matching source URIs are derived.
+            exclude_uri_patterns: Optional regex patterns; matching source URIs are skipped.
+            **kwargs: Additional context containing previously derived variables.
+        """
+
+        def _resolve_source_uris(
+            source: Union[str, List[str], None], context: Dict[str, Any]
+        ) -> List[str]:
+            if isinstance(source, list):
+                return source
+
+            if isinstance(source, str):
+                var_name = source
+                if source.startswith("${") and source.endswith("}"):
+                    var_name = source[2:-1]
+                return context.get(var_name, []) or []
+
+            return context.get("source_list", []) or []
+
+        try:
+            if not output_variable:
+                return {
+                    "success": False,
+                    "reason": "output_variable must be provided for _derive_uri_suffixes",
+                    "context": {},
+                }
+
+            source_uris = _resolve_source_uris(source_list, kwargs)
+
+            derived_uris: List[str] = []
+            skipped_uri_count = 0
+            if source_uris:
+                for uri in source_uris:
+                    if not isinstance(uri, str):
+                        continue
+
+                    if include_uri_patterns and not any(
+                        re.search(pattern, uri, re.IGNORECASE)
+                        for pattern in include_uri_patterns
+                    ):
+                        skipped_uri_count += 1
+                        continue
+
+                    if exclude_uri_patterns and any(
+                        re.search(pattern, uri, re.IGNORECASE)
+                        for pattern in exclude_uri_patterns
+                    ):
+                        skipped_uri_count += 1
+                        continue
+
+                    normalized_uri = uri.rstrip("/") if strip_trailing_slash else uri
+
+                    if suffix:
+                        if suffix.startswith("/"):
+                            derived_uri = f"{normalized_uri}{suffix}"
+                        else:
+                            derived_uri = f"{normalized_uri}/{suffix}"
+                    else:
+                        derived_uri = normalized_uri
+
+                    derived_uris.append(derived_uri)
+
+            if ensure_unique:
+                seen = set()
+                unique_derived = []
+                for uri in derived_uris:
+                    if uri not in seen:
+                        seen.add(uri)
+                        unique_derived.append(uri)
+                derived_uris = unique_derived
+
+            await self._log_runtime(
+                "INFO",
+                "RedfishService",
+                f"Derived {len(derived_uris)} URIs (suffix='{suffix}') from {len(source_uris)} source URIs; skipped {skipped_uri_count}",
+                dut_id,
+            )
+
+            return {
+                "success": True,
+                "context": {
+                    output_variable: derived_uris,
+                    "source_uri_count": len(source_uris),
+                    "derived_uri_count": len(derived_uris),
+                    "skipped_uri_count": skipped_uri_count,
+                    "suffix": suffix,
+                },
+            }
+
+        except Exception as e:
+            await self._log_runtime(
+                "ERROR",
+                "RedfishService",
+                f"Error in _derive_uri_suffixes: {str(e)}",
+                dut_id,
+            )
+            return {
+                "success": False,
+                "reason": f"URI derivation error: {str(e)}",
+                "context": {output_variable if output_variable else "derived_uris": []},
+            }
+
     async def _validate_chassis_dynamic(self, dut_id: str, **kwargs) -> Dict[str, Any]:
         """
         Backward compatibility wrapper for chassis dynamic validation.
@@ -1688,6 +2537,167 @@ class RedfishService(BaseService):
         return await self._validate_entities_dynamic(
             dut_id, entity_type="Managers", **kwargs
         )
+
+    async def _discover_dot_trusted_component_uris(
+        self,
+        dut_id: str,
+        output_variable: str = "dot_trusted_component_uris",
+        chassis_id_pattern: Union[str, List[str]] = r"^HGX_CPU_[0-9]+$",
+        target_uri: str = "/redfish/v1/Chassis/{chassis_id}/TrustedComponents",
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """
+        Discover CPU DOT TrustedComponents collection URIs.
+
+        R56 must not rely on the parent Chassis resource being readable: some
+        systems can return 5xx for /Chassis/HGX_CPU_x while the child
+        /TrustedComponents collection is available.
+        """
+        try:
+            chassis_base_uri = self.get_configured_uri(dut_id, "Chassis")
+            discovered_chassis = await self.get_discovered_chassis(dut_id)
+            discovered_chassis = discovered_chassis or []
+
+            if isinstance(chassis_id_pattern, (list, tuple, set)):
+                raw_patterns = [str(pattern) for pattern in chassis_id_pattern]
+            else:
+                raw_patterns = [str(chassis_id_pattern)]
+
+            compiled_patterns = [re.compile(pattern) for pattern in raw_patterns]
+
+            def _matches_chassis_pattern(chassis_id: str) -> bool:
+                return any(pattern.search(chassis_id) for pattern in compiled_patterns)
+
+            candidate_chassis: List[str] = []
+            skipped_chassis: List[str] = []
+
+            def _add_candidate(chassis_id: str) -> None:
+                if not chassis_id:
+                    return
+                if _matches_chassis_pattern(chassis_id):
+                    if chassis_id not in candidate_chassis:
+                        candidate_chassis.append(chassis_id)
+                elif chassis_id not in skipped_chassis:
+                    skipped_chassis.append(chassis_id)
+
+            for chassis_id in discovered_chassis:
+                _add_candidate(str(chassis_id))
+
+            chassis_collection_success, chassis_collection_data, _ = (
+                await self.dispatch_request(
+                    dut_id,
+                    "GET",
+                    chassis_base_uri,
+                    error_context="discover DOT chassis candidates",
+                )
+            )
+
+            if chassis_collection_success and isinstance(chassis_collection_data, dict):
+                for member in chassis_collection_data.get("Members", []):
+                    if not isinstance(member, dict):
+                        continue
+                    member_uri = member.get("@odata.id", "")
+                    chassis_id = member_uri.rstrip("/").split("/")[-1]
+                    _add_candidate(chassis_id)
+            elif not candidate_chassis:
+                reason = (
+                    f"Failed to fetch Chassis collection for DOT discovery and no "
+                    f"discovered chassis candidates were available: {chassis_collection_data}"
+                )
+                await self._log_runtime(
+                    "ERROR",
+                    "RedfishService",
+                    reason,
+                    dut_id,
+                )
+                return {
+                    "success": False,
+                    "reason": reason,
+                    "context": {output_variable: []},
+                }
+            else:
+                await self._log_runtime(
+                    "WARNING",
+                    "RedfishService",
+                    (
+                        "Failed to fetch Chassis collection during DOT discovery; "
+                        f"falling back to discovered chassis list: {chassis_collection_data}"
+                    ),
+                    dut_id,
+                )
+
+            trusted_component_uris: List[str] = []
+            unavailable_targets: List[str] = []
+
+            for chassis_id in candidate_chassis:
+                trusted_components_uri = target_uri.format(chassis_id=chassis_id)
+                success, trusted_components_data, _ = await self.dispatch_request(
+                    dut_id,
+                    "GET",
+                    trusted_components_uri,
+                    error_context=(
+                        f"discover DOT TrustedComponents for chassis {chassis_id}"
+                    ),
+                )
+
+                if success and isinstance(trusted_components_data, dict):
+                    trusted_component_uris.append(trusted_components_uri)
+                    await self._log_runtime(
+                        "INFO",
+                        "RedfishService",
+                        (
+                            "Discovered DOT TrustedComponents collection for "
+                            f"{chassis_id}: {trusted_components_uri}"
+                        ),
+                        dut_id,
+                    )
+                    continue
+
+                unavailable_targets.append(trusted_components_uri)
+                await self._log_runtime(
+                    "INFO",
+                    "RedfishService",
+                    (
+                        "Skipping DOT TrustedComponents collection for "
+                        f"{chassis_id}: {trusted_components_data}"
+                    ),
+                    dut_id,
+                )
+
+            await self._log_runtime(
+                "INFO",
+                "RedfishService",
+                (
+                    f"Discovered {len(trusted_component_uris)} DOT TrustedComponents "
+                    f"collections from {len(candidate_chassis)} candidate chassis"
+                ),
+                dut_id,
+            )
+
+            return {
+                "success": True,
+                "context": {
+                    output_variable: trusted_component_uris,
+                    "dot_trusted_component_uri_count": len(trusted_component_uris),
+                    "dot_candidate_chassis": candidate_chassis,
+                    "dot_unavailable_targets": unavailable_targets,
+                    "dot_skipped_chassis": skipped_chassis,
+                    "dot_chassis_id_patterns": raw_patterns,
+                },
+            }
+
+        except Exception as e:
+            await self._log_runtime(
+                "ERROR",
+                "RedfishService",
+                f"Error in _discover_dot_trusted_component_uris: {str(e)}",
+                dut_id,
+            )
+            return {
+                "success": False,
+                "reason": f"DOT TrustedComponents discovery error: {str(e)}",
+                "context": {output_variable: []},
+            }
 
     """
     Discovery
@@ -1933,6 +2943,37 @@ class RedfishService(BaseService):
                 dut_id,
             )
 
+            def _apply_num_gpus_filter(
+                device_type: str, device_ids_list: List[int]
+            ) -> List[int]:
+                if device_type.lower() != "gpu":
+                    return device_ids_list
+
+                num_gpus_value = None
+                if baseboard_config and baseboard_config.get("num_gpus") is not None:
+                    num_gpus_value = baseboard_config.get("num_gpus")
+                elif dut_config and dut_config.get("num_gpus") is not None:
+                    num_gpus_value = dut_config.get("num_gpus")
+
+                try:
+                    num_gpus = int(num_gpus_value) if num_gpus_value is not None else 0
+                except (TypeError, ValueError):
+                    num_gpus = 0
+
+                if num_gpus > 0 and len(device_ids_list) > num_gpus:
+                    limited = device_ids_list[:num_gpus]
+                    asyncio.create_task(
+                        self._log_runtime(
+                            "INFO",
+                            "RedfishService",
+                            f"Applying num_gpus={num_gpus} filter for {device_type}: {device_ids_list} -> {limited}",
+                            dut_id,
+                        )
+                    )
+                    return limited
+
+                return device_ids_list
+
             discovered_devices = {}
 
             # Default device types if not specified
@@ -1948,6 +2989,65 @@ class RedfishService(BaseService):
                     "gpu_patterns": [r"HGX_.*GPU_.*(\d+)", r"HGX_FW_GPU_(\d+)"],
                     "sma_patterns": [r"HGX_.*SMA_(\d+)", r"HGX_.*MCU_(\d+)"],
                 }
+            # Baseboard overrides are optional; keep an empty dict so unsupported
+            # device families degrade to "no patterns found" instead of raising.
+            baseboard_device_patterns = (
+                baseboard_config.get("device_patterns", {}) if baseboard_config else {}
+            )
+
+            # Apply baseboard-specific overrides if provided
+            if baseboard_config:
+                if "use_firmware_inventory" in baseboard_config:
+                    use_fw_inventory = baseboard_config["use_firmware_inventory"]
+                    await self._log_runtime(
+                        "INFO",
+                        "RedfishService",
+                        f"Baseboard override - use_firmware_inventory set to {use_fw_inventory}",
+                        dut_id,
+                    )
+
+                if baseboard_device_patterns:
+                    for (
+                        pattern_key,
+                        override_value,
+                    ) in baseboard_device_patterns.items():
+                        if override_value is None:
+                            continue
+                        # Handle complex override structures
+                        if isinstance(override_value, dict):
+                            override_patterns = override_value.get("override")
+                            append_patterns = override_value.get("append")
+
+                            if override_patterns is not None:
+                                device_patterns[pattern_key] = list(override_patterns)
+                                await self._log_runtime(
+                                    "INFO",
+                                    "RedfishService",
+                                    f"Baseboard override - device_patterns[{pattern_key}] replaced with {device_patterns[pattern_key]}",
+                                    dut_id,
+                                )
+                            if append_patterns:
+                                device_patterns.setdefault(pattern_key, [])
+                                device_patterns[pattern_key].extend(
+                                    list(append_patterns)
+                                )
+                                await self._log_runtime(
+                                    "INFO",
+                                    "RedfishService",
+                                    f"Baseboard override - device_patterns[{pattern_key}] extended with {append_patterns}",
+                                    dut_id,
+                                )
+                        else:
+                            if isinstance(override_value, (list, tuple, set)):
+                                device_patterns[pattern_key] = list(override_value)
+                            else:
+                                device_patterns[pattern_key] = [str(override_value)]
+                            await self._log_runtime(
+                                "INFO",
+                                "RedfishService",
+                                f"Baseboard override - device_patterns[{pattern_key}] set to {device_patterns[pattern_key]}",
+                                dut_id,
+                            )
 
             # Get chassis data
             chassis_uri = self.get_configured_uri(dut_id, "Chassis")
@@ -1974,7 +3074,7 @@ class RedfishService(BaseService):
 
             # Log filtered IDs if any were filtered
             if len(chassis_ids) != len(original_chassis_ids):
-                log_filtered_ids(
+                await log_filtered_ids(
                     original_chassis_ids, chassis_ids, "chassis", self.logger, dut_id
                 )
 
@@ -2004,8 +3104,134 @@ class RedfishService(BaseService):
                         f"Attempting firmware inventory discovery for {device_type}",
                         dut_id,
                     )
-                    # TODO: Implement firmware inventory discovery
-                    # For now, we'll use chassis-based discovery
+
+                    # Get firmware inventory from dynamic discovery
+                    firmware_inventory = await self.get_discovered_firmware_inventory(
+                        dut_id
+                    )
+
+                    if firmware_inventory:
+                        # Get the actual components dict
+                        fw_components = firmware_inventory.get("components", {})
+                        await self._log_runtime(
+                            "INFO",
+                            "RedfishService",
+                            f"Found {len(fw_components)} firmware inventory components: {list(fw_components.keys())}",
+                            dut_id,
+                        )
+
+                        # Get patterns for this device type
+                        patterns_for_type = []
+                        if device_type in device_patterns:
+                            patterns_for_type = device_patterns[device_type]
+                        elif f"{device_type}_patterns" in device_patterns:
+                            patterns_for_type = device_patterns[
+                                f"{device_type}_patterns"
+                            ]
+                        else:
+                            # Attempt to normalize keys like "gpu_patterns" or "gpu" in the override
+                            legacy_key = f"{device_type}_patterns"
+                            if legacy_key in baseboard_device_patterns:
+                                override = baseboard_device_patterns[legacy_key]
+                                if isinstance(override, (list, tuple, set)):
+                                    baseboard_device_patterns.setdefault(
+                                        device_type, []
+                                    )
+                                    baseboard_device_patterns[device_type].extend(
+                                        list(override)
+                                    )
+                                    patterns_for_type = baseboard_device_patterns[
+                                        device_type
+                                    ]
+                                elif isinstance(override, dict):
+                                    device_patterns[device_type] = list(
+                                        override.get("override", [])
+                                    )
+                                    device_patterns.setdefault(device_type, []).extend(
+                                        list(override.get("append", []))
+                                    )
+                                    patterns_for_type = device_patterns[device_type]
+                                else:
+                                    baseboard_device_patterns[device_type] = [
+                                        str(override)
+                                    ]
+                                    patterns_for_type = baseboard_device_patterns[
+                                        device_type
+                                    ]
+
+                        await self._log_runtime(
+                            "DEBUG",
+                            "RedfishService",
+                            f"Matching firmware inventory components against patterns for {device_type}: {patterns_for_type}",
+                            dut_id,
+                        )
+
+                        # Match firmware inventory components against patterns
+                        for fw_component_id in fw_components.keys():
+                            for pattern_str in patterns_for_type:
+                                try:
+                                    pattern = re.compile(pattern_str)
+                                    match = pattern.match(fw_component_id)
+                                    if match:
+                                        device_id = int(match.group(1))
+                                        device_ids.add(device_id)
+                                        await self._log_runtime(
+                                            "INFO",
+                                            "RedfishService",
+                                            f"✓ Matched {device_type} device ID {device_id} from firmware inventory component '{fw_component_id}' using pattern '{pattern_str}'",
+                                            dut_id,
+                                        )
+                                        break  # Found match, move to next component
+                                    else:
+                                        await self._log_runtime(
+                                            "DEBUG",
+                                            "RedfishService",
+                                            f"  Component '{fw_component_id}' did not match pattern '{pattern_str}'",
+                                            dut_id,
+                                        )
+                                except (ValueError, IndexError, re.error) as e:
+                                    await self._log_runtime(
+                                        "WARNING",
+                                        "RedfishService",
+                                        f"Error processing firmware inventory pattern {pattern_str} for component {fw_component_id}: {e}",
+                                        dut_id,
+                                    )
+
+                        # If we found devices via firmware inventory, skip chassis-based discovery
+                        if device_ids:
+                            await self._log_runtime(
+                                "INFO",
+                                "RedfishService",
+                                f"✓ Found {len(device_ids)} {device_type} devices via firmware inventory, skipping chassis-based discovery",
+                                dut_id,
+                            )
+                            # Store and continue to next device type
+                            device_ids_list = sorted(list(device_ids))
+                            device_ids_list = _apply_num_gpus_filter(
+                                device_type, device_ids_list
+                            )
+                            discovered_devices[device_type] = device_ids_list
+                            await self._log_runtime(
+                                "INFO",
+                                "RedfishService",
+                                f"Discovered {len(device_ids_list)} {device_type} devices: {device_ids_list}",
+                                dut_id,
+                            )
+                            continue  # Skip chassis-based discovery for this device type
+                        else:
+                            await self._log_runtime(
+                                "WARNING",
+                                "RedfishService",
+                                f"No {device_type} devices found via firmware inventory (checked {len(fw_components)} components), falling back to chassis-based discovery",
+                                dut_id,
+                            )
+                    else:
+                        await self._log_runtime(
+                            "INFO",
+                            "RedfishService",
+                            f"No firmware inventory available, falling back to chassis-based discovery for {device_type}",
+                            dut_id,
+                        )
 
                 # Chassis-based discovery - generic pattern lookup
                 patterns_for_type = []
@@ -2056,6 +3282,7 @@ class RedfishService(BaseService):
 
                 # Store discovered devices for this type
                 device_ids_list = sorted(list(device_ids))
+                device_ids_list = _apply_num_gpus_filter(device_type, device_ids_list)
                 discovered_devices[device_type] = device_ids_list
 
                 await self._log_runtime(
@@ -2136,8 +3363,8 @@ class RedfishService(BaseService):
                 "error": str(e),
             }
 
-    """ 
-    Common Helpers 
+    """
+    Common Helpers
     """
 
     async def _log_collector_start(self, dut_id: str, collector_name: str, **kwargs):
@@ -2149,6 +3376,7 @@ class RedfishService(BaseService):
             collector_name: Collector name.
             kwargs: Keyword arguments.
         """
+        await self._start_redfish_request_capture(dut_id, kwargs.get("collector_id"))
         await self._log_runtime(
             "INFO", "RedfishService", f"Starting {collector_name} collection", dut_id
         )
@@ -2223,6 +3451,61 @@ class RedfishService(BaseService):
                 dut_id,
             )
 
+    async def _create_standardized_collector_result(
+        self,
+        successful_operations: int,
+        total_operations: int,
+        output_files: List[str] = None,
+        error_messages: List[str] = None,
+        operation_name: str = "operations",
+        additional_context: Dict[str, Any] = None,
+        dut_id: str = None,
+        collector_id: str = None,
+    ) -> Dict[str, Any]:
+        """Create a standardized collector result and attach Redfish request capture metadata."""
+        resolved_dut_id = dut_id or self._get_current_dut_id()
+        resolved_collector_id = collector_id or self._get_current_collector_id()
+        result: Optional[Dict[str, Any]] = None
+        parent_exception: Optional[Exception] = None
+
+        try:
+            result = await super()._create_standardized_collector_result(
+                successful_operations=successful_operations,
+                total_operations=total_operations,
+                output_files=output_files,
+                error_messages=error_messages,
+                operation_name=operation_name,
+                additional_context=additional_context,
+                dut_id=dut_id,
+                collector_id=collector_id,
+            )
+        except Exception as exc:
+            parent_exception = exc
+        finally:
+            try:
+                attached_result = await self._attach_redfish_request_capture(
+                    resolved_dut_id, result, resolved_collector_id
+                )
+                if attached_result is not None:
+                    result = attached_result
+            except Exception as attach_exc:
+                if parent_exception is None:
+                    raise
+                await self._log_runtime(
+                    "WARN",
+                    "RedfishService",
+                    (
+                        "Failed to attach Redfish request capture while handling "
+                        f"collector result exception: {attach_exc}"
+                    ),
+                    resolved_dut_id,
+                )
+
+        if parent_exception is not None:
+            raise parent_exception
+
+        return result
+
     async def _process_entities_with_common_logic(
         self,
         dut_id: str,
@@ -2241,8 +3524,11 @@ class RedfishService(BaseService):
             collector_name: Collector name.
             kwargs: Keyword arguments.
         """
+        collector_id = kwargs.get("collector_id", collector_name)
         try:
-            await self._log_collector_start(dut_id, collector_name)
+            await self._log_collector_start(
+                dut_id, collector_name, collector_id=collector_id
+            )
 
             # Get entities
             success, entities, _ = await self.dispatch_request(
@@ -2312,6 +3598,8 @@ class RedfishService(BaseService):
                 operation_name="collection",
                 additional_context={"collector_name": collector_name},
             )
+        finally:
+            await self._clear_redfish_request_capture(dut_id, collector_id)
 
     async def _save_data_to_file_with_pattern(
         self, dut_id: str, data: Any, function_tag: str, **kwargs
@@ -2334,6 +3622,16 @@ class RedfishService(BaseService):
         filename = kwargs.get("filename", "")
         entries_pattern = kwargs.get("entries_pattern", "")
         additional_data_pattern = kwargs.get("additional_data_pattern", "")
+        if not collector_id:
+            collector_id = await self._get_original_collector_id(
+                dut_id, self._get_current_collector_id()
+            )
+        if (
+            not output_pattern
+            and isinstance(function_tag, str)
+            and function_tag.endswith(".json")
+        ):
+            output_pattern = function_tag
         try:
             # Handle binary data (bytes) vs JSON/text data
             if isinstance(data, bytes):
@@ -2385,11 +3683,17 @@ class RedfishService(BaseService):
                 # Use the actual collector_id (like "R3") for proper directory structure
                 group = self._get_collector_group(collector_id)
                 if self.logger:
-                    # Use the logger's create_collector_log_file to get the proper directory structure
+                    # Use the logger's create_collector_log_file to get the collector base directory.
+                    # Pass only the basename so that create_collector_log_file doesn't create a
+                    # subdirectory itself — the full relative path (e.g. "DGX/foo.tar.xz") is
+                    # resolved from temp_file_path.parent below, avoiding a double "DGX/DGX/" nesting.
                     temp_file_path = await self.logger.create_collector_log_file(
-                        dut_id, group, collector_id, final_filename
+                        dut_id, group, collector_id, Path(final_filename).name
                     )
                     file_path = temp_file_path.parent / final_filename
+
+                    # Ensure parent directory exists (supports subdirectories in output_pattern)
+                    os.makedirs(file_path.parent, exist_ok=True)
 
                     # Write binary data directly
                     with open(file_path, "wb") as f:
@@ -2646,7 +3950,7 @@ class RedfishService(BaseService):
                 await self._log_runtime(
                     "DEBUG",
                     "RedfishService",
-                    f"Platform detection: DUT config not accessible",
+                    "Platform detection: DUT config not accessible",
                     dut_id,
                 )
 
@@ -2670,7 +3974,7 @@ class RedfishService(BaseService):
             return {"platform_type": "Unknown"}
 
     """
-    Task Management 
+    Task Management
     """
 
     async def _append_to_diagnostic_json_array(
@@ -2712,11 +4016,9 @@ class RedfishService(BaseService):
 
             group = self._get_collector_group(file_collector_id)
             if self.logger:
-                # Get the proper file path using the logger's directory structure
-                temp_file_path = await self.logger.create_collector_log_file(
+                file_path = await self.logger.create_collector_log_file(
                     dut_id, group, file_collector_id, filename
                 )
-                file_path = temp_file_path.parent / filename
             else:
                 # Fallback if logger not available
                 file_path = Path(filename)
@@ -2768,7 +4070,7 @@ class RedfishService(BaseService):
         **kwargs,
     ) -> Optional[Dict[str, Any]]:
         """
-        Wait for a Redfish task to complete.
+        Wait for a Redfish task to complete (matching legacy behavior).
 
         Args:
             dut_id: DUT ID.
@@ -2780,59 +4082,26 @@ class RedfishService(BaseService):
         Returns:
             Task completion data or None if failed.
         """
-        # Get collector context for better logging
         collector_id = kwargs.get("collector_id", "unknown")
-        await self._log_runtime(
-            "INFO",
-            "RedfishService",
-            f"[{collector_id}] === ENTERING _wait_for_task_completion for task {task_id} with max_retries={max_retries} ===",
-            dut_id,
-        )
 
         try:
             task_service_uri = self.get_configured_uri(dut_id, "TaskService")
             task_uri = f"{task_service_uri}/Tasks/{task_id}"
-
-            # Calculate timeout
-            retry_interval = 30  # seconds
+            retry_interval = 30
             total_timeout = max_retries * retry_interval
 
             await self._log_runtime(
                 "INFO",
                 "RedfishService",
-                f"[{collector_id}] Starting task monitoring for {task_id} with {max_retries} retries ({total_timeout}s total)",
+                f"[{collector_id}] Starting task monitoring for {task_id} ({max_retries} retries, {total_timeout}s timeout)",
                 dut_id,
             )
 
-            await self._log_runtime(
-                "DEBUG",
-                "RedfishService",
-                f"Task monitoring parameters: task_id={task_id}, task_uri={task_uri}, max_retries={max_retries}, retry_interval={retry_interval}",
-                dut_id,
-            )
-
-            # Initial wait for quick tasks
             await asyncio.sleep(2)
-
-            # Test the task URI first to make sure it's accessible
-            await self._log_runtime(
-                "DEBUG",
-                "RedfishService",
-                f"Testing task URI accessibility: {task_uri}",
-                dut_id,
-            )
 
             test_success, test_response, _ = await self.dispatch_request(
                 dut_id, "GET", task_uri, bypass_cache=True
             )
-
-            await self._log_runtime(
-                "DEBUG",
-                "RedfishService",
-                f"Task URI test result: success={test_success}, response_type={type(test_response)}",
-                dut_id,
-            )
-
             if not test_success:
                 await self._log_runtime(
                     "ERROR",
@@ -2842,93 +4111,19 @@ class RedfishService(BaseService):
                 )
                 return None
 
+            prev_state = None
+            prev_percent = None
+
             for attempt in range(max_retries):
-                await self._log_runtime(
-                    "DEBUG",
-                    "RedfishService",
-                    f"=== STARTING Task monitoring attempt {attempt + 1}/{max_retries} for task {task_id} ===",
-                    dut_id,
-                )
-
-                await self._log_runtime(
-                    "DEBUG",
-                    "RedfishService",
-                    f"About to make dispatch_request for task {task_id}, attempt {attempt + 1}",
-                    dut_id,
-                )
-
                 try:
-                    await self._log_runtime(
-                        "INFO",
-                        "RedfishService",
-                        f"=== DISPATCH REQUEST DEBUG START for task {task_id}, attempt {attempt + 1} ===",
-                        dut_id,
-                    )
-                    await self._log_runtime(
-                        "INFO",
-                        "RedfishService",
-                        f"Request details: method=GET, uri={task_uri}, bypass_cache=True",
-                        dut_id,
-                    )
-
                     success, response, _ = await self.dispatch_request(
                         dut_id, "GET", task_uri, bypass_cache=True
-                    )
-
-                    await self._log_runtime(
-                        "INFO",
-                        "RedfishService",
-                        f"Dispatch request completed: success={success}, response_type={type(response)}",
-                        dut_id,
-                    )
-
-                    if success and response:
-                        # Safely log response content, avoiding binary data
-                        try:
-                            if isinstance(response, bytes):
-                                response_log = f"Task {task_id} response content: <binary data, {len(response)} bytes>"
-                            else:
-                                response_log = f"Task {task_id} response content: {json.dumps(response, indent=2)}"
-                        except (TypeError, ValueError) as e:
-                            response_log = f"Task {task_id} response content: <unable to serialize: {type(response)}, error: {e}>"
-
-                        await self._log_runtime(
-                            "INFO", "RedfishService", response_log, dut_id
-                        )
-
-                        # Check if we have TaskState in the response
-                        task_state = response.get("TaskState", "NOT_FOUND")
-                        await self._log_runtime(
-                            "INFO",
-                            "RedfishService",
-                            f"Task {task_id} TaskState: {task_state}",
-                            dut_id,
-                        )
-                    else:
-                        await self._log_runtime(
-                            "ERROR",
-                            "RedfishService",
-                            f"Dispatch request failed for task {task_id}, attempt {attempt + 1}: response={response}",
-                            dut_id,
-                        )
-
-                    await self._log_runtime(
-                        "INFO",
-                        "RedfishService",
-                        f"=== DISPATCH REQUEST DEBUG END for task {task_id}, attempt {attempt + 1} ===",
-                        dut_id,
                     )
                 except Exception as e:
                     await self._log_runtime(
                         "ERROR",
                         "RedfishService",
-                        f"Exception in dispatch_request for task {task_id}, attempt {attempt + 1}: {str(e)}",
-                        dut_id,
-                    )
-                    await self._log_runtime(
-                        "ERROR",
-                        "RedfishService",
-                        f"Exception type: {type(e).__name__}, Exception args: {e.args}",
+                        f"Task {task_id} poll error (attempt {attempt + 1}/{max_retries}): {type(e).__name__}: {e}",
                         dut_id,
                     )
                     success = False
@@ -2938,14 +4133,12 @@ class RedfishService(BaseService):
                     await self._log_runtime(
                         "WARN",
                         "RedfishService",
-                        f"Failed to fetch task {task_id} status (attempt {attempt + 1}/{max_retries})",
+                        f"Task {task_id} poll failed (attempt {attempt + 1}/{max_retries})",
                         dut_id,
                     )
-
-                    # Check for critical failures that should cause early exit
                     if isinstance(response, str) and any(
-                        keyword in response.lower()
-                        for keyword in [
+                        kw in response.lower()
+                        for kw in [
                             "unauthorized",
                             "forbidden",
                             "not found",
@@ -2956,36 +4149,29 @@ class RedfishService(BaseService):
                         await self._log_runtime(
                             "ERROR",
                             "RedfishService",
-                            f"Critical failure detected for task {task_id}: {response}. Exiting task monitoring.",
+                            f"Task {task_id} critical failure: {response}",
                             dut_id,
                         )
                         return None
-
-                    await self._log_runtime(
-                        "DEBUG",
-                        "RedfishService",
-                        f"Sleeping {retry_interval}s before next attempt for task {task_id}",
-                        dut_id,
-                    )
                     await asyncio.sleep(retry_interval)
                     continue
 
-                # Log the first response to see what we're getting
-                if attempt == 0:
-                    # Safely log initial task response, avoiding binary data
-                    try:
-                        if isinstance(response, bytes):
-                            response_log = f"Initial task response for {task_id}: <binary data, {len(response)} bytes>"
-                        else:
-                            response_log = f"Initial task response for {task_id}: {json.dumps(response, indent=2)}"
-                    except (TypeError, ValueError) as e:
-                        response_log = f"Initial task response for {task_id}: <unable to serialize: {type(response)}, error: {e}>"
+                # Log full response at DEBUG only
+                try:
+                    if isinstance(response, bytes):
+                        response_log = f"<binary data, {len(response)} bytes>"
+                    else:
+                        response_log = json.dumps(response, indent=2)
+                except (TypeError, ValueError):
+                    response_log = f"<unable to serialize: {type(response)}>"
+                await self._log_runtime(
+                    "DEBUG",
+                    "RedfishService",
+                    f"Task {task_id} response (attempt {attempt + 1}): {response_log}",
+                    dut_id,
+                )
 
-                    await self._log_runtime(
-                        "DEBUG", "RedfishService", response_log, dut_id
-                    )
-
-                # Save intermediate task status for monitoring progress
+                # Save intermediate status to metadata
                 if function_tag and entity_context and success and response:
                     status_data = {
                         "task_id": task_id,
@@ -3008,158 +4194,54 @@ class RedfishService(BaseService):
                         kwargs.get("collector_id", "unknown"),
                     )
 
-                await self._log_runtime(
-                    "DEBUG",
-                    "RedfishService",
-                    f"Validating response for task {task_id}, attempt {attempt + 1}: type={type(response)}",
-                    dut_id,
-                )
-
-                # Validate response
                 if not isinstance(response, dict) or "TaskState" not in response:
                     await self._log_runtime(
                         "WARN",
                         "RedfishService",
-                        f"Received malformed task response: {response}",
-                        dut_id,
-                    )
-                    await self._log_runtime(
-                        "DEBUG",
-                        "RedfishService",
-                        f"Sleeping {retry_interval}s before next attempt for task {task_id}",
+                        f"Task {task_id} malformed response (attempt {attempt + 1}/{max_retries})",
                         dut_id,
                     )
                     await asyncio.sleep(retry_interval)
                     continue
 
-                try:
-                    task_state = response.get("TaskState", "")
-                    task_status = response.get("TaskStatus", "")
-                    percent_complete = response.get("PercentComplete", "")
+                task_state = response.get("TaskState", "")
+                task_status = response.get("TaskStatus", "")
+                percent_complete = response.get("PercentComplete", "")
 
-                    await self._log_runtime(
-                        "DEBUG",
-                        "RedfishService",
-                        f"Task {task_id}, attempt {attempt + 1}: TaskState='{task_state}', TaskStatus='{task_status}', PercentComplete='{percent_complete}'",
-                        dut_id,
-                    )
-
-                    # Log task state changes as INFO for better visibility
-                    if (
-                        attempt == 0
-                        or task_state != "Running"
-                        or percent_complete != "0"
-                    ):
-                        await self._log_runtime(
-                            "INFO",
-                            "RedfishService",
-                            f"Task {task_id}, attempt {attempt + 1}: TaskState='{task_state}', TaskStatus='{task_status}', PercentComplete='{percent_complete}'",
-                            dut_id,
-                        )
-                except Exception as e:
-                    await self._log_runtime(
-                        "ERROR",
-                        "RedfishService",
-                        f"Error parsing task state for task {task_id}, attempt {attempt + 1}: {str(e)}",
-                        dut_id,
-                    )
-                    await self._log_runtime(
-                        "ERROR",
-                        "RedfishService",
-                        f"Task state parsing error details: type={type(e).__name__}, args={e.args}",
-                        dut_id,
-                    )
-                    # Continue with next attempt
-                    await asyncio.sleep(retry_interval)
-                    continue
-
-                # Log detailed task information
-                task_info = f"TaskState: {task_state}"
-                if task_status:
-                    task_info += f", TaskStatus: {task_status}"
-                if percent_complete:
-                    task_info += f", PercentComplete: {percent_complete}%"
-
-                # Log progress every 10 attempts (every 5 minutes)
-                if (attempt + 1) % 10 == 0:
-                    await self._log_runtime(
-                        "INFO",
-                        "RedfishService",
-                        f"Task {task_id} still running - attempt {attempt + 1}/{max_retries} ({task_info})",
-                        dut_id,
-                    )
-
-                # Also log every 5 attempts for better visibility
-                if (attempt + 1) % 5 == 0:
-                    await self._log_runtime(
-                        "INFO",
-                        "RedfishService",
-                        f"Task {task_id} progress - attempt {attempt + 1}/{max_retries} ({task_info})",
-                        dut_id,
-                    )
-
-                # Check for completion states
-                await self._log_runtime(
-                    "DEBUG",
-                    "RedfishService",
-                    f"Checking completion states for task {task_id}, attempt {attempt + 1}: TaskState='{task_state}'",
-                    dut_id,
+                # Log one line per poll: only when state or progress changes, or every 5th attempt
+                state_changed = (
+                    task_state != prev_state or percent_complete != prev_percent
                 )
-
-                if task_state == "Completed":
+                periodic = (attempt + 1) % 5 == 0
+                if state_changed or periodic or attempt == 0:
                     await self._log_runtime(
                         "INFO",
                         "RedfishService",
-                        f"Task {task_id} completed successfully after {attempt + 1} attempts ({task_info})",
+                        f"Task {task_id} attempt {attempt + 1}/{max_retries}: {task_state}, {percent_complete}% complete",
                         dut_id,
                     )
-                    await self._log_runtime(
-                        "DEBUG",
-                        "RedfishService",
-                        f"EXITING _wait_for_task_completion for task {task_id} - COMPLETED",
-                        dut_id,
-                    )
+                prev_state = task_state
+                prev_percent = percent_complete
 
-                    # Save task completion to array-based file
-                    if function_tag and entity_context:
-                        completion_data = {
-                            "task_id": task_id,
-                            "final_state": task_state,
-                            "total_attempts": attempt + 1,
-                            "max_retries": max_retries,
-                            "completion_response": response,
-                            "entity_type": entity_context.get("entity_type", "unknown"),
-                            "entity_id": entity_context.get("entity_id", "unknown"),
-                            "log_service": entity_context.get("log_service", "unknown"),
-                            "timestamp": datetime.now().isoformat(),
-                        }
-                        await self._append_to_diagnostic_json_array(
-                            dut_id,
-                            completion_data,
-                            function_tag,
-                            "task_completions",
-                            kwargs.get("collector_id", "unknown"),
-                        )
-
-                    return response
-                elif task_state in [
+                # Completion states
+                if task_state in [
+                    "Completed",
                     "Succeeded",
                     "Done",
-                ]:  # Additional success states
+                    "Completed with Warnings",
+                ]:
+                    label = (
+                        "completed"
+                        if task_state == "Completed"
+                        else f"completed ({task_state})"
+                    )
                     await self._log_runtime(
                         "INFO",
                         "RedfishService",
-                        f"Task completed with alternate success state: {task_state} after {attempt + 1} attempts ({task_info})",
-                        dut_id,
-                    )
-                    await self._log_runtime(
-                        "DEBUG",
-                        "RedfishService",
-                        f"EXITING _wait_for_task_completion for task {task_id} - SUCCEEDED/DONE",
+                        f"Task {task_id} {label} after {attempt + 1} attempts",
                         dut_id,
                     )
 
-                    # Save task completion to array-based file
                     if function_tag and entity_context:
                         completion_data = {
                             "task_id": task_id,
@@ -3179,128 +4261,43 @@ class RedfishService(BaseService):
                             "task_completions",
                             kwargs.get("collector_id", "unknown"),
                         )
-
-                    return response
-                elif task_state in ["Completed with Warnings"]:
-                    await self._log_runtime(
-                        "INFO",
-                        "RedfishService",
-                        f"Task {task_id} completed with warnings after {attempt + 1} attempts ({task_info})",
-                        dut_id,
-                    )
-                    await self._log_runtime(
-                        "DEBUG",
-                        "RedfishService",
-                        f"EXITING _wait_for_task_completion for task {task_id} - COMPLETED WITH WARNINGS",
-                        dut_id,
-                    )
-
-                    # Save task completion to array-based file
-                    if function_tag and entity_context:
-                        completion_data = {
-                            "task_id": task_id,
-                            "final_state": task_state,
-                            "total_attempts": attempt + 1,
-                            "max_retries": max_retries,
-                            "completion_response": response,
-                            "entity_type": entity_context.get("entity_type", "unknown"),
-                            "entity_id": entity_context.get("entity_id", "unknown"),
-                            "log_service": entity_context.get("log_service", "unknown"),
-                            "timestamp": datetime.now().isoformat(),
-                        }
-                        await self._append_to_diagnostic_json_array(
-                            dut_id,
-                            completion_data,
-                            function_tag,
-                            "task_completions",
-                            kwargs.get("collector_id", "unknown"),
-                        )
-
                     return response
 
-                # Check for terminal failure states
+                # Terminal failure states
                 if task_state in ["Failed", "Cancelled", "Exception", "Aborted"]:
-                    await self._log_runtime(
-                        "DEBUG",
-                        "RedfishService",
-                        f"Task {task_id} in terminal failure state: {task_state}",
-                        dut_id,
-                    )
-                    # Log detailed error information
                     error_details = []
                     if "Messages" in response:
                         try:
                             messages = response["Messages"]
                             if isinstance(messages, bytes):
                                 error_details.append(
-                                    f"Messages: <binary data, {len(messages)} bytes>"
+                                    f"Messages: <binary, {len(messages)} bytes>"
                                 )
                             else:
                                 error_details.append(
                                     f"Messages: {json.dumps(messages, indent=2)}"
                                 )
                         except Exception:
-                            error_details.append(
-                                "Messages: [Error serializing messages]"
-                            )
+                            error_details.append("Messages: [serialization error]")
                     if task_status:
                         error_details.append(f"TaskStatus: {task_status}")
-                    if percent_complete:
-                        error_details.append(f"PercentComplete: {percent_complete}%")
 
-                    error_msg = (
-                        "\n".join(error_details)
-                        if error_details
-                        else "No additional details"
-                    )
                     await self._log_runtime(
                         "ERROR",
                         "RedfishService",
-                        f"Task {task_id} failed with state: {task_state}\nDetails: {error_msg}",
-                        dut_id,
-                    )
-                    await self._log_runtime(
-                        "DEBUG",
-                        "RedfishService",
-                        f"EXITING _wait_for_task_completion for task {task_id} - FAILED",
+                        f"Task {task_id} failed ({task_state}) after {attempt + 1} attempts. {'; '.join(error_details) if error_details else ''}",
                         dut_id,
                     )
                     return None
 
-                # Still running, wait 30 seconds
-                if attempt < max_retries - 1:  # Don't sleep on last attempt
-                    await self._log_runtime(
-                        "DEBUG",
-                        "RedfishService",
-                        f"Task {task_id} still running, sleeping {retry_interval}s before next attempt (attempt {attempt + 1}/{max_retries})",
-                        dut_id,
-                    )
+                # Still running — sleep before next poll
+                if attempt < max_retries - 1:
                     await asyncio.sleep(retry_interval)
-                else:
-                    await self._log_runtime(
-                        "DEBUG",
-                        "RedfishService",
-                        f"Task {task_id} last attempt ({attempt + 1}/{max_retries}), not sleeping",
-                        dut_id,
-                    )
 
-            # Timeout after max retries
-            await self._log_runtime(
-                "DEBUG",
-                "RedfishService",
-                f"Task {task_id} loop completed, checking for timeout",
-                dut_id,
-            )
             await self._log_runtime(
                 "ERROR",
                 "RedfishService",
-                f"Task {task_id} timed out after {total_timeout} seconds ({max_retries} retries)",
-                dut_id,
-            )
-            await self._log_runtime(
-                "DEBUG",
-                "RedfishService",
-                f"EXITING _wait_for_task_completion for task {task_id} - TIMEOUT",
+                f"Task {task_id} timed out after {total_timeout}s ({max_retries} retries)",
                 dut_id,
             )
             return None
@@ -3309,13 +4306,7 @@ class RedfishService(BaseService):
             await self._log_runtime(
                 "ERROR",
                 "RedfishService",
-                f"Exception in task monitoring: {str(e)}",
-                dut_id,
-            )
-            await self._log_runtime(
-                "DEBUG",
-                "RedfishService",
-                f"EXITING _wait_for_task_completion for task {task_id} - EXCEPTION",
+                f"Task {task_id} monitoring exception: {type(e).__name__}: {e}",
                 dut_id,
             )
             return None
@@ -3324,7 +4315,7 @@ class RedfishService(BaseService):
         self, task_response: Dict[str, Any], dut_id: str = None, attachment: bool = True
     ) -> Optional[str]:
         """
-        Get the log dump location for a redfish task.
+        Get the log dump location for a redfish task (matching legacy behavior).
 
         Args:
             task_response: Task response data.
@@ -3335,33 +4326,66 @@ class RedfishService(BaseService):
             Dump location URI or None if not found.
         """
         try:
-            # Get location from HttpHeaders
+            # Get location from HttpHeaders like legacy code
             resp_headers = task_response.get("Payload", {}).get("HttpHeaders", [])
             dump_location = ""
 
             for header in resp_headers:
-                if header.startswith("Location:"):
-                    dump_location = header.lstrip("Location:").strip()
+                header_name, separator, header_value = str(header).partition(":")
+                if separator and header_name.strip().lower() == "location":
+                    dump_location = header_value.strip()
                     if attachment:
-                        # Fetch the URI to get AdditionalDataURI
+                        if dump_location.endswith("/attachment"):
+                            await self._log_runtime(
+                                "DEBUG",
+                                "RedfishService",
+                                f"Using attachment URI from task Location header: {dump_location}",
+                                dut_id,
+                            )
+                            break
+
+                        # Fetch the URI to get AdditionalDataURI like legacy
                         success, resp, _ = await self.dispatch_request(
                             dut_id, "GET", dump_location, bypass_cache=True
                         )
-                        if success and resp.get("AdditionalDataURI"):
-                            dump_location = resp.get("AdditionalDataURI")
+                        if (
+                            success
+                            and isinstance(resp, dict)
+                            and resp.get("AdditionalDataURI")
+                        ):
+                            dump_location = resp["AdditionalDataURI"]
                         else:
-                            await self._log_runtime(
-                                "WARN",
-                                "RedfishService",
-                                "Could not fetch attachment URI. Returning default value",
-                                dut_id,
-                            )
-                            # Fall back to previous default
+                            # Fall back to previous default like legacy
                             if not dump_location.endswith("/attachment"):
                                 dump_location = dump_location + "/attachment"
+                            await self._log_runtime(
+                                "DEBUG",
+                                "RedfishService",
+                                f"No AdditionalDataURI found; using fallback attachment URI: {dump_location}",
+                                dut_id,
+                            )
                     break
 
-            return dump_location if dump_location else None
+            if dump_location:
+                return dump_location
+
+            # Fallback: DiagnosticLog endpoint (e.g. Managers/BMC/LogServices/DiagnosticLog)
+            # embeds the attachment URI in Messages[*].MessageArgs rather than HttpHeaders.
+            # Example MessageId: "Ami.1.0.0.DiagnosticDumpCreated"
+            messages = task_response.get("Messages", [])
+            for msg in messages:
+                args = msg.get("MessageArgs", [])
+                if args and str(args[0]).startswith("/redfish/"):
+                    dump_location = args[0]
+                    await self._log_runtime(
+                        "DEBUG",
+                        "RedfishService",
+                        f"Found dump location in Messages.MessageArgs: {dump_location}",
+                        dut_id,
+                    )
+                    return dump_location
+
+            return None
         except Exception as e:
             await self._log_runtime(
                 "ERROR",
@@ -3370,6 +4394,64 @@ class RedfishService(BaseService):
                 dut_id,
             )
             return None
+
+    @staticmethod
+    def _replace_output_pattern_extension(
+        output_pattern: str, new_extension: str
+    ) -> str:
+        """Replace common artifact extensions while preserving directories/templates."""
+        if not output_pattern:
+            return output_pattern
+
+        known_suffixes = (
+            ".tar.gz",
+            ".tgz",
+            ".tar.xz",
+            ".txz",
+            ".tar.bz2",
+            ".tbz2",
+            ".zip",
+            ".gz",
+            ".xz",
+            ".bin",
+            ".txt",
+            ".json",
+        )
+        for suffix in known_suffixes:
+            if output_pattern.lower().endswith(suffix):
+                return output_pattern[: -len(suffix)] + new_extension
+        return output_pattern + new_extension
+
+    def _prepare_downloaded_dump_for_save(
+        self, dump_data: Any, output_pattern: str
+    ) -> Tuple[Any, str, str, int]:
+        """
+        Classify downloaded Redfish dump content before saving.
+
+        Some Redfish attachment endpoints return JSON even though the collector
+        output pattern is archive-shaped. Preserve binary/archive payloads, but
+        save JSON payloads as JSON with a matching extension.
+        """
+        if not isinstance(dump_data, bytes):
+            data_size = len(dump_data) if hasattr(dump_data, "__len__") else 0
+            data_type = "json" if isinstance(dump_data, (dict, list)) else "text"
+            return dump_data, data_type, output_pattern, data_size
+
+        data_size = len(dump_data)
+        stripped = dump_data.lstrip()
+        if stripped.startswith((b"{", b"[")):
+            try:
+                parsed_json = json.loads(dump_data.decode("utf-8-sig"))
+                return (
+                    parsed_json,
+                    "json",
+                    self._replace_output_pattern_extension(output_pattern, ".json"),
+                    data_size,
+                )
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                pass
+
+        return dump_data, "binary", output_pattern, data_size
 
     async def _try_fallback_payloads(
         self,
@@ -3470,7 +4552,7 @@ class RedfishService(BaseService):
             return False
 
     """
-    Utility Functions 
+    Utility Functions
     """
 
     def _extract_output_pattern_params(
@@ -3537,39 +4619,573 @@ class RedfishService(BaseService):
             )
             return None
 
-    def _extract_nested_value(self, data: Dict[str, Any], path: str) -> Any:
+    @staticmethod
+    def _split_path_tokens(path: str) -> List[Union[str, int]]:
         """
-        Extract nested value from dictionary using dot notation path.
+        Split a dot/bracket notation path into tokens that can be used
+        for nested dictionary/list traversal.
+
+        Supports patterns like "Members[0].@odata.id" or "Location[0].Uri".
+        """
+        if not path:
+            return []
+
+        tokens: List[Union[str, int]] = []
+        buffer: List[str] = []
+        i = 0
+        length = len(path)
+
+        while i < length:
+            char = path[i]
+
+            if char == "[":
+                end_idx = path.find("]", i)
+                if end_idx == -1:
+                    buffer.append(char)
+                    i += 1
+                    continue
+
+                # Flush current buffer as string token
+                if buffer:
+                    tokens.append("".join(buffer))
+                    buffer.clear()
+
+                index_str = path[i + 1 : end_idx]
+                if index_str.isdigit():
+                    tokens.append(int(index_str))
+
+                i = end_idx + 1
+                continue
+
+            if char == ".":
+                if buffer and "@" in buffer:
+                    buffer.append(char)
+                else:
+                    if buffer:
+                        tokens.append("".join(buffer))
+                        buffer.clear()
+                i += 1
+                continue
+
+            buffer.append(char)
+            i += 1
+
+        if buffer:
+            tokens.append("".join(buffer))
+
+        return tokens
+
+    def _extract_nested_value(self, data: Any, path: Any) -> Any:
+        """
+        Extract nested value from dictionary or list using dot/bracket notation path
+        or an explicit token list.
 
         Args:
-            data: Dictionary to search.
-            path: Dot-notation path to value.
+            data: Dictionary or list to search.
+            path: Dot/bracket notation path to value, or a list/tuple of path tokens.
 
         Returns:
             Extracted value or None if not found.
         """
-        # Handle special case for @odata.id pattern - this is a common Redfish pattern
-        if ".@odata.id" in path:
-            # Split on ".@odata.id" to get the parent path
-            parts = path.split(".@odata.id")
-            if len(parts) == 2:
-                parent_key = parts[0]
-                parent_data = self._extract_nested_value(data, parent_key)
-                if isinstance(parent_data, dict):
-                    return parent_data.get("@odata.id")
+        if data is None or path is None:
             return None
 
-        # For other cases, use the original dot notation approach
-        keys = path.split(".")
-        current = data
+        if isinstance(path, (list, tuple)):
+            tokens = list(path)
+        else:
+            tokens = self._split_path_tokens(path)
+        current: Any = data
 
-        for key in keys:
-            if isinstance(current, dict) and key in current:
-                current = current[key]
+        for token in tokens:
+            if isinstance(token, int):
+                if isinstance(current, list) and 0 <= token < len(current):
+                    current = current[token]
+                else:
+                    return None
             else:
-                return None
+                if isinstance(current, dict) and token in current:
+                    current = current[token]
+                else:
+                    return None
 
         return current
+
+    @staticmethod
+    def _resolve_placeholder(value: Any, context: Dict[str, Any]) -> Any:
+        """
+        Resolve simple ${var_name} placeholders using the provided context.
+
+        Args:
+            value: Original value (string with placeholder or other types).
+            context: Context dictionary for variable substitution.
+
+        Returns:
+            Resolved value if placeholder is found, otherwise original value.
+        """
+        if isinstance(value, str):
+            if value.startswith("${") and value.endswith("}"):
+                key = value[2:-1]
+                return context.get(key, value)
+        return value
+
+    def _get_dut_baseboard_name(self, dut_id: str) -> Optional[str]:
+        """
+        Helper to fetch baseboard name for a DUT.
+        """
+        try:
+            dut = None
+            if hasattr(self, "dut_manager") and self.dut_manager:
+                dut = self.dut_manager.get_dut(dut_id)
+            if dut and hasattr(dut, "config"):
+                return dut.config.get("baseboard")
+
+            # Fallback to DUT config lookup
+            dut_config = (
+                self.dut_manager.get_dut_config(dut_id)
+                if hasattr(self, "dut_manager")
+                else {}
+            )
+            return dut_config.get("baseboard")
+        except Exception:
+            return None
+
+    async def _should_apply_dynamic_discovery(
+        self,
+        dut_id: str,
+        collector_name: str,
+        collector_id: str,
+        function_tag: str,
+        discovery_config: Dict[str, Any],
+        collector_def: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Determine whether a dynamic discovery entry should be applied for the DUT.
+        """
+        apply_when = discovery_config.get("apply_when")
+        baseboard_name = self._get_dut_baseboard_name(dut_id)
+
+        if not apply_when:
+            return True, baseboard_name
+
+        # Collector ID filter
+        collector_ids = apply_when.get("collector_ids")
+        if collector_ids and collector_id not in collector_ids:
+            await self._log_runtime(
+                "DEBUG",
+                "RedfishService",
+                f"Dynamic discovery skipped for {collector_name}: collector_id '{collector_id}' not in {collector_ids}",
+                dut_id,
+            )
+            return False, baseboard_name
+
+        # Function tag filter
+        function_tags = apply_when.get("function_tags")
+        if function_tags and function_tag not in function_tags:
+            await self._log_runtime(
+                "DEBUG",
+                "RedfishService",
+                f"Dynamic discovery skipped for {collector_name}: function tag '{function_tag}' not in {function_tags}",
+                dut_id,
+            )
+            return False, baseboard_name
+
+        applicable_baseboards: List[str] = []
+        if collector_def:
+            collector_applicable = collector_def.get("applicable_baseboards")
+            if isinstance(collector_applicable, list):
+                applicable_baseboards = collector_applicable
+            elif isinstance(collector_applicable, str):
+                if collector_applicable.lower() != "all":
+                    applicable_baseboards = [collector_applicable]
+
+        baseboards = apply_when.get("baseboards")
+        if (
+            not baseboards
+            and apply_when.get("use_applicable_baseboards")
+            and applicable_baseboards
+        ):
+            baseboards = applicable_baseboards
+
+        if baseboards:
+            if not baseboard_name:
+                await self._log_runtime(
+                    "DEBUG",
+                    "RedfishService",
+                    f"Dynamic discovery skipped for {collector_name}: baseboard unknown, required one of {baseboards}",
+                    dut_id,
+                )
+                return False, baseboard_name
+            if baseboard_name not in baseboards:
+                await self._log_runtime(
+                    "DEBUG",
+                    "RedfishService",
+                    f"Dynamic discovery skipped for {collector_name}: baseboard '{baseboard_name}' not in {baseboards}",
+                    dut_id,
+                )
+                return False, baseboard_name
+
+        baseboard_groups = apply_when.get("baseboard_groups")
+        if (
+            not baseboard_groups
+            and apply_when.get("use_applicable_baseboard_groups")
+            and applicable_baseboards
+        ):
+            derived_groups: List[str] = []
+            baseboard_manager = None
+            if (
+                hasattr(self, "dut_manager")
+                and self.dut_manager
+                and hasattr(self.dut_manager, "_get_baseboard_manager")
+            ):
+                baseboard_manager = self.dut_manager._get_baseboard_manager()
+
+            if baseboard_manager:
+                for candidate in applicable_baseboards:
+                    group_name = baseboard_manager.get_baseboard_type(candidate)
+                    if group_name:
+                        derived_groups.append(group_name)
+
+            if derived_groups:
+                baseboard_groups = derived_groups
+
+        if baseboard_groups:
+            if not baseboard_name:
+                await self._log_runtime(
+                    "DEBUG",
+                    "RedfishService",
+                    f"Dynamic discovery skipped for {collector_name}: baseboard unknown, required group in {baseboard_groups}",
+                    dut_id,
+                )
+                return False, baseboard_name
+
+            baseboard_manager = None
+            if (
+                hasattr(self, "dut_manager")
+                and self.dut_manager
+                and hasattr(self.dut_manager, "_get_baseboard_manager")
+            ):
+                baseboard_manager = self.dut_manager._get_baseboard_manager()
+
+            baseboard_type = None
+            if baseboard_manager:
+                baseboard_type = baseboard_manager.get_baseboard_type(baseboard_name)
+            elif hasattr(self, "dut_manager") and self.dut_manager:
+                dut_config = self.dut_manager.get_dut_config(dut_id)
+                baseboard_type = dut_config.get("baseboard_type")
+
+            if baseboard_type not in baseboard_groups:
+                await self._log_runtime(
+                    "DEBUG",
+                    "RedfishService",
+                    (
+                        f"Dynamic discovery skipped for {collector_name}: baseboard "
+                        f"'{baseboard_name}' (type={baseboard_type}) not in groups {baseboard_groups}"
+                    ),
+                    dut_id,
+                )
+                return False, baseboard_name
+
+        return True, baseboard_name
+
+    def _apply_discovered_value(
+        self,
+        current_value: Optional[Union[str, List[str]]],
+        discovered_value: Optional[Union[str, List[str]]],
+        behavior: str,
+        deduplicate: bool = False,
+    ) -> Optional[Union[str, List[str]]]:
+        """
+        Apply discovered value to existing configuration using the specified behavior.
+        """
+        if discovered_value is None:
+            return current_value
+
+        if behavior == "append":
+
+            def _normalize_to_list(value: Optional[Any]) -> List[str]:
+                if value is None:
+                    return []
+                if isinstance(value, list):
+                    return list(value)
+                if isinstance(value, str):
+                    return [value]
+                return [str(value)]
+
+            combined: List[str] = _normalize_to_list(current_value)
+            combined.extend(_normalize_to_list(discovered_value))
+
+            if deduplicate:
+                seen = set()
+                deduped: List[str] = []
+                for item in combined:
+                    if item not in seen:
+                        seen.add(item)
+                        deduped.append(item)
+                combined = deduped
+
+            if not combined:
+                return None
+
+            should_return_list = (
+                isinstance(current_value, list)
+                or isinstance(discovered_value, list)
+                or len(combined) != 1
+            )
+
+            return combined if should_return_list else combined[0]
+
+        # Default to override behavior
+        return discovered_value
+
+    async def _perform_dynamic_uri_discovery(
+        self,
+        dut_id: str,
+        collector_name: str,
+        discovery_config: Dict[str, Any],
+        context: Dict[str, Any],
+    ) -> Optional[Union[str, List[str]]]:
+        """
+        Execute a dynamic URI discovery workflow based on configuration.
+        """
+        strategy = discovery_config.get("strategy", "registry_member")
+        config_name = discovery_config.get("name") or strategy
+
+        await self._log_runtime(
+            "DEBUG",
+            "RedfishService",
+            f"Starting dynamic URI discovery '{config_name}' using strategy '{strategy}'",
+            dut_id,
+        )
+
+        if strategy != "registry_member":
+            await self._log_runtime(
+                "WARNING",
+                "RedfishService",
+                f"Unsupported dynamic discovery strategy '{strategy}' for {collector_name}",
+                dut_id,
+            )
+            return None
+
+        base_uri = self._resolve_placeholder(
+            discovery_config.get("base_uri", "/redfish/v1/Registries"), context
+        )
+        if not isinstance(base_uri, str) or not base_uri:
+            await self._log_runtime(
+                "ERROR",
+                "RedfishService",
+                f"Dynamic discovery '{config_name}' missing valid base_uri",
+                dut_id,
+            )
+            return None
+
+        bypass_cache = discovery_config.get("bypass_cache", True)
+        success, registries_data, _ = await self.dispatch_request(
+            dut_id, "GET", base_uri, bypass_cache=bypass_cache
+        )
+
+        if not success or not isinstance(registries_data, dict):
+            await self._log_runtime(
+                "ERROR",
+                "RedfishService",
+                (
+                    f"Dynamic discovery '{config_name}' failed to fetch base URI {base_uri}: "
+                    f"{registries_data}"
+                ),
+                dut_id,
+            )
+            return None
+
+        members_path = discovery_config.get("members_path", "Members")
+        members = (
+            registries_data.get("Members")
+            if members_path in (None, "", "Members")
+            else self._extract_nested_value(registries_data, members_path)
+        )
+
+        if not isinstance(members, list):
+            await self._log_runtime(
+                "ERROR",
+                "RedfishService",
+                (
+                    f"Dynamic discovery '{config_name}' expected a list at path '{members_path}' "
+                    f"but received {type(members).__name__}"
+                ),
+                dut_id,
+            )
+            return None
+
+        match_field = discovery_config.get("match_field", "@odata.id")
+        match_type = discovery_config.get("match_type", "contains").lower()
+        match_value_config = discovery_config.get("match_value")
+        match_values_config = discovery_config.get("match_values")
+
+        resolved_match_values: List[str] = []
+        if match_values_config:
+            if isinstance(match_values_config, list):
+                for val in match_values_config:
+                    resolved = self._resolve_placeholder(val, context)
+                    if isinstance(resolved, str):
+                        resolved_match_values.append(resolved)
+        elif match_value_config:
+            resolved = self._resolve_placeholder(match_value_config, context)
+            if isinstance(resolved, str):
+                resolved_match_values.append(resolved)
+
+        match_regex = discovery_config.get("match_regex")
+        match_case_insensitive = discovery_config.get("case_insensitive", True)
+        return_multiple = discovery_config.get("return_multiple", False)
+
+        discovered_results: List[str] = []
+
+        for member in members:
+            if not isinstance(member, dict):
+                continue
+
+            candidate_value = self._extract_nested_value(member, match_field)
+            if candidate_value is None:
+                continue
+
+            if isinstance(candidate_value, str) and match_case_insensitive:
+                candidate_compare = candidate_value.lower()
+            else:
+                candidate_compare = candidate_value
+
+            matched = False
+
+            if match_regex:
+                regex_flags = re.IGNORECASE if match_case_insensitive else 0
+                if isinstance(candidate_value, str) and re.search(
+                    match_regex, candidate_value, flags=regex_flags
+                ):
+                    matched = True
+            elif resolved_match_values:
+                compare_values = (
+                    [v.lower() for v in resolved_match_values]
+                    if match_case_insensitive
+                    else resolved_match_values
+                )
+                if isinstance(candidate_compare, str):
+                    if match_type == "equals":
+                        matched = candidate_compare in compare_values
+                    else:  # default contains behavior
+                        matched = any(
+                            val in candidate_compare for val in compare_values
+                        )
+                else:
+                    matched = candidate_compare in compare_values
+            else:
+                # No explicit match criteria specified; treat as automatic match
+                matched = True
+
+            if not matched:
+                continue
+
+            follow_up_config = discovery_config.get("follow_up")
+            final_value: Optional[Union[str, List[str]]] = None
+
+            if follow_up_config:
+                request_path = follow_up_config.get("request_path", "@odata.id")
+                request_uri = self._extract_nested_value(member, request_path)
+
+                if not isinstance(request_uri, str):
+                    await self._log_runtime(
+                        "ERROR",
+                        "RedfishService",
+                        (
+                            f"Dynamic discovery '{config_name}' could not resolve follow-up URI "
+                            f"using path '{request_path}'"
+                        ),
+                        dut_id,
+                    )
+                    continue
+
+                request_method = follow_up_config.get("method", "GET").upper()
+                follow_bypass_cache = follow_up_config.get("bypass_cache", True)
+
+                await self._log_runtime(
+                    "DEBUG",
+                    "RedfishService",
+                    (
+                        f"Dynamic discovery '{config_name}' follow-up request: "
+                        f"{request_method} {request_uri}"
+                    ),
+                    dut_id,
+                )
+
+                follow_success, follow_data, _ = await self.dispatch_request(
+                    dut_id,
+                    request_method,
+                    request_uri,
+                    bypass_cache=follow_bypass_cache,
+                )
+
+                if not follow_success or not isinstance(follow_data, (dict, list)):
+                    await self._log_runtime(
+                        "ERROR",
+                        "RedfishService",
+                        (
+                            f"Dynamic discovery '{config_name}' follow-up request failed: "
+                            f"{follow_data}"
+                        ),
+                        dut_id,
+                    )
+                    continue
+
+                value_path = follow_up_config.get("value_path")
+                if value_path:
+                    final_value = self._extract_nested_value(follow_data, value_path)
+                else:
+                    final_value = follow_data
+            else:
+                value_path = discovery_config.get("value_path", match_field)
+                final_value = self._extract_nested_value(member, value_path)
+
+            if isinstance(final_value, list) and not final_value:
+                final_value = None
+
+            if final_value is None:
+                await self._log_runtime(
+                    "WARNING",
+                    "RedfishService",
+                    (
+                        f"Dynamic discovery '{config_name}' matched entry but could not extract "
+                        f"final value using configured paths."
+                    ),
+                    dut_id,
+                )
+                continue
+
+            await self._log_runtime(
+                "INFO",
+                "RedfishService",
+                f"Dynamic discovery '{config_name}' produced value: {final_value}",
+                dut_id,
+            )
+
+            discovered_results.append(final_value)  # type: ignore[arg-type]
+
+            if not return_multiple:
+                break
+
+        if not discovered_results:
+            await self._log_runtime(
+                "WARNING",
+                "RedfishService",
+                f"Dynamic discovery '{config_name}' did not yield any results",
+                dut_id,
+            )
+            return None
+
+        if return_multiple:
+            flattened: List[str] = []
+            for item in discovered_results:
+                if isinstance(item, list):
+                    flattened.extend(item)
+                else:
+                    flattened.append(item)  # type: ignore[arg-type]
+            return flattened
+
+        return discovered_results[0]
 
     async def _get_dut_config(self, dut_id: str) -> Dict[str, Any]:
         """
@@ -3590,6 +5206,46 @@ class RedfishService(BaseService):
                 "WARN", "RedfishService", f"Failed to get DUT config: {str(e)}", dut_id
             )
             return {}
+
+    async def _build_redfish_time_filter(self, dut_id: str) -> str:
+        """
+        Build a Redfish OData $filter string for time-window filtering
+        based on the normalized streaming window.
+
+        Returns empty string if no time window is configured.
+        """
+        if not self.orchestrator or not self.orchestrator.config_manager:
+            return ""
+        try:
+            tool_config = self.orchestrator.config_manager.get_tool_config()
+            if not tool_config.get("streaming_only", False):
+                return ""
+
+            stream_begin, stream_end = normalize_stream_window(
+                tool_config.get("stream_begin", "24"),
+                tool_config.get("stream_end", "0"),
+            )
+            return (
+                "$filter="
+                f"Created ge '{format_redfish_stream_timestamp(stream_begin)}' and "
+                f"Created le '{format_redfish_stream_timestamp(stream_end)}'"
+            )
+        except Exception as e:
+            await self._log_runtime(
+                "WARNING",
+                "RedfishService",
+                f"Failed to build time filter: {e}",
+                dut_id,
+            )
+            return ""
+
+    async def _append_streaming_time_filter(self, dut_id: str, uri: str) -> str:
+        """Append the normalized Redfish time filter to a URI."""
+        time_filter = await self._build_redfish_time_filter(dut_id)
+        if not time_filter:
+            return uri
+        separator = "&" if "?" in uri else "?"
+        return f"{uri}{separator}{time_filter}"
 
     def _extract_entity_id_from_uri(
         self, uri: str, entity_type: Optional[str] = None
@@ -3772,6 +5428,8 @@ class RedfishService(BaseService):
         source_logs: str,
         entry_filter: Dict[str, Any],
         processing_config: Dict[str, Any] = None,
+        collector_id: str = "",
+        collector_name: str = "",
     ) -> List[Dict[str, Any]]:
         """
         Find filtered entries in source log files.
@@ -3804,16 +5462,30 @@ class RedfishService(BaseService):
                 dut_id,
             )
 
-            # Get possible source directories from processing config
+            # Get possible source directories from processing config.
+            # For derived collectors (for example R21 CPER), configured source
+            # directories must win over the current collector directory; the
+            # current collector directory may already exist but be empty.
             possible_source_dirs = []
             if processing_config and "possible_source_directories" in processing_config:
-                possible_source_dirs = processing_config["possible_source_directories"]
+                possible_source_dirs.extend(
+                    processing_config["possible_source_directories"]
+                )
             else:
-                # Fallback to default patterns
-                possible_source_dirs = [
-                    f"Redfish_{source_logs}",
-                    f"Redfish_{source_logs.replace('_', '')}",
-                ]
+                if collector_id and collector_name:
+                    possible_source_dirs.append(
+                        f"Redfish_{collector_id}_{collector_name}"
+                    )
+
+                # Fallback to default patterns for older collectors.
+                possible_source_dirs.extend(
+                    [
+                        f"Redfish_{source_logs}",
+                        f"Redfish_{source_logs.replace('_', '')}",
+                    ]
+                )
+
+            possible_source_dirs = list(dict.fromkeys(possible_source_dirs))
 
             # Build full paths
             full_source_dirs = [
@@ -4265,6 +5937,166 @@ class RedfishService(BaseService):
             )
             return False, None
 
+    async def _capture_task_service_snapshot(
+        self,
+        dut_id: str,
+        function_tag: str,
+        collector_id: str,
+        entity_type: str,
+        entity_id: str,
+        log_service: str,
+        reason: str,
+        task_id: Optional[str] = None,
+        payload: Optional[Any] = None,
+        diagnostic_type: Optional[str] = None,
+        extra_context: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """
+        Capture the TaskService state when a dump request fails and save it to a JSON file.
+
+        Args:
+            dut_id: DUT identifier.
+            function_tag: Function tag associated with the collector.
+            collector_id: Collector identifier.
+            entity_type: Redfish entity type (Systems, Managers, etc.).
+            entity_id: Specific entity identifier.
+            log_service: Log service being used.
+            reason: Reason for capturing the snapshot.
+            task_id: Task identifier if available.
+            payload: Request payload associated with the dump request.
+            diagnostic_type: Diagnostic type used for the request.
+            extra_context: Additional context information to persist.
+
+        Returns:
+            Path to the snapshot file or None if capture failed.
+        """
+        try:
+            timestamp = datetime.now()
+            timestamp_iso = timestamp.isoformat()
+            timestamp_label = timestamp.strftime("%Y%m%dT%H%M%S")
+
+            entity_component = f"{entity_type or 'entity'}_{entity_id or 'unknown'}"
+            entity_label = re.sub(r"[^A-Za-z0-9_.-]", "_", entity_component) or "entity"
+
+            task_component = str(task_id) if task_id else "no_task_id"
+            task_label = re.sub(r"[^A-Za-z0-9_.-]", "_", task_component) or "no_task_id"
+            if len(task_label) > 48:
+                task_label = task_label[:48]
+
+            task_service_uri = None
+            tasks_uri = None
+            tasks_response: Optional[Any] = None
+            tasks_error: Optional[Any] = None
+            task_details: List[Dict[str, Any]] = []
+
+            try:
+                task_service_uri = self.get_configured_uri(dut_id, "TaskService")
+                if task_service_uri:
+                    tasks_uri = f"{task_service_uri}/Tasks"
+                    tasks_success, tasks_resp_raw, _ = await self.dispatch_request(
+                        dut_id, "GET", tasks_uri, bypass_cache=True
+                    )
+                    if tasks_success:
+                        tasks_response = self._sanitize_for_capture(tasks_resp_raw)
+                        if isinstance(tasks_resp_raw, dict):
+                            for member in tasks_resp_raw.get("Members", []):
+                                member_uri = member.get("@odata.id")
+                                if not member_uri:
+                                    continue
+                                if not validate_redfish_uri(member_uri):
+                                    continue
+                                detail_success, detail_data, _ = (
+                                    await self.dispatch_request(
+                                        dut_id,
+                                        "GET",
+                                        member_uri,
+                                        bypass_cache=True,
+                                    )
+                                )
+                                detail_entry: Dict[str, Any] = {
+                                    "task_uri": member_uri,
+                                    "success": detail_success,
+                                }
+                                if detail_success:
+                                    detail_entry["data"] = self._sanitize_for_capture(
+                                        detail_data
+                                    )
+                                else:
+                                    detail_entry["error"] = self._sanitize_for_capture(
+                                        detail_data
+                                    )
+                                task_details.append(detail_entry)
+                    else:
+                        tasks_error = self._sanitize_for_capture(tasks_resp_raw)
+                else:
+                    tasks_error = "TaskService URI not configured for DUT"
+            except Exception as snapshot_exc:
+                tasks_error = f"Failed to retrieve tasks: {snapshot_exc}"
+                await self._log_runtime(
+                    "WARN",
+                    "RedfishService",
+                    f"Failed to retrieve TaskService snapshot: {snapshot_exc}",
+                    dut_id,
+                )
+
+            snapshot_payload: Dict[str, Any] = {
+                "captured_at": timestamp_iso,
+                "reason": reason,
+                "entity_type": entity_type,
+                "entity_id": entity_id,
+                "log_service": log_service,
+                "collector_id": collector_id,
+                "function_tag": function_tag,
+                "task_id": task_id,
+                "diagnostic_type": diagnostic_type,
+                "payload": (
+                    self._sanitize_for_capture(payload) if payload is not None else None
+                ),
+                "task_service_uri": task_service_uri,
+                "tasks_uri": tasks_uri,
+                "tasks_response": tasks_response,
+                "tasks_response_error": tasks_error,
+                "task_details": task_details,
+            }
+
+            if extra_context:
+                snapshot_payload["additional_context"] = self._sanitize_for_capture(
+                    extra_context
+                )
+
+            substitutions = {
+                "entity_label": entity_label,
+                "task_label": task_label,
+                "timestamp": timestamp_label,
+            }
+
+            file_path = await self._save_data_to_file_with_pattern(
+                dut_id,
+                snapshot_payload,
+                function_tag,
+                output_pattern="TaskService_snapshot_{entity_label}_{task_label}_{timestamp}.json",
+                substitutions=substitutions,
+                collector_id=collector_id,
+            )
+
+            if file_path:
+                await self._log_runtime(
+                    "INFO",
+                    "RedfishService",
+                    f"TaskService snapshot captured: {file_path}",
+                    dut_id,
+                )
+
+            return file_path
+        except Exception as e:
+            await self._log_runtime(
+                "WARN",
+                "RedfishService",
+                f"Failed to capture TaskService snapshot: {e}",
+                dut_id,
+            )
+            return None
+
     async def _execute_redfish_dump_task(
         self,
         dut_id: str,
@@ -4301,6 +6133,16 @@ class RedfishService(BaseService):
             device_id = kwargs.get("device_id")
             device_type_name = kwargs.get("device_type_name")
 
+            extra_context: Optional[Dict[str, Any]] = {}
+            if fallback_index is not None:
+                extra_context["fallback_index"] = fallback_index
+            if device_id is not None:
+                extra_context["device_id"] = device_id
+            if device_type_name:
+                extra_context["device_type_name"] = device_type_name
+            if not extra_context:
+                extra_context = None
+
             # Get timeout from collector definition and DUT config
             collector_def = kwargs.get("collector_def", {})
             dut_config = self.dut_manager.get_dut_config(dut_id)
@@ -4309,8 +6151,8 @@ class RedfishService(BaseService):
                 collector_id, collector_def, dut_config, 1500, tool_config
             )
 
-            # Calculate retries based on timeout
-            retry_interval = 30  # seconds, default value
+            # Calculate retries based on timeout (like legacy code)
+            retry_interval = 30  # seconds, matching legacy default
             max_retries = int((timeout_seconds + 28) / retry_interval)
 
             await self._log_runtime(
@@ -4417,6 +6259,18 @@ class RedfishService(BaseService):
                     dut_id,
                     f"Failed to initiate dump task for {entity_type} {entity_id} (URI: {full_dump_uri}): ",
                 )
+                snapshot_path = await self._capture_task_service_snapshot(
+                    dut_id,
+                    function_tag,
+                    collector_id,
+                    entity_type,
+                    entity_id,
+                    log_service,
+                    reason="initiation_failed",
+                    payload=payload,
+                    diagnostic_type=diagnostic_type,
+                    extra_context=extra_context,
+                )
 
                 # Include request details in the error response for better debugging
                 error_response = {
@@ -4432,6 +6286,8 @@ class RedfishService(BaseService):
                         "log_service": log_service,
                     },
                 }
+                if snapshot_path:
+                    error_response["context"]["task_service_snapshot"] = snapshot_path
                 await self._log_runtime(
                     "ERROR",
                     "RedfishService",
@@ -4478,7 +6334,20 @@ class RedfishService(BaseService):
                     except (json.JSONDecodeError, TypeError):
                         response_data = {"raw_response": str(response)}
 
-                error_response = {
+                snapshot_path = await self._capture_task_service_snapshot(
+                    dut_id,
+                    function_tag,
+                    collector_id,
+                    entity_type,
+                    entity_id,
+                    log_service,
+                    reason="missing_task_id",
+                    payload=payload,
+                    diagnostic_type=diagnostic_type,
+                    extra_context=extra_context,
+                )
+
+                error_entry = {
                     "request_uri": dump_uri,
                     "request_payload": payload,
                     "response_status": "failure",
@@ -4490,11 +6359,13 @@ class RedfishService(BaseService):
                     "log_service": log_service,
                     "timestamp": datetime.now().isoformat(),
                 }
+                if snapshot_path:
+                    error_entry["task_service_snapshot"] = snapshot_path
 
                 # Save the structured error response to array-based file
-                error_file_path = await self._append_to_diagnostic_json_array(
+                await self._append_to_diagnostic_json_array(
                     dut_id,
-                    error_response,
+                    error_entry,
                     function_tag,
                     "diagnostic_errors",
                     collector_id,
@@ -4513,6 +6384,8 @@ class RedfishService(BaseService):
                         "log_service": log_service,
                     },
                 }
+                if snapshot_path:
+                    error_response["context"]["task_service_snapshot"] = snapshot_path
                 await self._log_runtime(
                     "ERROR",
                     "RedfishService",
@@ -4521,7 +6394,7 @@ class RedfishService(BaseService):
                 )
                 return False, "Response did not contain a task ID"
 
-            # Wait for task completion
+            # Wait for task completion (like legacy get_task_completed)
             entity_context = {
                 "entity_type": entity_type,
                 "entity_id": entity_id,
@@ -4543,6 +6416,20 @@ class RedfishService(BaseService):
                     dut_id,
                 )
 
+                snapshot_path = await self._capture_task_service_snapshot(
+                    dut_id,
+                    function_tag,
+                    collector_id,
+                    entity_type,
+                    entity_id,
+                    log_service,
+                    reason="task_timeout",
+                    task_id=task_id,
+                    payload=payload,
+                    diagnostic_type=diagnostic_type,
+                    extra_context=extra_context,
+                )
+
                 # Save the task timeout error to array-based file
                 error_data = {
                     "task_id": task_id,
@@ -4554,6 +6441,8 @@ class RedfishService(BaseService):
                     "error_type": "task_timeout",
                     "timestamp": datetime.now().isoformat(),
                 }
+                if snapshot_path:
+                    error_data["task_service_snapshot"] = snapshot_path
                 error_file_path = await self._append_to_diagnostic_json_array(
                     dut_id,
                     error_data,
@@ -4576,13 +6465,15 @@ class RedfishService(BaseService):
                         "max_retries": max_retries,
                     },
                 }
+                if snapshot_path:
+                    error_response["context"]["task_service_snapshot"] = snapshot_path
                 await self._log_runtime(
                     "ERROR",
                     "RedfishService",
                     f"{error_response}",
                     dut_id,
                 )
-                return False, "Task {task_id} did not complete within timeout"
+                return False, f"Task {task_id} did not complete within timeout"
 
             # Task completion is already saved in _wait_for_task_completion method
             # No need to save it again here
@@ -4590,11 +6481,11 @@ class RedfishService(BaseService):
             await self._log_runtime(
                 "DEBUG",
                 "RedfishService",
-                f"Task completion saved to array-based file",
+                "Task completion saved to array-based file",
                 dut_id,
             )
 
-            # Get dump location
+            # Get dump location (like legacy get_dump_location)
             dump_location = await self._get_dump_location(task_completed, dut_id)
             if not dump_location:
                 await self._log_runtime(
@@ -4602,6 +6493,20 @@ class RedfishService(BaseService):
                     "RedfishService",
                     f"Failed to get dump location for task {task_id}",
                     dut_id,
+                )
+
+                snapshot_path = await self._capture_task_service_snapshot(
+                    dut_id,
+                    function_tag,
+                    collector_id,
+                    entity_type,
+                    entity_id,
+                    log_service,
+                    reason="no_dump_location",
+                    task_id=task_id,
+                    payload=payload,
+                    diagnostic_type=diagnostic_type,
+                    extra_context=extra_context,
                 )
 
                 # Save the no dump location error to array-based file
@@ -4615,6 +6520,8 @@ class RedfishService(BaseService):
                     "error_type": "no_dump_location",
                     "timestamp": datetime.now().isoformat(),
                 }
+                if snapshot_path:
+                    error_data["task_service_snapshot"] = snapshot_path
                 error_file_path = await self._append_to_diagnostic_json_array(
                     dut_id,
                     error_data,
@@ -4641,9 +6548,11 @@ class RedfishService(BaseService):
                         "entity_type": entity_type,
                         "entity_id": entity_id,
                         "log_service": log_service,
-                        "task_response": task_response,
+                        "task_completion": task_completed,
                     },
                 }
+                if snapshot_path:
+                    error_response["context"]["task_service_snapshot"] = snapshot_path
                 await self._log_runtime(
                     "ERROR",
                     "RedfishService",
@@ -4652,7 +6561,7 @@ class RedfishService(BaseService):
                 )
                 return False, "Task completed but no dump location found in response"
 
-            # Generate output filename with task_id substitution
+            # Generate output filename with task_id substitution (like legacy)
             if "$task_id" in output_pattern:
                 final_output_pattern = output_pattern.replace("$task_id", str(task_id))
             else:
@@ -4670,10 +6579,14 @@ class RedfishService(BaseService):
                 dut_id, "GET", dump_location, get_raw_content=True, bypass_cache=True
             )
 
+            data_to_save, data_type, save_output_pattern, data_size = (
+                self._prepare_downloaded_dump_for_save(dump_data, final_output_pattern)
+            )
+
             await self._log_runtime(
                 "INFO",
                 "RedfishService",
-                f"Download attempt result: success={success}, data_size={len(dump_data) if success and isinstance(dump_data, bytes) else 'N/A'}",
+                f"Download attempt result: success={success}, data_type={data_type if success else 'error'}, data_size={data_size if success else 'N/A'}",
                 dut_id,
             )
 
@@ -4681,10 +6594,8 @@ class RedfishService(BaseService):
             dump_metadata = {
                 "dump_location": dump_location,
                 "success": success,
-                "data_type": "binary" if success else "error",
-                "data_size": (
-                    len(dump_data) if success and isinstance(dump_data, bytes) else 0
-                ),
+                "data_type": data_type if success else "error",
+                "data_size": data_size if success else 0,
                 "task_id": task_id,
                 "entity_type": entity_type,
                 "entity_id": entity_id,
@@ -4692,21 +6603,6 @@ class RedfishService(BaseService):
                 "step": "dump_download",
                 "timestamp": datetime.now().isoformat(),
             }
-            dump_metadata_file_path = await self._append_to_diagnostic_json_array(
-                dut_id,
-                dump_metadata,
-                function_tag,
-                "diagnostic_responses",
-                collector_id,
-            )
-
-            await self._log_runtime(
-                "DEBUG",
-                "RedfishService",
-                f"Saved dump metadata to: {dump_metadata_file_path}",
-                dut_id,
-            )
-
             if success:
                 # Get device-specific substitutions from kwargs and merge with standard ones
                 device_substitutions = kwargs.get("substitutions", {})
@@ -4723,23 +6619,64 @@ class RedfishService(BaseService):
                     **device_substitutions,
                 }
 
-                # Write binary data to file
+                # Write the downloaded artifact using the detected content type.
                 file_path = await self._save_data_to_file_with_pattern(
                     dut_id,
-                    dump_data,
+                    data_to_save,
                     function_tag,
-                    output_pattern=final_output_pattern,
+                    output_pattern=save_output_pattern,
                     substitutions=merged_substitutions,
                     collector_id=collector_id,
-                    is_binary=True,
+                )
+                if file_path:
+                    dump_metadata["saved_file"] = file_path
+                dump_metadata_file_path = await self._append_to_diagnostic_json_array(
+                    dut_id,
+                    dump_metadata,
+                    function_tag,
+                    "diagnostic_responses",
+                    collector_id,
+                )
+                await self._log_runtime(
+                    "DEBUG",
+                    "RedfishService",
+                    f"Saved dump metadata to: {dump_metadata_file_path}",
+                    dut_id,
                 )
                 return True, file_path
             else:
+                dump_metadata_file_path = await self._append_to_diagnostic_json_array(
+                    dut_id,
+                    dump_metadata,
+                    function_tag,
+                    "diagnostic_responses",
+                    collector_id,
+                )
+                await self._log_runtime(
+                    "DEBUG",
+                    "RedfishService",
+                    f"Saved dump metadata to: {dump_metadata_file_path}",
+                    dut_id,
+                )
                 await self._log_runtime(
                     "ERROR",
                     "RedfishService",
                     f"Failed to download dump from {dump_location}",
                     dut_id,
+                )
+
+                snapshot_path = await self._capture_task_service_snapshot(
+                    dut_id,
+                    function_tag,
+                    collector_id,
+                    entity_type,
+                    entity_id,
+                    log_service,
+                    reason="dump_download_failed",
+                    task_id=task_id,
+                    payload=payload,
+                    diagnostic_type=diagnostic_type,
+                    extra_context=extra_context,
                 )
 
                 # Save the dump download error response to array-based file
@@ -4757,6 +6694,8 @@ class RedfishService(BaseService):
                     "dump_location": dump_location,
                     "timestamp": datetime.now().isoformat(),
                 }
+                if snapshot_path:
+                    error_data["task_service_snapshot"] = snapshot_path
                 error_file_path = await self._append_to_diagnostic_json_array(
                     dut_id,
                     error_data,
@@ -4780,15 +6719,32 @@ class RedfishService(BaseService):
                         "download_success": success,
                     },
                 }
+                if snapshot_path:
+                    error_response["context"]["task_service_snapshot"] = snapshot_path
                 await self._log_runtime(
                     "ERROR",
                     "RedfishService",
                     f"{error_response}",
                     dut_id,
                 )
-                return False, "Failed to download dump from {dump_location}"
+                return False, f"Failed to download dump from {dump_location}"
 
         except Exception as e:
+            task_id_for_snapshot = locals().get("task_id")
+            snapshot_path = await self._capture_task_service_snapshot(
+                dut_id,
+                function_tag,
+                collector_id,
+                entity_type,
+                entity_id,
+                log_service,
+                reason="exception",
+                task_id=task_id_for_snapshot,
+                payload=payload,
+                diagnostic_type=diagnostic_type,
+                extra_context=extra_context,
+            )
+
             # Include request details in the error response for better debugging
             error_response = {
                 "success": False,
@@ -4802,13 +6758,15 @@ class RedfishService(BaseService):
                     "exception": str(e),
                 },
             }
+            if snapshot_path:
+                error_response["context"]["task_service_snapshot"] = snapshot_path
             await self._log_runtime(
                 "ERROR",
                 "RedfishService",
                 f"{error_response}",
                 dut_id,
             )
-            return False, "Exception in dump task execution: {str(e)}"
+            return False, f"Exception in dump task execution: {str(e)}"
 
     async def _process_entities_common(
         self, dut_id: str, entities: Dict[str, Any], processor_func, **kwargs
@@ -4892,6 +6850,8 @@ class RedfishService(BaseService):
         Returns:
             Tuple of (success, response_data, metadata)
         """
+        full_uri = uri
+
         try:
             # Get DUT for URI normalization (for logging full URIs)
             dut = self.dut_manager.get_dut(dut_id)
@@ -4918,6 +6878,18 @@ class RedfishService(BaseService):
                     retry_count,
                 )
             )
+
+            request_capture_info = {
+                "method": method,
+                "uri": full_uri,
+                "original_uri": uri,
+                "body": body,
+                "timeout": timeout,
+                "bypass_cache": bypass_cache,
+                "get_raw_content": get_raw_content,
+                "retry_count": retry_count,
+                "error_context": error_context,
+            }
 
             if not success:
                 # Use the detailed error information from DUT manager
@@ -4949,6 +6921,25 @@ class RedfishService(BaseService):
                         dut_id,
                         f"Failed to {error_context} ({method} {full_uri}): {body_log}",
                     )
+
+                response_capture = {
+                    "success": False,
+                    "error": error_details,
+                }
+                if retry_info:
+                    response_capture["retry_info"] = retry_info
+                if response not in (None, error_details):
+                    response_capture["raw_response"] = response
+                self._record_request_response(
+                    request_capture_info,
+                    response_capture,
+                )
+                await self._record_redfish_request_capture(
+                    dut_id,
+                    request_capture_info,
+                    response_capture,
+                    error_details,
+                )
                 return False, response, error_details
 
             # Log successful binary downloads
@@ -4960,9 +6951,57 @@ class RedfishService(BaseService):
                     dut_id,
                 )
 
+            response_capture: Dict[str, Any] = {"success": True}
+            if get_raw_content and isinstance(response, bytes):
+                response_capture["data"] = {
+                    "type": "bytes",
+                    "length": len(response),
+                }
+            else:
+                response_capture["data"] = response
+            if retry_info:
+                response_capture["retry_info"] = retry_info
+
+            self._record_request_response(
+                request_capture_info,
+                response_capture,
+            )
+            await self._record_redfish_request_capture(
+                dut_id,
+                request_capture_info,
+                response_capture,
+            )
+
             return True, response, {}
 
         except Exception as e:
+            exception_request_capture = {
+                "method": method,
+                "uri": full_uri,
+                "original_uri": uri,
+                "body": body,
+                "timeout": timeout,
+                "bypass_cache": bypass_cache,
+                "get_raw_content": get_raw_content,
+                "retry_count": retry_count,
+                "error_context": error_context,
+            }
+            exception_response_capture = {
+                "success": False,
+                "error": {
+                    "type": type(e).__name__,
+                    "message": str(e),
+                },
+            }
+            self._record_request_response(
+                exception_request_capture,
+                exception_response_capture,
+            )
+            await self._record_redfish_request_capture(
+                dut_id,
+                exception_request_capture,
+                exception_response_capture,
+            )
             await self._log_runtime(
                 "ERROR",
                 "RedfishService",
@@ -4976,6 +7015,7 @@ class RedfishService(BaseService):
         dut_id: str,
         requests: List[Tuple[str, str]],  # List of (uri, error_context) tuples
         max_concurrent: int = None,
+        get_raw_content: bool = False,
     ) -> List[Tuple[bool, Any]]:
         """
         Execute multiple Redfish requests concurrently with rate limiting.
@@ -4996,7 +7036,12 @@ class RedfishService(BaseService):
         async def _make_request(uri: str, error_context: str) -> Tuple[bool, Any]:
             async with semaphore:
                 return await self.dispatch_request(
-                    dut_id, "GET", uri, error_context=error_context, bypass_cache=True
+                    dut_id,
+                    "GET",
+                    uri,
+                    error_context=error_context,
+                    bypass_cache=True,
+                    get_raw_content=get_raw_content,
                 )
 
         # Create tasks for all requests
@@ -5107,7 +7152,7 @@ class RedfishService(BaseService):
         timeout: int = 60,
     ) -> None:
         """
-        Log Redfish request details.
+        Log Redfish request details similar to legacy code.
 
         Args:
             dut_id: DUT ID.
@@ -5148,7 +7193,7 @@ class RedfishService(BaseService):
         error_message: str = None,
     ) -> None:
         """
-        Log Redfish response details.
+        Log Redfish response details similar to legacy code.
 
         Args:
             dut_id: DUT ID.
@@ -5269,7 +7314,7 @@ class RedfishService(BaseService):
         return device_type_mapping.get(diagnostic_type, diagnostic_type)
 
     """
-    Handles 
+    Handles
     """
 
     async def _handle_get_collection(
@@ -5291,23 +7336,46 @@ class RedfishService(BaseService):
         async def _get_collection_and_save():
             output_files = []
 
+            complete_on_empty_targets = kwargs.get("complete_on_empty_targets", False)
+            get_raw_content = kwargs.get("get_raw_content", False)
+            # Raw downloads must bypass cache so a prior JSON/text read of the same URI
+            # cannot be reused in place of the binary payload.
+            bypass_cache = kwargs.get("bypass_cache", False) or get_raw_content
+
+            # If there are no URIs and the collector allows empty targets, treat as complete
+            if not uri_list and complete_on_empty_targets:
+                return await self._create_standardized_collector_result(
+                    dut_id=dut_id,
+                    collector_id=kwargs.get("collector_id", function_tag),
+                    successful_operations=1,
+                    total_operations=1,
+                    output_files=[],
+                    error_messages=[],
+                    operation_name="get_collection",
+                    additional_context={
+                        "uris_processed": uri_list,
+                        "successful_count": 0,
+                        "reason": "No URIs to collect; treating as complete (empty targets allowed)",
+                    },
+                )
+
+            # Phase 1: fetch all responses before writing any files.
+            collected = []  # list of (uri, data, extracted_ids)
             for uri in uri_list:
+                if kwargs.get("streaming_time_filtered", False):
+                    uri = await self._append_streaming_time_filter(dut_id, uri)
                 await self._log_collection_start(dut_id, "GET", uri)
 
                 success, data, _ = await self.dispatch_request(
-                    dut_id, "GET", uri, bypass_cache=True
+                    dut_id,
+                    "GET",
+                    uri,
+                    get_raw_content=get_raw_content,
+                    bypass_cache=bypass_cache,
                 )
 
                 if success:
-                    # Extract output pattern parameters using common function
-                    output_pattern, substitutions, filtered_kwargs = (
-                        self._extract_output_pattern_params(kwargs)
-                    )
-
-                    # Extract entity IDs from URI for placeholder substitution
                     extracted_ids = self._extract_entity_id_from_uri(uri)
-                    substitutions.update(extracted_ids)
-
                     if extracted_ids:
                         await self._log_runtime(
                             "DEBUG",
@@ -5315,50 +7383,93 @@ class RedfishService(BaseService):
                             f"Extracted entity IDs from URI: {extracted_ids}",
                             dut_id,
                         )
-
-                    # Use common data saving function
-                    file_path = await self._save_data_with_common_pattern(
-                        dut_id,
-                        data,
-                        f"{function_tag}_response",
-                        output_pattern=output_pattern,
-                        substitutions=substitutions,
-                        **filtered_kwargs,
-                    )
-
-                    if file_path:
-                        output_files.append(file_path)
-                        await self._log_collection_success(
-                            dut_id, "GET", uri, file_path
-                        )
+                    collected.append((uri, data, extracted_ids))
                 else:
                     await self._log_collection_failure(dut_id, "GET", uri, str(data))
-                    # Return error immediately with the actual error message
                     return await self._create_standardized_collector_result(
                         dut_id=dut_id,
                         collector_id=kwargs.get("collector_id", function_tag),
-                        successful_operations=len(output_files),
+                        successful_operations=len(collected),
                         total_operations=len(uri_list),
                         output_files=output_files,
                         error_messages=[f"GET request failed: {uri} - {data}"],
                         operation_name="get_collection",
                         additional_context={
                             "uris_processed": uri_list,
-                            "successful_count": len(output_files),
+                            "successful_count": len(collected),
                         },
                     )
 
+            # Phase 2: write results.
+            # When multiple URIs would produce the same filename (output_pattern has no
+            # entity placeholder), combine all responses into a single dict keyed by
+            # entity ID rather than overwriting on each iteration.
+            output_pattern, substitutions, filtered_kwargs = (
+                self._extract_output_pattern_params(kwargs)
+            )
+            entity_placeholders = {"system_id", "manager_id", "chassis_id", "entity_id"}
+            pattern_str = output_pattern or ""
+            needs_combine = len(collected) > 1 and not any(
+                f"{{{p}}}" in pattern_str for p in entity_placeholders
+            )
+
+            if needs_combine:
+                combined = {}
+                for uri, data, extracted_ids in collected:
+                    key = (
+                        extracted_ids.get("system_id")
+                        or extracted_ids.get("manager_id")
+                        or extracted_ids.get("chassis_id")
+                        or uri
+                    )
+                    combined[key] = data
+
+                file_path = await self._save_data_with_common_pattern(
+                    dut_id,
+                    combined,
+                    f"{function_tag}_response",
+                    output_pattern=output_pattern,
+                    substitutions=substitutions.copy(),
+                    **filtered_kwargs,
+                )
+                if file_path:
+                    output_files.append(file_path)
+                    for uri, _, _ in collected:
+                        await self._log_collection_success(
+                            dut_id, "GET", uri, file_path
+                        )
+            else:
+                for uri, data, extracted_ids in collected:
+                    subs = substitutions.copy()
+                    subs.update(extracted_ids)
+                    file_path = await self._save_data_with_common_pattern(
+                        dut_id,
+                        data,
+                        f"{function_tag}_response",
+                        output_pattern=output_pattern,
+                        substitutions=subs,
+                        **filtered_kwargs,
+                    )
+                    if file_path:
+                        output_files.append(file_path)
+                        await self._log_collection_success(
+                            dut_id, "GET", uri, file_path
+                        )
+
+            # When combining, every collected response is a success even though they
+            # produced a single output file. Count responses, not files.
+            successful_ops = len(collected) if needs_combine else len(output_files)
             return await self._create_standardized_collector_result(
                 dut_id=dut_id,
                 collector_id=kwargs.get("collector_id", function_tag),
-                successful_operations=len(output_files),
+                successful_operations=successful_ops,
                 total_operations=len(uri_list),
                 output_files=output_files,
                 error_messages=[],
                 operation_name="get_collection",
                 additional_context={
                     "uris_processed": uri_list,
-                    "successful_count": len(output_files),
+                    "successful_count": successful_ops,
                 },
             )
 
@@ -5480,6 +7591,7 @@ class RedfishService(BaseService):
         output_files = []
         failed_uris = []
         successful_uris = []
+        entity_type = kwargs.get("entity_type")
 
         for uri in uri_list:
             await self._log_collection_start(dut_id, "paginated_uri", uri)
@@ -5700,7 +7812,7 @@ class RedfishService(BaseService):
                 # Always support generic {entity_id} substitution
                 processed_uri = processed_uri.replace("{entity_id}", entity_id)
 
-                # Backward compatibility support
+                # Legacy support for backward compatibility
                 processed_uri = processed_uri.replace("{system_id}", entity_id)
                 processed_uri = processed_uri.replace("{manager_id}", entity_id)
                 processed_uri = processed_uri.replace("{chassis_id}", entity_id)
@@ -5747,7 +7859,7 @@ class RedfishService(BaseService):
                 dut_id,
             )
 
-            # Generate filename based on URI
+            # Generate filename based on URI (matching legacy behavior)
             uri_safe = (
                 "_".join(uri.split("/")[-3:-1]).replace("?", "_").replace("&", "_")
             )
@@ -5957,9 +8069,49 @@ class RedfishService(BaseService):
         output_files = []
         failed_collections = []
         successful_collections = []
+        partial_collections = []
+        member_successes = 0
+        member_failures = 0
+        additional_member_successes = 0
+        additional_member_failures = 0
+        linked_member_successes = 0
+        linked_member_failures = 0
 
         # Define collection name for summary generation (matching host service pattern)
         collection_name = f"{function_tag} Collection"
+
+        complete_on_empty_targets = kwargs.get("complete_on_empty_targets", False)
+        if not uri_list and complete_on_empty_targets:
+            reason_msg = (
+                f"No collection_with_members targets found for {function_tag}; "
+                "treating as complete"
+            )
+            await self._log_runtime(
+                "INFO",
+                "RedfishService",
+                reason_msg,
+                dut_id,
+            )
+            result = await self._create_standardized_collector_result(
+                dut_id=dut_id,
+                collector_id=kwargs.get("collector_id", function_tag),
+                successful_operations=1,
+                total_operations=1,
+                output_files=[],
+                error_messages=[],
+                operation_name="collection_with_members",
+                additional_context={
+                    "collections_processed": 0,
+                    "successful_collections": [],
+                    "partial_collections": [],
+                    "failed_collections": [],
+                    "status": "success",
+                    "reason": reason_msg,
+                },
+            )
+            result["status_override"] = "success"
+            result["reason_override"] = reason_msg
+            return result
 
         # Check if this is a table format request (for firmware inventory)
         format_output = kwargs.get("format_output", "")
@@ -6031,11 +8183,24 @@ class RedfishService(BaseService):
         )  # Default 2 retries for failed collections
         retry_delay = 5  # 5 seconds between retries
 
+        def _append_output_suffix(pattern: str, suffix: str) -> str:
+            """Append a suffix before the filename extension when present."""
+            if not suffix:
+                return pattern
+            if "." in pattern:
+                stem, extension = pattern.rsplit(".", 1)
+                return f"{stem}{suffix}.{extension}"
+            return f"{pattern}{suffix}"
+
         for collection_uri in uri_list:
             await self._log_collection_start(dut_id, "collection", collection_uri)
 
             # Add small delay between requests to prevent BMC overload
-            if len(successful_collections) > 0 or len(failed_collections) > 0:
+            if (
+                len(successful_collections) > 0
+                or len(partial_collections) > 0
+                or len(failed_collections) > 0
+            ):
                 await asyncio.sleep(1)  # 1000ms delay between requests
 
             # Try collection with retries
@@ -6101,6 +8266,9 @@ class RedfishService(BaseService):
                     dut_id,
                 )
 
+            collection_saved = False
+            collection_has_nested_failures = False
+
             # Handle table format for any collection
             if is_table_format:
                 # Create collection table instead of individual member files
@@ -6120,12 +8288,19 @@ class RedfishService(BaseService):
                 )
                 output_files.extend(table_files)
                 if table_files:
-                    successful_collections.append(collection_uri)
+                    collection_saved = True
                     await self._log_collection_success(
                         dut_id,
                         "collection",
                         collection_uri,
                         f"Created {len(table_files)} table files",
+                    )
+                else:
+                    error_msg = f"Collection save failed for {collection_uri}: no table files created"
+                    failed_collections.append(error_msg)
+                    collection_has_nested_failures = True
+                    await self._log_collection_failure(
+                        dut_id, "collection", collection_uri, "No table files created"
                     )
             else:
                 # Save collection summary using common function (original behavior)
@@ -6145,9 +8320,19 @@ class RedfishService(BaseService):
                 )
                 if collection_file:
                     output_files.append(collection_file)
-                    successful_collections.append(collection_uri)
+                    collection_saved = True
                     await self._log_collection_success(
                         dut_id, "collection", collection_uri, collection_file
+                    )
+                else:
+                    error_msg = f"Collection save failed for {collection_uri}: no output file generated"
+                    failed_collections.append(error_msg)
+                    collection_has_nested_failures = True
+                    await self._log_collection_failure(
+                        dut_id,
+                        "collection",
+                        collection_uri,
+                        "No output file generated",
                     )
 
             # Process members (skip for table format as members are processed in table creation)
@@ -6181,6 +8366,8 @@ class RedfishService(BaseService):
                             member_uri.split("/")[-1] if member_uri else f"member_{i}"
                         )
 
+                    if member_uri and not validate_redfish_uri(member_uri):
+                        continue
                     if member_uri:
                         # Try member collection with retries
                         member_success = False
@@ -6257,9 +8444,20 @@ class RedfishService(BaseService):
                             )
                             if member_file:
                                 output_files.append(member_file)
-                                successful_collections.append(member_uri)
+                                member_successes += 1
                                 await self._log_collection_success(
                                     dut_id, "member", member_uri, member_file
+                                )
+                            else:
+                                member_failures += 1
+                                collection_has_nested_failures = True
+                                error_msg = f"Member save failed for {member_uri}: no output file generated"
+                                failed_collections.append(error_msg)
+                                await self._log_collection_failure(
+                                    dut_id,
+                                    "member",
+                                    member_uri,
+                                    "No output file generated",
                                 )
 
                             # Handle additional member collections (e.g., CertChain for certificates)
@@ -6306,6 +8504,9 @@ class RedfishService(BaseService):
                                         additional_suffix = additional_config.get(
                                             "output_suffix", ""
                                         )
+                                        linked_resources = additional_config.get(
+                                            "linked_resources", []
+                                        )
 
                                         if not additional_uri_pattern:
                                             continue
@@ -6324,48 +8525,48 @@ class RedfishService(BaseService):
                                             dut_id,
                                         )
 
-                                    # Try to collect additional member data with retries
-                                    additional_success = False
-                                    additional_data = None
-                                    additional_last_error = None
+                                        # Try to collect additional member data with retries
+                                        additional_success = False
+                                        additional_data = None
+                                        additional_last_error = None
 
-                                    # Use reduced retries for certificate endpoints that often fail
-                                    additional_max_retries = max_retries
-                                    if "CertChain" in additional_uri:
-                                        additional_max_retries = min(
-                                            1, max_retries
-                                        )  # Only 1 retry for CertChain
-                                        await self._log_runtime(
-                                            "DEBUG",
-                                            "RedfishService",
-                                            f"Using reduced retries ({additional_max_retries}) for certificate endpoint: {additional_uri}",
-                                            dut_id,
-                                        )
-
-                                    for additional_retry_attempt in range(
-                                        additional_max_retries + 1
-                                    ):
-                                        if additional_retry_attempt > 0:
+                                        # Use reduced retries for certificate endpoints that often fail
+                                        additional_max_retries = max_retries
+                                        if "CertChain" in additional_uri:
+                                            additional_max_retries = min(
+                                                1, max_retries
+                                            )  # Only 1 retry for CertChain
                                             await self._log_runtime(
-                                                "WARNING",
+                                                "DEBUG",
                                                 "RedfishService",
-                                                f"Retrying additional collection for {additional_uri} (attempt {additional_retry_attempt + 1}/{additional_max_retries + 1})",
+                                                f"Using reduced retries ({additional_max_retries}) for certificate endpoint: {additional_uri}",
                                                 dut_id,
                                             )
-                                            await asyncio.sleep(retry_delay)
 
-                                        additional_success, additional_data, _ = (
-                                            await self.dispatch_request(
-                                                dut_id,
-                                                "GET",
-                                                additional_uri,
-                                                error_context=f"get additional member data {additional_uri}",
+                                        for additional_retry_attempt in range(
+                                            additional_max_retries + 1
+                                        ):
+                                            if additional_retry_attempt > 0:
+                                                await self._log_runtime(
+                                                    "WARNING",
+                                                    "RedfishService",
+                                                    f"Retrying additional collection for {additional_uri} (attempt {additional_retry_attempt + 1}/{additional_max_retries + 1})",
+                                                    dut_id,
+                                                )
+                                                await asyncio.sleep(retry_delay)
+
+                                            additional_success, additional_data, _ = (
+                                                await self.dispatch_request(
+                                                    dut_id,
+                                                    "GET",
+                                                    additional_uri,
+                                                    error_context=f"get additional member data {additional_uri}",
+                                                )
                                             )
-                                        )
 
-                                        if additional_success:
-                                            break
-                                        else:
+                                            if additional_success:
+                                                break
+
                                             additional_last_error = additional_data
                                             await self._log_runtime(
                                                 "WARNING",
@@ -6374,22 +8575,25 @@ class RedfishService(BaseService):
                                                 dut_id,
                                             )
 
-                                    if additional_success:
-                                        # Create output pattern with suffix
-                                        additional_output_pattern = output_pattern
-                                        if additional_suffix:
-                                            # Add suffix before the file extension
-                                            if additional_output_pattern.endswith(
-                                                ".json"
-                                            ):
-                                                additional_output_pattern = (
-                                                    additional_output_pattern.replace(
-                                                        ".json",
-                                                        f"{additional_suffix}.json",
-                                                    )
-                                                )
-                                            else:
-                                                additional_output_pattern = f"{additional_output_pattern}{additional_suffix}"
+                                        if not additional_success:
+                                            # Log additional collection failure but don't fail the main collection
+                                            error_msg = f"Additional member collection failed for {additional_uri} after {additional_max_retries + 1} attempts: {additional_last_error}"
+                                            failed_collections.append(error_msg)
+                                            additional_member_failures += 1
+                                            collection_has_nested_failures = True
+                                            await self._log_runtime(
+                                                "WARNING",
+                                                "RedfishService",
+                                                error_msg,
+                                                dut_id,
+                                            )
+                                            continue
+
+                                        additional_output_pattern = (
+                                            _append_output_suffix(
+                                                output_pattern, additional_suffix
+                                            )
+                                        )
 
                                         additional_file = await self._save_data_with_common_pattern(
                                             dut_id,
@@ -6401,24 +8605,163 @@ class RedfishService(BaseService):
                                         )
                                         if additional_file:
                                             output_files.append(additional_file)
-                                            successful_collections.append(
-                                                additional_uri
-                                            )
+                                            additional_member_successes += 1
                                             await self._log_collection_success(
                                                 dut_id,
                                                 "additional_member",
                                                 additional_uri,
                                                 additional_file,
                                             )
-                                    else:
-                                        # Log additional collection failure but don't fail the main collection
-                                        error_msg = f"Additional member collection failed for {additional_uri} after {additional_max_retries + 1} attempts: {additional_last_error}"
-                                        await self._log_runtime(
-                                            "WARNING",
-                                            "RedfishService",
-                                            error_msg,
-                                            dut_id,
-                                        )
+                                        else:
+                                            error_msg = f"Additional member save failed for {additional_uri}: no output file generated"
+                                            failed_collections.append(error_msg)
+                                            additional_member_failures += 1
+                                            collection_has_nested_failures = True
+                                            await self._log_collection_failure(
+                                                dut_id,
+                                                "additional_member",
+                                                additional_uri,
+                                                "No output file generated",
+                                            )
+
+                                        if linked_resources and isinstance(
+                                            linked_resources, list
+                                        ):
+                                            for linked_resource in linked_resources:
+                                                if not isinstance(
+                                                    linked_resource, dict
+                                                ):
+                                                    continue
+
+                                                linked_uri_path = linked_resource.get(
+                                                    "uri_path"
+                                                )
+                                                linked_suffix = linked_resource.get(
+                                                    "output_suffix", ""
+                                                )
+
+                                                if not linked_uri_path:
+                                                    continue
+
+                                                linked_uri = self._extract_nested_value(
+                                                    additional_data,
+                                                    linked_uri_path,
+                                                )
+
+                                                if not linked_uri:
+                                                    await self._log_runtime(
+                                                        "DEBUG",
+                                                        "RedfishService",
+                                                        f"Skipping linked resource for {additional_uri}: path {linked_uri_path} not found",
+                                                        dut_id,
+                                                    )
+                                                    continue
+
+                                                if not validate_redfish_uri(linked_uri):
+                                                    await self._log_runtime(
+                                                        "DEBUG",
+                                                        "RedfishService",
+                                                        f"Skipping invalid linked resource URI: {linked_uri}",
+                                                        dut_id,
+                                                    )
+                                                    continue
+
+                                                await self._log_runtime(
+                                                    "DEBUG",
+                                                    "RedfishService",
+                                                    f"Collecting linked member data from: {linked_uri}",
+                                                    dut_id,
+                                                )
+
+                                                linked_success = False
+                                                linked_data = None
+                                                linked_last_error = None
+
+                                                for linked_retry_attempt in range(
+                                                    max_retries + 1
+                                                ):
+                                                    if linked_retry_attempt > 0:
+                                                        await self._log_runtime(
+                                                            "WARNING",
+                                                            "RedfishService",
+                                                            f"Retrying linked collection for {linked_uri} (attempt {linked_retry_attempt + 1}/{max_retries + 1})",
+                                                            dut_id,
+                                                        )
+                                                        await asyncio.sleep(retry_delay)
+
+                                                    linked_success, linked_data, _ = (
+                                                        await self.dispatch_request(
+                                                            dut_id,
+                                                            "GET",
+                                                            linked_uri,
+                                                            error_context=f"get linked member data {linked_uri}",
+                                                        )
+                                                    )
+
+                                                    if linked_success:
+                                                        break
+
+                                                    linked_last_error = linked_data
+                                                    await self._log_runtime(
+                                                        "WARNING",
+                                                        "RedfishService",
+                                                        f"Linked collection attempt {linked_retry_attempt + 1} failed for {linked_uri}: {linked_data}",
+                                                        dut_id,
+                                                    )
+
+                                                if not linked_success:
+                                                    linked_member_failures += 1
+                                                    collection_has_nested_failures = (
+                                                        True
+                                                    )
+                                                    failed_collections.append(
+                                                        f"Linked member collection failed for {linked_uri} after {max_retries + 1} attempts: {linked_last_error}"
+                                                    )
+                                                    await self._log_runtime(
+                                                        "WARNING",
+                                                        "RedfishService",
+                                                        f"Linked member collection failed for {linked_uri} after {max_retries + 1} attempts: {linked_last_error}",
+                                                        dut_id,
+                                                    )
+                                                    continue
+
+                                                linked_output_pattern = (
+                                                    _append_output_suffix(
+                                                        additional_output_pattern,
+                                                        linked_suffix,
+                                                    )
+                                                )
+
+                                                linked_file = await self._save_data_with_common_pattern(
+                                                    dut_id,
+                                                    linked_data,
+                                                    function_tag,
+                                                    output_pattern=linked_output_pattern,
+                                                    substitutions=member_substitutions,
+                                                    **filtered_kwargs,
+                                                )
+                                                if linked_file:
+                                                    output_files.append(linked_file)
+                                                    linked_member_successes += 1
+                                                    await self._log_collection_success(
+                                                        dut_id,
+                                                        "linked_member",
+                                                        linked_uri,
+                                                        linked_file,
+                                                    )
+                                                else:
+                                                    error_msg = f"Linked member save failed for {linked_uri}: no output file generated"
+                                                    failed_collections.append(error_msg)
+                                                    linked_member_failures += 1
+                                                    collection_has_nested_failures = (
+                                                        True
+                                                    )
+                                                    await self._log_collection_failure(
+                                                        dut_id,
+                                                        "linked_member",
+                                                        linked_uri,
+                                                        "No output file generated",
+                                                    )
                                 else:
                                     await self._log_runtime(
                                         "DEBUG",
@@ -6430,13 +8773,21 @@ class RedfishService(BaseService):
                             # Add specific error message for member collection failure
                             error_msg = f"Member collection failed for {member_uri} after {max_retries + 1} attempts: {member_last_error}"
                             failed_collections.append(error_msg)
+                            member_failures += 1
+                            collection_has_nested_failures = True
                             await self._log_collection_failure(
                                 dut_id, "member", member_uri, str(member_last_error)
                             )
 
+            if collection_saved:
+                if collection_has_nested_failures:
+                    partial_collections.append(collection_uri)
+                else:
+                    successful_collections.append(collection_uri)
+
         # Determine overall success based on results
-        # Count successful operations: collections that succeeded + members that succeeded
         successful_operations = len(successful_collections)
+        partial_operations = len(partial_collections)
         total_operations = len(uri_list)
         error_messages = (
             failed_collections  # failed_collections already contains error messages
@@ -6522,8 +8873,27 @@ class RedfishService(BaseService):
         additional_context = {
             "collections_processed": len(uri_list),
             "successful_collections": successful_collections,
+            "partial_collections": partial_collections,
             "failed_collections": failed_collections,
+            "member_requests_successful": member_successes,
+            "member_requests_failed": member_failures,
+            "additional_member_requests_successful": additional_member_successes,
+            "additional_member_requests_failed": additional_member_failures,
+            "linked_member_requests_successful": linked_member_successes,
+            "linked_member_requests_failed": linked_member_failures,
         }
+
+        if (
+            partial_operations > 0
+            and successful_operations == 0
+            and total_operations > 0
+        ):
+            partial_reason = f"Partial success: {partial_operations}/{total_operations} collection_with_members targets completed with nested sub-resource failures."
+            if error_messages:
+                partial_reason += "\n" + self._format_error_messages(
+                    error_messages, "collection_with_members", is_partial=True
+                )
+            additional_context.update({"status": "partial", "reason": partial_reason})
 
         # Add certificate-specific details if this is a certificate collection
         if "certificates" in function_tag.lower() or "cert" in function_tag.lower():
@@ -6670,7 +9040,7 @@ class RedfishService(BaseService):
                         dut_id,
                         "entity_dumps",
                         f"{entity_type}/{entity_id}",
-                        f"Dump service not found",
+                        "Dump service not found",
                     )
                     return []
 
@@ -6966,6 +9336,8 @@ class RedfishService(BaseService):
         successful_uris = []
 
         for i, uri in enumerate(uri_list):
+            if kwargs.get("streaming_time_filtered", False):
+                uri = await self._append_streaming_time_filter(dut_id, uri)
             await self._log_collection_start(dut_id, "uri_list", uri)
 
             success, data, _ = await self.dispatch_request(dut_id, "GET", uri)
@@ -7075,6 +9447,7 @@ class RedfishService(BaseService):
         output_files = []
         failed_uris = []
         successful_uris = []
+        entity_type = kwargs.get("entity_type")
 
         for base_uri in uri_list:
             await self._log_collection_start(dut_id, "expand", base_uri)
@@ -7096,6 +9469,47 @@ class RedfishService(BaseService):
                 )
                 continue
 
+            filtered_collection_data = await self._filter_collection_members_by_skip_config(
+                dut_id, collection_data, entity_type, base_uri
+            )
+            original_members = (
+                collection_data.get("Members")
+                if isinstance(collection_data, dict)
+                else None
+            )
+            filtered_members = (
+                filtered_collection_data.get("Members")
+                if isinstance(filtered_collection_data, dict)
+                else None
+            )
+            if (
+                isinstance(original_members, list)
+                and isinstance(filtered_members, list)
+                and len(filtered_members) == 0
+                and len(original_members) > 0
+            ):
+                output_pattern, substitutions, filtered_kwargs = (
+                    self._extract_output_pattern_params(kwargs)
+                )
+                file_path = await self._save_data_with_common_pattern(
+                    dut_id,
+                    filtered_collection_data,
+                    function_tag,
+                    output_pattern=output_pattern,
+                    substitutions={**substitutions, "expand_level": str(expand_level)},
+                    **filtered_kwargs,
+                )
+                if file_path:
+                    output_files.append(file_path)
+                    successful_uris.append(base_uri)
+                    await self._log_runtime(
+                        "INFO",
+                        "RedfishService",
+                        f"Skipped expanded query for {base_uri}: all members are excluded by skip config",
+                        dut_id,
+                    )
+                continue
+
             # Build expand query
             expand_query = f"$expand=*($levels={expand_level})"
 
@@ -7108,6 +9522,9 @@ class RedfishService(BaseService):
             )
 
             if success:
+                expanded_data = await self._filter_collection_members_by_skip_config(
+                    dut_id, expanded_data, entity_type, base_uri
+                )
                 # Extract output pattern parameters using common function
                 output_pattern, substitutions, filtered_kwargs = (
                     self._extract_output_pattern_params(kwargs)
@@ -7154,6 +9571,69 @@ class RedfishService(BaseService):
             },
         )
 
+    async def _filter_collection_members_by_skip_config(
+        self,
+        dut_id: str,
+        collection_data: Any,
+        entity_type: Optional[str],
+        base_uri: str,
+    ) -> Any:
+        """
+        Apply configured Redfish entity skip lists to expanded collection payloads.
+        """
+        if not isinstance(collection_data, dict):
+            return collection_data
+
+        members = collection_data.get("Members")
+        if not isinstance(members, list):
+            return collection_data
+
+        normalized_entity_type = str(entity_type or "").strip().lower()
+        base_uri_lower = str(base_uri or "").lower()
+        if normalized_entity_type == "systems" or "/systems" in base_uri_lower:
+            id_type = "system"
+        elif normalized_entity_type == "managers" or "/managers" in base_uri_lower:
+            id_type = "manager"
+        elif normalized_entity_type == "chassis" or "/chassis" in base_uri_lower:
+            id_type = "chassis"
+        else:
+            return collection_data
+
+        member_ids = []
+        for member in members:
+            if isinstance(member, dict):
+                member_uri = str(member.get("@odata.id") or "")
+                member_id = str(member.get("Id") or "")
+                if member_uri:
+                    member_id = member_uri.rstrip("/").split("/")[-1]
+                member_ids.append(member_id)
+            else:
+                member_ids.append("")
+
+        dut_config = self.dut_manager.get_dut_config(dut_id)
+        filtered_ids = filter_ids(member_ids, id_type, dut_config)
+        if len(filtered_ids) == len(member_ids):
+            return collection_data
+
+        filtered_id_set = set(filtered_ids)
+        filtered_data = copy.deepcopy(collection_data)
+        filtered_data["Members"] = [
+            member
+            for member, member_id in zip(filtered_data.get("Members", []), member_ids)
+            if member_id in filtered_id_set
+        ]
+        if "Members@odata.count" in filtered_data:
+            filtered_data["Members@odata.count"] = len(filtered_data["Members"])
+
+        await log_filtered_ids(member_ids, filtered_ids, id_type, self.logger, dut_id)
+        await self._log_runtime(
+            "INFO",
+            "RedfishService",
+            f"Filtered expanded {entity_type or base_uri} members from {member_ids} to {filtered_ids}",
+            dut_id,
+        )
+        return filtered_data
+
     async def _handle_chassis_with_filter_collection(
         self, dut_id: str, uri_list: List[str], function_tag: str, **kwargs
     ) -> Dict[str, Any]:
@@ -7199,6 +9679,8 @@ class RedfishService(BaseService):
             members = collection_data.get("Members", [])
             for member in members:
                 chassis_uri = member.get("@odata.id", "")
+                if chassis_uri and not validate_redfish_uri(chassis_uri):
+                    continue
                 if chassis_uri:
                     chassis_id = chassis_uri.split("/")[-1]
 
@@ -7328,6 +9810,7 @@ class RedfishService(BaseService):
             collector_id = kwargs.get(
                 "collector_id", ""
             )  # Extract collector_id from kwargs
+            collector_name = kwargs.get("collector_name", function_tag)
 
             # Check if this is a legacy platform
             platform_info = await self._get_platform_info(dut_id)
@@ -7491,7 +9974,12 @@ class RedfishService(BaseService):
 
                 # Find source log files
                 source_entries = await self._find_filtered_entries_in_source_logs(
-                    dut_id, source_logs, entry_filter, processing_config
+                    dut_id,
+                    source_logs,
+                    entry_filter,
+                    processing_config,
+                    collector_id=collector_id,
+                    collector_name=collector_name,
                 )
 
                 if source_entries:
@@ -7578,7 +10066,12 @@ class RedfishService(BaseService):
                             # Try to find entries again after fallback collection
                             source_entries = (
                                 await self._find_filtered_entries_in_source_logs(
-                                    dut_id, source_logs, entry_filter, processing_config
+                                    dut_id,
+                                    source_logs,
+                                    entry_filter,
+                                    processing_config,
+                                    collector_id=collector_id,
+                                    collector_name=collector_name,
                                 )
                             )
 
@@ -7675,15 +10168,16 @@ class RedfishService(BaseService):
                                     collector_id=collector_id,
                                 )
 
-                                return await self._create_standardized_collector_result(
-                                    successful_operations=1 if report_file else 0,
-                                    total_operations=1,
+                                return await self._create_no_data_skipped_result(
+                                    log_service=log_service,
+                                    reason=(
+                                        f"No {log_service} entries found - this is "
+                                        f"normal if no {log_service} events occurred"
+                                    ),
                                     output_files=[report_file] if report_file else [],
-                                    error_messages=[],
                                     operation_name="log_processing_collection",
                                     additional_context={
-                                        "log_service": log_service,
-                                        "reason": f"No {log_service} entries found - this is normal if no {log_service} events occurred",
+                                        "fallback_collection_attempted": True,
                                     },
                                 )
                         else:
@@ -7739,15 +10233,16 @@ class RedfishService(BaseService):
                             collector_id=collector_id,
                         )
 
-                        return await self._create_standardized_collector_result(
-                            successful_operations=1 if report_file else 0,
-                            total_operations=1,
+                        return await self._create_no_data_skipped_result(
+                            log_service=log_service,
+                            reason=(
+                                f"No {log_service} entries found - this is normal "
+                                f"if no {log_service} events occurred"
+                            ),
                             output_files=[report_file] if report_file else [],
-                            error_messages=[],
                             operation_name="log_processing_collection",
                             additional_context={
-                                "log_service": log_service,
-                                "reason": f"No {log_service} entries found - this is normal if no {log_service} events occurred",
+                                "fallback_collection_attempted": False,
                             },
                         )
 
@@ -7785,6 +10280,34 @@ class RedfishService(BaseService):
                 },
             )
 
+    async def _create_no_data_skipped_result(
+        self,
+        log_service: str,
+        reason: str,
+        output_files: List[str] = None,
+        operation_name: str = "collection",
+        additional_context: Dict[str, Any] = None,
+    ) -> Dict[str, Any]:
+        """Create a skipped result for expected no-data collectors."""
+        context = {
+            "log_service": log_service,
+            "status": "skipped",
+            "reason": reason,
+            "no_data_collected": True,
+            "classification": "expected_no_data",
+        }
+        if additional_context:
+            context.update(additional_context)
+
+        return await self._create_standardized_collector_result(
+            successful_operations=0,
+            total_operations=0,
+            output_files=output_files or [],
+            error_messages=[],
+            operation_name=operation_name,
+            additional_context=context,
+        )
+
     async def _handle_collector_error(
         self,
         dut_id: str,
@@ -7806,10 +10329,6 @@ class RedfishService(BaseService):
         Returns:
             Collector result dictionary.
         """
-        await self._log_runtime(
-            "ERROR", "RedfishService", f"{collector_name}: {error_message}", dut_id
-        )
-
         if skip_condition:
             await self._log_runtime(
                 "WARN",
@@ -7826,9 +10345,16 @@ class RedfishService(BaseService):
                 additional_context={
                     "collector_name": collector_name,
                     "status": "skipped",
+                    "reason": f"Skipped: {error_message}",
                 },
             )
         else:
+            await self._log_runtime(
+                "ERROR",
+                "RedfishService",
+                f"{collector_name}: {error_message}",
+                dut_id,
+            )
             return await self._create_standardized_collector_result(
                 successful_operations=0,
                 total_operations=1,
@@ -7889,9 +10415,101 @@ class RedfishService(BaseService):
             )
         return result
 
-    """
-    Collector Public API
-    """
+    async def generate_streaming_csv(
+        self, dut_id: str, function_tag: str, **kwargs
+    ) -> Dict[str, Any]:
+        """
+        Post-processing hook: convert collected Redfish EventLog JSON files
+        into CSV for streaming output.
+
+        Generates:
+          <collector>_events.csv — Timestamp, Id, Severity, MessageId, Message, Resolution
+        """
+        collector_id = kwargs.get("collector_id", "")
+        output_dir = await self._get_output_directory(dut_id)
+
+        collector_name = kwargs.get("collector_name", function_tag)
+        collector_dir_name = f"Redfish_{collector_id}_{collector_name}"
+        collector_dir = Path(output_dir) / dut_id / "redfish" / collector_dir_name
+
+        if not collector_dir.exists():
+            await self._log_runtime(
+                "WARNING",
+                "RedfishService",
+                f"CSV generation skipped: directory not found {collector_dir}",
+                dut_id,
+            )
+            return {"success": True, "output_files": [], "csv_skipped": True}
+
+        all_events = []
+        for json_file in sorted(collector_dir.glob("*.json")):
+            if (
+                "metadata" in json_file.name
+                or "status" in json_file.name
+                or "diagnostic" in json_file.name
+            ):
+                continue
+            try:
+                data = json.loads(json_file.read_text(encoding="utf-8"))
+                members = data.get("Members", [])
+                all_events.extend(members)
+            except Exception:
+                continue
+
+        if not all_events:
+            await self._log_runtime(
+                "INFO",
+                "RedfishService",
+                f"CSV generation: no events found for {collector_id}",
+                dut_id,
+            )
+            return {"success": True, "output_files": [], "csv_no_events": True}
+
+        all_events.sort(key=lambda e: e.get("Created", ""))
+
+        csv_filename = f"{collector_id}_events.csv"
+        if self.orchestrator and self.orchestrator.config_manager:
+            try:
+                tool_config = self.orchestrator.config_manager.get_tool_config()
+                if tool_config.get("streaming_only", False):
+                    stream_begin, stream_end = normalize_stream_window(
+                        tool_config.get("stream_begin", "24"),
+                        tool_config.get("stream_end", "0"),
+                    )
+                    csv_filename = append_stream_window_to_filename(
+                        csv_filename,
+                        format_stream_window_component(stream_begin),
+                        format_stream_window_component(stream_end),
+                    )
+            except Exception:
+                pass
+
+        events_csv = collector_dir / csv_filename
+        with open(events_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                ["Timestamp", "Id", "Severity", "MessageId", "Message", "Resolution"]
+            )
+            for event in all_events:
+                writer.writerow(
+                    [
+                        event.get("Created", ""),
+                        event.get("Id", ""),
+                        event.get("Severity", ""),
+                        event.get("MessageId", ""),
+                        event.get("Message", ""),
+                        event.get("Resolution", ""),
+                    ]
+                )
+        csv_files = [str(events_csv)]
+
+        await self._log_runtime(
+            "INFO",
+            "RedfishService",
+            f"Generated {len(csv_files)} CSV files with {len(all_events)} events for {collector_id}",
+            dut_id,
+        )
+        return {"success": True, "output_files": csv_files}
 
     async def collect_redfish_unified(
         self,
@@ -7927,10 +10545,10 @@ class RedfishService(BaseService):
             Dict with success status, output files, and context
         """
         collector_name = f"{function_tag}_{collection_type}"
+        collector_def = kwargs.get("collector_def", {})
 
         # Get configurable expand level if this is an expand collection
         if collection_type == "expand":
-            collector_def = kwargs.get("collector_def", {})
             dut_config = self.dut_manager.get_dut_config(dut_id)
             expand_level = get_expand_level(
                 kwargs.get("collector_id", ""), collector_def, dut_config, expand_level
@@ -7964,124 +10582,270 @@ class RedfishService(BaseService):
             f"additional_member_collections parameter: {additional_collections}",
             dut_id,
         )
-        await self._log_collector_start(dut_id, collector_name)
+        collector_id = kwargs.get("collector_id", "")
+        try:
+            await self._log_collector_start(
+                dut_id, collector_name, collector_id=collector_id
+            )
 
-        # Handle URI list from kwargs (for variable substitution cases)
-        uri_list_from_kwargs = kwargs.get("uri_list")
-        if uri_list_from_kwargs:
-            if isinstance(uri_list_from_kwargs, str):
-                # Check if this looks like a variable substitution pattern
-                if uri_list_from_kwargs.startswith(
-                    "${"
-                ) and uri_list_from_kwargs.endswith("}"):
-                    # Extract variable name
-                    var_name = uri_list_from_kwargs[2:-1]  # Remove ${ and }
-                    # Try to get the value from context (validation results)
-                    if var_name in kwargs:
-                        uri_list_value = kwargs[var_name]
-                        if isinstance(uri_list_value, list):
-                            uri_list = uri_list_value
-                        else:
-                            uri_list = [uri_list_value] if uri_list_value else []
-                    else:
-                        # Fallback to treating as literal string
-                        uri_list = [uri_list_from_kwargs]
-                else:
-                    uri_list = [uri_list_from_kwargs]
-            elif isinstance(uri_list_from_kwargs, list):
-                uri_list = uri_list_from_kwargs
-            else:
-                uri_list = []
-            # Remove from kwargs to avoid conflicts
-            kwargs.pop("uri_list", None)
-        else:
-            # Check for uri_list_key parameter (for configuration-based URI lists)
-            uri_list_key = kwargs.get("uri_list_key")
-            if uri_list_key:
-                # Get URI list from configuration (DUT config, tool config, or collector defaults)
-                try:
-                    dut_config = self.dut_manager.get_dut_config(dut_id)
-                    dut_uri_list = dut_config.get(uri_list_key, [])
+            dynamic_discovery_entries = kwargs.get("dynamic_uri_discovery")
+            if dynamic_discovery_entries:
+                if not isinstance(dynamic_discovery_entries, list):
+                    dynamic_discovery_entries = [dynamic_discovery_entries]
 
-                    # Check DUT-level configuration first (highest priority)
-                    if isinstance(dut_uri_list, list) and dut_uri_list:
-                        uri_list = dut_uri_list
+                resolved_uri_patterns: Optional[Union[str, List[str]]] = uri_patterns
+                resolved_uri_list: Optional[Union[str, List[str]]] = kwargs.get(
+                    "uri_list"
+                )
+
+                for discovery_entry in dynamic_discovery_entries:
+                    if not isinstance(discovery_entry, dict):
                         await self._log_runtime(
-                            "INFO",
+                            "WARNING",
                             "RedfishService",
-                            f"Using DUT-level URI list from {uri_list_key}: {uri_list}",
+                            f"Skipping invalid dynamic_uri_discovery entry (expected dict): {discovery_entry}",
                             dut_id,
                         )
+                        continue
+
+                    should_apply, baseboard_name = (
+                        await self._should_apply_dynamic_discovery(
+                            dut_id,
+                            collector_name,
+                            collector_id,
+                            function_tag,
+                            discovery_entry,
+                            collector_def,
+                        )
+                    )
+
+                    if not should_apply:
+                        continue
+
+                    context: Dict[str, Any] = {
+                        **kwargs,
+                        "collector_id": collector_id,
+                        "collector_name": collector_name,
+                        "function_tag": function_tag,
+                        "collection_type": collection_type,
+                        "baseboard": baseboard_name,
+                    }
+
+                    if (
+                        baseboard_name
+                        and hasattr(self, "dut_manager")
+                        and self.dut_manager
+                    ):
+                        baseboard_manager = None
+                        if hasattr(self.dut_manager, "_get_baseboard_manager"):
+                            baseboard_manager = (
+                                self.dut_manager._get_baseboard_manager()
+                            )
+                        if baseboard_manager:
+                            baseboard_type = baseboard_manager.get_baseboard_type(
+                                baseboard_name
+                            )
+                            if baseboard_type:
+                                context.setdefault("baseboard_type", baseboard_type)
+
+                    discovered_value = await self._perform_dynamic_uri_discovery(
+                        dut_id, collector_name, discovery_entry, context
+                    )
+
+                    if discovered_value is None:
+                        continue
+
+                    target = discovery_entry.get("target", "uri_patterns")
+                    behavior = discovery_entry.get("behavior", "override")
+                    if isinstance(behavior, str):
+                        behavior = behavior.lower()
                     else:
-                        # Fall back to tool-level configuration (medium priority)
-                        orchestrator = getattr(self, "orchestrator", None)
-                        if orchestrator and hasattr(orchestrator, "config_manager"):
-                            tool_config = orchestrator.config_manager.get_tool_config()
+                        behavior = "override"
+
+                    deduplicate = discovery_entry.get("deduplicate", False)
+
+                    if target == "uri_list":
+                        resolved_uri_list = self._apply_discovered_value(
+                            resolved_uri_list, discovered_value, behavior, deduplicate
+                        )
+                    else:
+                        resolved_uri_patterns = self._apply_discovered_value(
+                            resolved_uri_patterns,
+                            discovered_value,
+                            behavior,
+                            deduplicate,
+                        )
+
+                uri_patterns = resolved_uri_patterns
+                if resolved_uri_list is not None:
+                    kwargs["uri_list"] = resolved_uri_list
+
+                kwargs.pop("dynamic_uri_discovery", None)
+
+            uri_list_from_kwargs = kwargs.get("uri_list")
+            if uri_list_from_kwargs:
+                if isinstance(uri_list_from_kwargs, str):
+                    if uri_list_from_kwargs.startswith(
+                        "${"
+                    ) and uri_list_from_kwargs.endswith("}"):
+                        var_name = uri_list_from_kwargs[2:-1]
+                        if var_name in kwargs:
+                            uri_list_value = kwargs[var_name]
+                            if isinstance(uri_list_value, list):
+                                uri_list = uri_list_value
+                            else:
+                                uri_list = [uri_list_value] if uri_list_value else []
                         else:
-                            tool_config = self.dut_manager.tool_config
-                        tool_uri_list = tool_config.get(uri_list_key, [])
-                        if isinstance(tool_uri_list, list) and tool_uri_list:
-                            uri_list = tool_uri_list
+                            uri_list = [uri_list_from_kwargs]
+                    else:
+                        uri_list = [uri_list_from_kwargs]
+                elif isinstance(uri_list_from_kwargs, list):
+                    uri_list = uri_list_from_kwargs
+                else:
+                    uri_list = []
+                kwargs.pop("uri_list", None)
+            else:
+                uri_list_key = kwargs.get("uri_list_key")
+                if uri_list_key:
+                    try:
+                        dut_config = self.dut_manager.get_dut_config(dut_id)
+                        dut_uri_list = dut_config.get(uri_list_key, [])
+
+                        if isinstance(dut_uri_list, list) and dut_uri_list:
+                            uri_list = dut_uri_list
                             await self._log_runtime(
                                 "INFO",
                                 "RedfishService",
-                                f"Using tool-level URI list from {uri_list_key}: {uri_list}",
+                                f"Using DUT-level URI list from {uri_list_key}: {uri_list}",
                                 dut_id,
                             )
                         else:
-                            await self._log_runtime(
-                                "WARNING",
-                                "RedfishService",
-                                f"No URI list found for {uri_list_key} in DUT or tool config - collector will be skipped",
-                                dut_id,
-                            )
-                            return await self._create_standardized_collector_result(
-                                dut_id=dut_id,
-                                collector_id=kwargs.get("collector_id", function_tag),
-                                successful_operations=0,
-                                total_operations=0,
-                                output_files=[],
-                                error_messages=[
-                                    f"No URIs provided in configuration - collector skipped"
-                                ],
-                                operation_name="uri_list_collection",
-                                additional_context={"uri_list_key": uri_list_key},
-                            )
-                except Exception as e:
-                    await self._log_runtime(
-                        "WARNING",
-                        "RedfishService",
-                        f"Could not load URI list configuration for {uri_list_key}: {e}",
-                        dut_id,
-                    )
-                    return await self._create_standardized_collector_result(
-                        dut_id=dut_id,
-                        collector_id=kwargs.get("collector_id", function_tag),
-                        successful_operations=0,
-                        total_operations=0,
-                        output_files=[],
-                        error_messages=[f"Configuration error for {uri_list_key}: {e}"],
-                        operation_name="uri_list_collection",
-                        additional_context={"uri_list_key": uri_list_key},
-                    )
-            else:
-                # Normalize URI patterns to list
-                if isinstance(uri_patterns, str):
-                    uri_list = [uri_patterns]
-                elif isinstance(uri_patterns, list):
-                    uri_list = uri_patterns
+                            orchestrator = getattr(self, "orchestrator", None)
+                            if orchestrator and hasattr(orchestrator, "config_manager"):
+                                tool_config = (
+                                    orchestrator.config_manager.get_tool_config()
+                                )
+                            else:
+                                tool_config = self.dut_manager.tool_config
+                            tool_uri_list = tool_config.get(uri_list_key, [])
+                            if isinstance(tool_uri_list, list) and tool_uri_list:
+                                uri_list = tool_uri_list
+                                await self._log_runtime(
+                                    "INFO",
+                                    "RedfishService",
+                                    f"Using tool-level URI list from {uri_list_key}: {uri_list}",
+                                    dut_id,
+                                )
+                            else:
+                                await self._log_runtime(
+                                    "WARNING",
+                                    "RedfishService",
+                                    f"No URI list found for {uri_list_key} in DUT or tool config - collector will be skipped",
+                                    dut_id,
+                                )
+                                return await self._create_standardized_collector_result(
+                                    dut_id=dut_id,
+                                    collector_id=kwargs.get(
+                                        "collector_id", function_tag
+                                    ),
+                                    successful_operations=0,
+                                    total_operations=0,
+                                    output_files=[],
+                                    error_messages=[
+                                        "No URIs provided in configuration - collector skipped"
+                                    ],
+                                    operation_name="uri_list_collection",
+                                    additional_context={"uri_list_key": uri_list_key},
+                                )
+                    except Exception as e:
+                        await self._log_runtime(
+                            "WARNING",
+                            "RedfishService",
+                            f"Could not load URI list configuration for {uri_list_key}: {e}",
+                            dut_id,
+                        )
+                        return await self._create_standardized_collector_result(
+                            dut_id=dut_id,
+                            collector_id=kwargs.get("collector_id", function_tag),
+                            successful_operations=0,
+                            total_operations=0,
+                            output_files=[],
+                            error_messages=[
+                                f"Configuration error for {uri_list_key}: {e}"
+                            ],
+                            operation_name="uri_list_collection",
+                            additional_context={"uri_list_key": uri_list_key},
+                        )
                 else:
-                    uri_list = []
+                    if isinstance(uri_patterns, str):
+                        uri_list = [uri_patterns]
+                    elif isinstance(uri_patterns, list):
+                        uri_list = uri_patterns
+                    else:
+                        uri_list = []
 
-            # Apply prefix overrides to URI patterns if URI config manager is available
-            if uri_list and self.dut_manager and self.dut_manager.uri_config_manager:
-                uri_list = [
-                    self.dut_manager.uri_config_manager._apply_prefix_override(uri)
-                    for uri in uri_list
-                ]
+                filtered_systems = kwargs.get("filtered_systems", [])
+                filtered_managers = kwargs.get("filtered_managers", [])
+                filtered_chassis = kwargs.get("filtered_chassis", [])
+                has_placeholder = uri_list and any("{" in uri for uri in uri_list)
+                if has_placeholder and (
+                    filtered_systems or filtered_managers or filtered_chassis
+                ):
+                    entity_map = {
+                        "Systems": filtered_systems,
+                        "Managers": filtered_managers,
+                        "Chassis": filtered_chassis,
+                    }
+                    entities = (
+                        entity_map.get(entity_type, [])
+                        or filtered_systems
+                        or filtered_managers
+                        or filtered_chassis
+                    )
+                    expanded = []
+                    for ent in entities:
+                        eid = ent["id"] if isinstance(ent, dict) else ent
+                        expanded.extend(
+                            self._process_user_defined_uris(uri_list, eid, entity_type)
+                        )
+                    if expanded:
+                        uri_list = expanded
+                elif has_placeholder and self.dut_manager:
+                    all_uris_str = " ".join(uri_list)
+                    if "{system_id}" in all_uris_str:
+                        fallback_type = "Systems"
+                    elif "{manager_id}" in all_uris_str:
+                        fallback_type = "Managers"
+                    elif "{chassis_id}" in all_uris_str:
+                        fallback_type = "Chassis"
+                    else:
+                        fallback_type = None
 
-        # Route to appropriate collection handler with proper error handling
-        try:
+                    if fallback_type:
+                        member_ids = await self.dut_manager.get_resource_members(
+                            dut_id, fallback_type
+                        )
+                        if member_ids:
+                            expanded = []
+                            for mid in member_ids:
+                                expanded.extend(
+                                    self._process_user_defined_uris(
+                                        uri_list, mid, fallback_type
+                                    )
+                                )
+                            if expanded:
+                                uri_list = expanded
+
+                if (
+                    uri_list
+                    and self.dut_manager
+                    and self.dut_manager.uri_config_manager
+                ):
+                    uri_list = [
+                        self.dut_manager.uri_config_manager._apply_prefix_override(uri)
+                        for uri in uri_list
+                    ]
+
             if collection_type == "get":
                 return await self._handle_get_collection(
                     dut_id, uri_list, function_tag, **kwargs
@@ -8115,7 +10879,12 @@ class RedfishService(BaseService):
                 )
             elif collection_type == "expand":
                 return await self._handle_expand_collection(
-                    dut_id, uri_list, expand_level, function_tag, **kwargs
+                    dut_id,
+                    uri_list,
+                    expand_level,
+                    function_tag,
+                    entity_type=entity_type,
+                    **kwargs,
                 )
             elif collection_type == "chassis_with_filter":
                 return await self._handle_chassis_with_filter_collection(
@@ -8154,6 +10923,8 @@ class RedfishService(BaseService):
                     "error_type": type(e).__name__,
                 },
             )
+        finally:
+            await self._clear_redfish_request_capture(dut_id, collector_id)
 
     async def _collect_redfish_paginated_logs(
         self,
@@ -8183,24 +10954,37 @@ class RedfishService(BaseService):
             Collector result dictionary.
         """
         collector_name = f"{function_tag}_{entity_type}_{log_service}"
+        collector_id = kwargs.get("collector_id", collector_name)
 
         try:
-            await self._log_collector_start(dut_id, collector_name)
+            await self._log_collector_start(
+                dut_id, collector_name, collector_id=collector_id
+            )
 
             # Check if we have validation results with filtered entities
             filtered_systems = kwargs.get("filtered_systems", [])
             filtered_managers = kwargs.get("filtered_managers", [])
             filtered_chassis = kwargs.get("filtered_chassis", [])
 
-            if filtered_systems and entity_type == "Systems":
+            if entity_type == "Systems" and "filtered_systems" in kwargs:
                 # Use filtered systems from validation
+                system_ids_for_log = [sys["id"] for sys in filtered_systems]
                 await self._log_runtime(
                     "INFO",
                     "RedfishService",
-                    f"Using {len(filtered_systems)} filtered systems from validation: {[sys['id'] for sys in filtered_systems]}",
+                    f"Using {len(filtered_systems)} filtered systems from validation: {system_ids_for_log}",
                     dut_id,
                 )
                 entity_ids = [sys["id"] for sys in filtered_systems]
+
+                dut_config = self.dut_manager.get_dut_config(dut_id)
+                original_system_ids = entity_ids.copy()
+                entity_ids = filter_ids(entity_ids, "system", dut_config)
+                if len(entity_ids) != len(original_system_ids):
+                    await log_filtered_ids(
+                        original_system_ids, entity_ids, "system", self.logger, dut_id
+                    )
+
                 systems_uri = self.get_configured_uri(dut_id, "Systems")
                 entities = {
                     "Members": [
@@ -8208,12 +10992,13 @@ class RedfishService(BaseService):
                         for sys_id in entity_ids
                     ]
                 }
-            elif filtered_managers and entity_type == "Managers":
+            elif entity_type == "Managers" and "filtered_managers" in kwargs:
                 # Use filtered managers from validation
+                manager_ids_for_log = [mgr["id"] for mgr in filtered_managers]
                 await self._log_runtime(
                     "INFO",
                     "RedfishService",
-                    f"Using {len(filtered_managers)} filtered managers from validation: {[mgr['id'] for mgr in filtered_managers]}",
+                    f"Using {len(filtered_managers)} filtered managers from validation: {manager_ids_for_log}",
                     dut_id,
                 )
                 entity_ids = [mgr["id"] for mgr in filtered_managers]
@@ -8225,7 +11010,7 @@ class RedfishService(BaseService):
 
                 # Log filtered IDs if any were filtered
                 if len(entity_ids) != len(original_manager_ids):
-                    log_filtered_ids(
+                    await log_filtered_ids(
                         original_manager_ids, entity_ids, "manager", self.logger, dut_id
                     )
 
@@ -8236,15 +11021,25 @@ class RedfishService(BaseService):
                         for mgr_id in entity_ids
                     ]
                 }
-            elif filtered_chassis and entity_type == "Chassis":
+            elif entity_type == "Chassis" and "filtered_chassis" in kwargs:
                 # Use filtered chassis from validation
+                chassis_ids_for_log = [chassis["id"] for chassis in filtered_chassis]
                 await self._log_runtime(
                     "INFO",
                     "RedfishService",
-                    f"Using {len(filtered_chassis)} filtered chassis from validation: {[chassis['id'] for chassis in filtered_chassis]}",
+                    f"Using {len(filtered_chassis)} filtered chassis from validation: {chassis_ids_for_log}",
                     dut_id,
                 )
                 entity_ids = [chassis["id"] for chassis in filtered_chassis]
+
+                dut_config = self.dut_manager.get_dut_config(dut_id)
+                original_chassis_ids = entity_ids.copy()
+                entity_ids = filter_ids(entity_ids, "chassis", dut_config)
+                if len(entity_ids) != len(original_chassis_ids):
+                    await log_filtered_ids(
+                        original_chassis_ids, entity_ids, "chassis", self.logger, dut_id
+                    )
+
                 chassis_uri = self.get_configured_uri(dut_id, "Chassis")
                 entities = {
                     "Members": [
@@ -8473,31 +11268,23 @@ class RedfishService(BaseService):
             total_collections = len(all_status_list)
 
             # Handle the case where no collections were attempted (e.g., no entries in EventLog)
-            # This should be considered a successful collection with no data, not a failure
+            # as an expected no-data outcome, not a successful data collection.
             if total_collections == 0:
-                # No collections attempted - this is a successful collection with no data
                 await self._log_runtime(
                     "INFO",
                     "RedfishService",
-                    f"No collections attempted for {entity_type} {log_service} - this is a successful collection with no data",
+                    f"No collections attempted for {entity_type} {log_service} - treating as expected no-data",
                     dut_id,
                 )
-                result = await self._create_standardized_collector_result(
-                    dut_id=dut_id,
-                    collector_id=kwargs.get(
-                        "collector_id", f"{entity_type}_{log_service}"
-                    ),
-                    successful_operations=1,  # Consider this successful
-                    total_operations=1,
+                result = await self._create_no_data_skipped_result(
+                    log_service=log_service,
+                    reason=f"No {log_service} entries found for {entity_type} - expected no-data",
                     output_files=output_files,
-                    error_messages=[],
                     operation_name="collections",
                     additional_context={
                         "entities_processed": len(entity_ids),
-                        "successful_collections": 1,
-                        "total_collections": 1,
-                        "no_data_collected": True,
-                        "reason": f"No {log_service} entries found for {entity_type} - collection successful with no data",
+                        "successful_collections": 0,
+                        "total_collections": 0,
                     },
                 )
             elif successful_collections == 0 and total_collections > 0:
@@ -8570,7 +11357,7 @@ class RedfishService(BaseService):
                     if len(output_files) > 0:
                         detailed_error_msg += f"Successfully collected {len(output_files)} files before encountering errors. "
                     detailed_error_msg += (
-                        f"Error details saved to JSON files for manual investigation."
+                        "Error details saved to JSON files for manual investigation."
                     )
 
                     result = await self._create_standardized_collector_result(
@@ -8645,6 +11432,8 @@ class RedfishService(BaseService):
 
         except Exception as e:
             return await self._handle_collector_exception(dut_id, collector_name, e)
+        finally:
+            await self._clear_redfish_request_capture(dut_id, collector_id)
 
     async def _collect_optimized_paginated_logs(
         self,
@@ -8666,6 +11455,14 @@ class RedfishService(BaseService):
         try:
             # Initialize collection variables
             collected_files = []
+            output_pattern = kwargs.get("output_pattern", "")
+            resolved_collector_id = kwargs.get(
+                "collector_id"
+            ) or await self._get_original_collector_id(
+                dut_id, self._get_current_collector_id()
+            )
+            entity_id_key = self._get_entity_id_key(entity_type)
+            base_substitutions = {entity_id_key: entity_id, "entity_id": entity_id}
 
             # Get collection level and determine skip amount
             collection_level = kwargs.get("collection_level", "L3")
@@ -8767,7 +11564,7 @@ class RedfishService(BaseService):
 
                     # Create a JSON file documenting that PostCodes service is not available
                     info_response = {
-                        "info": f"PostCodes service check attempted",
+                        "info": "PostCodes service check attempted",
                         "entity_type": entity_type,
                         "entity_id": entity_id,
                         "service_uri": log_service_uri,
@@ -8967,7 +11764,7 @@ class RedfishService(BaseService):
             max_entries_to_collect = None
 
             if collection_level and skip_amount > 0 and total_entries is not None:
-                # Calculate start_skip for collection level
+                # Calculate start_skip for collection level (like legacy code)
                 start_skip = max(0, total_entries - skip_amount)
                 entries_to_collect = total_entries - start_skip
                 max_entries_to_collect = entries_to_collect
@@ -8994,12 +11791,13 @@ class RedfishService(BaseService):
             # Initialize collection variables
             all_entries = []
             additional_data = {}
+            page_files = []
             status_list = (
                 []
             )  # Status per page - important for partial success determination
             page_timings = []  # Track timing for each page
             page = 1
-            max_pages = 100  # Safety limit
+            max_pages = self._get_tool_config_int("max_pagination_pages", 100)
             collection_start_time = time.time()
 
             await self._log_runtime(
@@ -9014,6 +11812,18 @@ class RedfishService(BaseService):
                 f"Total entries: {total_entries}, Target skip: {start_skip}, Collection level: {collection_level}",
                 dut_id,
             )
+
+            # Apply time-window $filter when streaming --since/--until are set
+            time_filter = await self._build_redfish_time_filter(dut_id)
+            if time_filter:
+                separator = "&" if "?" in base_uri else "?"
+                base_uri = f"{base_uri}{separator}{time_filter}"
+                await self._log_runtime(
+                    "INFO",
+                    "RedfishService",
+                    f"Applied time filter to {entity_type} {entity_id}: {time_filter}",
+                    dut_id,
+                )
 
             # Pagination approach - use $skip if specified
             current_uri = base_uri
@@ -9040,10 +11850,13 @@ class RedfishService(BaseService):
                 0  # Actual page number (increments only when moving to next page)
             )
             total_entries_collected = 0
-            max_pages = 100  # Safety limit
             page_retry_count = 0  # Track retries at pagination level
             max_page_retries = 2  # Maximum retries per page at pagination level
-            retry_delay = 2  # Simple 2-second delay between retries
+            max_duplicate_url_retries = self._get_tool_config_int(
+                "max_duplicate_url_retries", 3
+            )
+            duplicate_url_count = 0
+            retry_delay = 2  # Simple 2-second delay between retries (like legacy)
             current_page_retry = 0  # Track retries for current page
 
             while current_uri and page_count < max_pages:
@@ -9203,6 +12016,7 @@ class RedfishService(BaseService):
 
                                 if file_path:
                                     collected_files.append(file_path)
+                                    page_files.append(file_path)
                                     await self._log_runtime(
                                         "INFO",
                                         "RedfishService",
@@ -9239,16 +12053,47 @@ class RedfishService(BaseService):
 
                                         # Check for next link
                                         if parsed_response.get(next_link_field):
-                                            current_uri = parsed_response.get(
+                                            next_uri = parsed_response.get(
                                                 next_link_field
                                             )
-                                            await self._log_runtime(
-                                                "INFO",
-                                                "RedfishService",
-                                                f"Page {page_count} (502): continuing with next link: {current_uri}",
-                                                dut_id,
-                                            )
-                                            continue
+                                            if next_uri == current_uri:
+                                                duplicate_url_count += 1
+                                                if (
+                                                    duplicate_url_count
+                                                    >= max_duplicate_url_retries
+                                                ):
+                                                    await self._log_runtime(
+                                                        "WARNING",
+                                                        "RedfishService",
+                                                        f"Stopping pagination for {entity_type} {entity_id}: duplicate nextLink repeated {duplicate_url_count} times: {next_uri}",
+                                                        dut_id,
+                                                    )
+                                                    current_uri = None
+                                                    break
+                                            else:
+                                                duplicate_url_count = 0
+                                            current_uri = next_uri
+                                            if current_uri and not validate_redfish_uri(
+                                                current_uri,
+                                                expected_host=self._get_connection_host(
+                                                    dut_id
+                                                ),
+                                            ):
+                                                await self._log_runtime(
+                                                    "WARNING",
+                                                    "RedfishService",
+                                                    f"Rejecting suspicious nextLink URI: {current_uri}",
+                                                    dut_id,
+                                                )
+                                                current_uri = None
+                                            if current_uri:
+                                                await self._log_runtime(
+                                                    "INFO",
+                                                    "RedfishService",
+                                                    f"Page {page_count} (502): continuing with next link: {current_uri}",
+                                                    dut_id,
+                                                )
+                                                continue
                                         else:
                                             await self._log_runtime(
                                                 "INFO",
@@ -9344,7 +12189,7 @@ class RedfishService(BaseService):
                                 f"Page {page_count}: Exhausted pagination-level retries for {entity_type} {entity_id} - continuing to next page",
                                 dut_id,
                             )
-                            # Continue to next page instead of breaking
+                            # Continue to next page instead of breaking (following legacy code pattern)
                     else:
                         # Non-retry failure - mark as failed
                         status_list.append(False)
@@ -9398,11 +12243,37 @@ class RedfishService(BaseService):
                             and isinstance(response, dict)
                             and response.get(next_link_field)
                         ):
-                            current_uri = response.get(next_link_field)
+                            next_uri = response.get(next_link_field)
+                            if next_uri == current_uri:
+                                duplicate_url_count += 1
+                                if duplicate_url_count >= max_duplicate_url_retries:
+                                    await self._log_runtime(
+                                        "WARNING",
+                                        "RedfishService",
+                                        f"Stopping pagination for {entity_type} {entity_id}: duplicate nextLink repeated {duplicate_url_count} times: {next_uri}",
+                                        dut_id,
+                                    )
+                                    current_uri = None
+                                    break
+                            else:
+                                duplicate_url_count = 0
+                            current_uri = next_uri
+                            if current_uri and not validate_redfish_uri(
+                                current_uri,
+                                expected_host=self._get_connection_host(dut_id),
+                            ):
+                                await self._log_runtime(
+                                    "WARNING",
+                                    "RedfishService",
+                                    f"Rejecting suspicious nextLink URI: {current_uri}",
+                                    dut_id,
+                                )
+                                current_uri = None
+                                break
                             current_page_retry = 0  # Reset retry count for new page
                             continue
                         else:
-                            # No nextLink available - stop pagination
+                            # No nextLink available - stop pagination (following legacy code pattern)
                             await self._log_runtime(
                                 "INFO",
                                 "RedfishService",
@@ -9490,17 +12361,24 @@ class RedfishService(BaseService):
                     output_file = f"{function_tag}_{log_service.lower()}_{entity_id}_page{page_count}_retry{current_page_retry}.json"
                 else:
                     output_file = f"{function_tag}_{log_service.lower()}_{entity_id}_page{page_count}.json"
+                page_substitutions = {
+                    **base_substitutions,
+                    "page": page_count,
+                    "total": "unknown",
+                }
                 file_path = await self._save_data_to_file_with_pattern(
                     dut_id,
                     response,
                     output_file,
                     filename=kwargs.get("filename", ""),
-                    substitutions={"entity_id": entity_id},
-                    collector_id=kwargs.get("collector_id"),
+                    output_pattern=output_pattern or output_file,
+                    substitutions=page_substitutions,
+                    collector_id=resolved_collector_id,
                 )
 
                 if file_path:
                     collected_files.append(file_path)
+                    page_files.append(file_path)
                     await self._log_runtime(
                         "DEBUG",
                         "RedfishService",
@@ -9543,6 +12421,7 @@ class RedfishService(BaseService):
                             dut_id,
                             additional_requests,
                             max_concurrent=3,  # Reduced from DEFAULT_MAX_CONCURRENT_REQUESTS
+                            get_raw_content=True,
                         )
 
                         # Process results
@@ -9573,6 +12452,28 @@ class RedfishService(BaseService):
                     and response.get(next_link_field)
                 ):
                     next_link = response.get(next_link_field)
+                    if next_link == current_uri:
+                        duplicate_url_count += 1
+                        if duplicate_url_count >= max_duplicate_url_retries:
+                            await self._log_runtime(
+                                "WARNING",
+                                "RedfishService",
+                                f"Stopping pagination for {entity_type} {entity_id}: duplicate nextLink repeated {duplicate_url_count} times: {next_link}",
+                                dut_id,
+                            )
+                            break
+                    else:
+                        duplicate_url_count = 0
+                    if not validate_redfish_uri(
+                        next_link, expected_host=self._get_connection_host(dut_id)
+                    ):
+                        await self._log_runtime(
+                            "WARNING",
+                            "RedfishService",
+                            f"Rejecting suspicious nextLink URI: {next_link}",
+                            dut_id,
+                        )
+                        break
                     current_uri = next_link
                     await self._log_runtime(
                         "DEBUG",
@@ -9661,7 +12562,7 @@ class RedfishService(BaseService):
                     await self._log_runtime("INFO", "RedfishService", line, dut_id)
 
             # Post-processing: Fix filenames with actual total pages
-            actual_total_pages = len(collected_files)
+            actual_total_pages = len(page_files)
             if actual_total_pages > 0:
                 await self._log_runtime(
                     "INFO",
@@ -9672,15 +12573,34 @@ class RedfishService(BaseService):
 
                 # Rename files to use actual total
                 renamed_files = []
-                for i, file_path in enumerate(collected_files, 1):
+                page_file_set = set(page_files)
+                for file_path in collected_files:
                     try:
                         old_path = file_path
+                        if old_path not in page_file_set:
+                            renamed_files.append(file_path)
+                            continue
+
                         # Replace "unknown" or any existing total with actual total
                         new_path = re.sub(
-                            r"_page(\d+)\.json$",
+                            r"_page(\d+)_of_[^/]+\.json$",
                             f"_page\\1_of_{actual_total_pages}.json",
                             str(old_path),
                         )
+                        if new_path == str(old_path):
+                            new_path = re.sub(
+                                r"_page(\d+)\.json$",
+                                f"_page\\1_of_{actual_total_pages}.json",
+                                str(old_path),
+                            )
+
+                        if self.logger and resolved_collector_id:
+                            new_basename = self.logger._apply_stream_window_to_filename(
+                                resolved_collector_id, os.path.basename(new_path)
+                            )
+                            new_path = os.path.join(
+                                os.path.dirname(new_path), new_basename
+                            )
 
                         if os.path.exists(old_path) and old_path != new_path:
                             os.rename(old_path, new_path)
@@ -9843,6 +12763,8 @@ class RedfishService(BaseService):
         try:
             output_files = []
             collection_type = kwargs.get("collection_type", "spdm_measurements")
+            successful_operations = 0
+            total_operations = 0
 
             # Get ComponentIntegrity information
             base_uri = kwargs.get("base_uri", "ComponentIntegrity")
@@ -9931,7 +12853,7 @@ class RedfishService(BaseService):
                     dut_id,
                 )
             else:
-                # Fallback to default configuration if no baseboard manager
+                # Fallback to legacy configuration if no baseboard manager
                 member_key_config = kwargs.get("member_key_config", {})
                 if member_key_config:
                     # Use the first available key list as default
@@ -9946,6 +12868,11 @@ class RedfishService(BaseService):
             # Get configurable delays
             member_delay = kwargs.get("member_delay", 1)
             request_delay = kwargs.get("request_delay", 1)
+            handler, expected_operations = (
+                self._get_component_integrity_handler_and_expected_operations(
+                    collection_type, kwargs
+                )
+            )
 
             for i, member in enumerate(members):
                 # Add delay between member processing to prevent BMC overload
@@ -9954,6 +12881,8 @@ class RedfishService(BaseService):
 
                 member_uri = member.get("@odata.id", None)
                 if not member_uri:
+                    continue
+                if not validate_redfish_uri(member_uri):
                     continue
 
                 # Platform-specific member key filtering
@@ -9972,6 +12901,7 @@ class RedfishService(BaseService):
                     f"Collecting {collection_type} for {member_uri}",
                     dut_id,
                 )
+                total_operations += expected_operations
 
                 # Get component integrity info
                 success, component_response, _ = await self.dispatch_request(
@@ -9987,44 +12917,21 @@ class RedfishService(BaseService):
                 member_id = member_uri.split("/")[-1]
 
                 # Handle different collection types
-                if collection_type == "spdm_measurements":
-                    # Handle SPDM measurements collection
-                    await self._handle_spdm_measurements_collection(
-                        dut_id,
-                        component_response,
-                        member_uri,
-                        member_id,
-                        kwargs,
-                        function_tag,
-                        output_files,
-                        request_delay,
-                    )
-                elif collection_type == "certificates":
-                    # Handle certificate collection
-                    await self._handle_certificate_collection(
-                        dut_id,
-                        component_response,
-                        member_uri,
-                        member_id,
-                        kwargs,
-                        function_tag,
-                        output_files,
-                    )
-                else:
-                    # Generic collection - just save the component response
-                    await self._handle_generic_collection(
-                        dut_id,
-                        component_response,
-                        member_uri,
-                        member_id,
-                        kwargs,
-                        function_tag,
-                        output_files,
-                    )
+                handler_result = await handler(
+                    dut_id,
+                    component_response,
+                    member_uri,
+                    member_id,
+                    kwargs,
+                    function_tag,
+                    output_files,
+                    request_delay,
+                )
+                successful_operations += handler_result["successful_operations"]
 
             return await self._create_standardized_collector_result(
-                successful_operations=len(output_files),
-                total_operations=len(members),
+                successful_operations=successful_operations,
+                total_operations=total_operations,
                 output_files=output_files,
                 error_messages=[],
                 operation_name=collection_type,
@@ -10051,6 +12958,25 @@ class RedfishService(BaseService):
                 },
             )
 
+    def _get_component_integrity_handler_and_expected_operations(
+        self, collection_type: str, kwargs: Dict[str, Any]
+    ) -> Tuple[Callable[..., Awaitable[Dict[str, int]]], int]:
+        """
+        Select the collection handler and expected operation count per member.
+
+        The expected count is used even when the per-member GET fails before the
+        handler can run, so status accounting reflects attempted work.
+        """
+        if collection_type == "spdm_measurements":
+            measurement_indices = kwargs.get("measurement_indices", [26, 50])
+            return (
+                self._handle_spdm_measurements_collection,
+                len(measurement_indices),
+            )
+        if collection_type == "certificates":
+            return (self._handle_certificate_collection, 1)
+        return (self._handle_generic_collection, 1)
+
     async def _handle_spdm_measurements_collection(
         self,
         dut_id: str,
@@ -10060,8 +12986,8 @@ class RedfishService(BaseService):
         kwargs: Dict[str, Any],
         function_tag: str,
         output_files: List[str],
-        request_delay: int,
-    ) -> None:
+        request_delay: int = 0,
+    ) -> Dict[str, int]:
         """
         Handle SPDM measurements collection.
 
@@ -10085,6 +13011,12 @@ class RedfishService(BaseService):
             .get("target", None)
         )
 
+        index_list = kwargs.get("measurement_indices", [26, 50])
+        collection_result = {
+            "successful_operations": 0,
+            "total_operations": len(index_list),
+        }
+
         if not action_target:
             await self._log_runtime(
                 "WARN",
@@ -10092,10 +13024,9 @@ class RedfishService(BaseService):
                 f"No SPDM action found for uri {member_uri}. Skipping...",
                 dut_id,
             )
-            return
+            return collection_result
 
         # Collect measurements for specific indices
-        index_list = kwargs.get("measurement_indices", [26, 50])
         slot_id = kwargs.get("slot_id", 0)
 
         for j, index in enumerate(index_list):
@@ -10121,7 +13052,7 @@ class RedfishService(BaseService):
                     )
                     continue
 
-                # Wait for task completion
+                # Wait for task completion (like legacy implementation)
                 max_retries = kwargs.get("max_retries", 50)
                 entity_context = {
                     "entity_type": "ComponentIntegrity",
@@ -10147,7 +13078,7 @@ class RedfishService(BaseService):
                     )
                     continue
 
-                # Get dump location
+                # Get dump location (like legacy implementation)
                 # SPDM measurements are not binary attachments, so use attachment=False
                 dump_location = await self._get_dump_location(
                     task_completed, dut_id, attachment=False
@@ -10183,13 +13114,20 @@ class RedfishService(BaseService):
                     )
                     if file_path:
                         output_files.append(file_path)
-
-                    await self._log_runtime(
-                        "INFO",
-                        "RedfishService",
-                        f"Successfully collected SPDM measurement index {index} from {member_uri}",
-                        dut_id,
-                    )
+                        collection_result["successful_operations"] += 1
+                        await self._log_runtime(
+                            "INFO",
+                            "RedfishService",
+                            f"Successfully collected SPDM measurement index {index} from {member_uri}",
+                            dut_id,
+                        )
+                    else:
+                        await self._log_runtime(
+                            "ERROR",
+                            "RedfishService",
+                            f"Failed to save SPDM measurement index {index} from {member_uri}",
+                            dut_id,
+                        )
                 else:
                     await self._log_runtime(
                         "ERROR",
@@ -10205,6 +13143,8 @@ class RedfishService(BaseService):
                     dut_id,
                 )
 
+        return collection_result
+
     async def _handle_certificate_collection(
         self,
         dut_id: str,
@@ -10214,7 +13154,8 @@ class RedfishService(BaseService):
         kwargs: Dict[str, Any],
         function_tag: str,
         output_files: List[str],
-    ) -> None:
+        request_delay: int,
+    ) -> Dict[str, int]:
         """
         Handle certificate collection.
 
@@ -10229,7 +13170,7 @@ class RedfishService(BaseService):
         """
         # For certificates, we might want to collect additional certificate data
         # This is a placeholder for certificate-specific logic
-        await self._handle_generic_collection(
+        return await self._handle_generic_collection(
             dut_id,
             component_response,
             member_uri,
@@ -10237,6 +13178,7 @@ class RedfishService(BaseService):
             kwargs,
             function_tag,
             output_files,
+            request_delay,
         )
 
     async def _handle_generic_collection(
@@ -10248,7 +13190,8 @@ class RedfishService(BaseService):
         kwargs: Dict[str, Any],
         function_tag: str,
         output_files: List[str],
-    ) -> None:
+        request_delay: int = 0,
+    ) -> Dict[str, int]:
         """
         Handle generic collection - just save the component response.
 
@@ -10276,6 +13219,9 @@ class RedfishService(BaseService):
         )
         if file_path:
             output_files.append(file_path)
+            return {"successful_operations": 1, "total_operations": 1}
+
+        return {"successful_operations": 0, "total_operations": 1}
 
     async def collect_diagnostic_data(
         self,
@@ -10330,6 +13276,14 @@ class RedfishService(BaseService):
                     dut_id,
                 )
                 entity_ids = [sys["id"] for sys in filtered_systems]
+
+                dut_config = self.dut_manager.get_dut_config(dut_id)
+                original_system_ids = entity_ids.copy()
+                entity_ids = filter_ids(entity_ids, "system", dut_config)
+                if len(entity_ids) != len(original_system_ids):
+                    await log_filtered_ids(
+                        original_system_ids, entity_ids, "system", self.logger, dut_id
+                    )
             elif filtered_managers and entity_type == "Managers":
                 # Use filtered managers from validation
                 await self._log_runtime(
@@ -10347,7 +13301,7 @@ class RedfishService(BaseService):
 
                 # Log filtered IDs if any were filtered
                 if len(entity_ids) != len(original_manager_ids):
-                    log_filtered_ids(
+                    await log_filtered_ids(
                         original_manager_ids, entity_ids, "manager", self.logger, dut_id
                     )
             elif filtered_chassis and entity_type == "Chassis":
@@ -10359,6 +13313,13 @@ class RedfishService(BaseService):
                     dut_id,
                 )
                 entity_ids = [chassis["id"] for chassis in filtered_chassis]
+                dut_config = self.dut_manager.get_dut_config(dut_id)
+                original_chassis_ids = entity_ids.copy()
+                entity_ids = filter_ids(entity_ids, "chassis", dut_config)
+                if len(entity_ids) != len(original_chassis_ids):
+                    await log_filtered_ids(
+                        original_chassis_ids, entity_ids, "chassis", self.logger, dut_id
+                    )
             else:
                 # Get entities - dut_manager handles URI construction automatically
                 await self._log_runtime(
@@ -10602,6 +13563,478 @@ class RedfishService(BaseService):
                 },
             )
 
+    async def collect_dgx_diagnostic_data(
+        self,
+        dut_id: str,
+        oem_types: List[str],
+        function_tag: str,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """
+        Collect DGX-specific diagnostic data via Managers/BMC/LogServices/DiagnosticLog.
+
+        This hook is added to existing collectors (e.g. manager_on_demand_log_dump,
+        manager_fpga_register_dump) and silently skips on non-DGX hardware.
+
+        For DGX platforms the BMC exposes:
+          POST /redfish/v1/Managers/BMC/LogServices/DiagnosticLog/Actions/LogService.CollectDiagnosticData
+        with payload {"DiagnosticDataType": "OEM", "OEMDiagnosticDataType": "<type>"}.
+
+        Output files are placed in a DGX/ subdirectory within the collector's output
+        directory (enabled by an os.makedirs call in _save_data_to_file_with_pattern).
+
+        Args:
+            dut_id: DUT identifier.
+            oem_types: List of OEMDiagnosticDataType values to collect
+                       (e.g. ["logs", "BMCLOG", "SERVICELOGS"]).
+            function_tag: Tag used for file naming / request metadata.
+            **kwargs: Forwarded by the hook framework; includes collector_id,
+                      output_pattern, collection_level, etc.
+        """
+        try:
+            dut = self.dut_manager.get_dut(dut_id)
+            is_dgx, dgx_signal = await self._is_dgx_platform(dut_id, dut)
+            if not is_dgx:
+                await self._log_runtime(
+                    "DEBUG",
+                    "RedfishService",
+                    "collect_dgx_diagnostic_data: not a DGX platform — skipping",
+                    dut_id,
+                )
+                return {
+                    "success": True,
+                    "status": "skipped",
+                    "reason": "Not a DGX platform",
+                    "context": {
+                        "successful_operations": 0,
+                        "total_operations": 0,
+                        "dgx_applicable": False,
+                    },
+                    "output_files": [],
+                }
+
+            collector_id = kwargs.get("collector_id", "")
+            output_pattern = kwargs.get(
+                "output_pattern", "DGX/Redfish_dgx_{oem_type}_BMC_{task_id}.tar.xz"
+            )
+
+            output_files = []
+            status_list = []
+            error_messages = []
+
+            await self._log_runtime(
+                "INFO",
+                "RedfishService",
+                f"DGX platform detected via {dgx_signal} — collecting {len(oem_types)} diagnostic type(s): {oem_types}",
+                dut_id,
+            )
+
+            for oem_type in oem_types:
+                payload = {
+                    "DiagnosticDataType": "OEM",
+                    "OEMDiagnosticDataType": oem_type,
+                }
+                # Substitute {oem_type} in the output_pattern for this iteration
+                resolved_pattern = output_pattern.replace("{oem_type}", oem_type)
+
+                await self._log_runtime(
+                    "INFO",
+                    "RedfishService",
+                    f"DGX: triggering {oem_type} dump via Managers/BMC/LogServices/DiagnosticLog",
+                    dut_id,
+                )
+
+                # Strip all keys we pass explicitly to _execute_redfish_dump_task
+                # to avoid "multiple values for keyword argument" errors from the context dict
+                _explicit = {
+                    "dut_id",
+                    "entity_type",
+                    "entity_id",
+                    "log_service",
+                    "payload",
+                    "function_tag",
+                    "output_pattern",
+                    "collector_id",
+                    "diagnostic_type",
+                    # hook-specific params that don't belong in _execute_redfish_dump_task
+                    "oem_types",
+                }
+                passthrough = {k: v for k, v in kwargs.items() if k not in _explicit}
+                success, output_file = await self._execute_redfish_dump_task(
+                    dut_id=dut_id,
+                    entity_type="Managers",
+                    entity_id="BMC",
+                    log_service="DiagnosticLog",
+                    payload=payload,
+                    function_tag=function_tag,
+                    output_pattern=resolved_pattern,
+                    collector_id=collector_id,
+                    diagnostic_type=oem_type,
+                    **passthrough,
+                )
+
+                status_list.append(success)
+                if output_file:
+                    output_files.append(output_file)
+                if not success:
+                    error_messages.append(f"DGX {oem_type}: {output_file}")
+
+            successful = len([s for s in status_list if s])
+            total = len(status_list)
+
+            return await self._create_standardized_collector_result(
+                successful_operations=successful,
+                total_operations=total,
+                output_files=output_files,
+                error_messages=error_messages,
+                operation_name="dgx_diagnostic_data",
+                additional_context={
+                    "dgx_applicable": True,
+                    "oem_types": oem_types,
+                    "entity": "Managers/BMC/LogServices/DiagnosticLog",
+                },
+            )
+
+        except Exception as e:
+            await self._log_runtime(
+                "ERROR",
+                "RedfishService",
+                f"Exception in collect_dgx_diagnostic_data: {e}",
+                dut_id,
+            )
+            return await self._create_standardized_collector_result(
+                successful_operations=0,
+                total_operations=0,
+                output_files=[],
+                error_messages=[f"Exception in collect_dgx_diagnostic_data: {e}"],
+                operation_name="dgx_diagnostic_data",
+                additional_context={"error_type": type(e).__name__},
+            )
+
+    async def _is_dgx_platform(
+        self, dut_id: str, dut: Optional[Any] = None
+    ) -> Tuple[bool, str]:
+        """Infer DGX applicability from explicit Redfish IDs and platform metadata."""
+        if dut is None:
+            dut = self.dut_manager.get_dut(dut_id)
+
+        if getattr(dut, "is_dgx", False):
+            return True, "redfish Systems member"
+
+        discovered_systems = await self.get_discovered_systems(dut_id)
+        if "DGX" in discovered_systems:
+            dut.is_dgx = True
+            return True, "discovered Systems member 'DGX'"
+
+        discovered_managers = await self.get_discovered_managers(dut_id)
+        if "DGX" in discovered_managers:
+            dut.is_dgx = True
+            return True, "discovered Managers member 'DGX'"
+
+        platform_info = getattr(dut, "platform_info", None)
+        if platform_info is None:
+            try:
+                platform_info = await self.dut_manager.get_platform_info(dut_id)
+            except Exception:
+                platform_info = None
+
+        if isinstance(platform_info, dict):
+            platform_text = " ".join(
+                str(platform_info.get(key, ""))
+                for key in ("model", "partnumber", "part_number", "name")
+            ).upper()
+            if "DGX" in platform_text:
+                dut.is_dgx = True
+                dut.platform_info = platform_info
+                return True, "platform metadata"
+
+        return False, "no DGX indicators"
+
+    async def _query_action_info_for_systems(
+        self,
+        dut_id: str,
+        system_ids: List[str],
+        log_service: str = "Dump",
+    ) -> Dict[str, List[str]]:
+        """Query CollectDiagnosticDataActionInfo for each system to get valid diagnostic types.
+
+        This method queries the ActionInfo endpoint for each system to determine what
+        diagnostic types are actually supported. This information is used for:
+        1. ActionInfo-aware success criteria (failures on non-ActionInfo items don't count)
+        2. Validating expected vs actual collection results
+
+        Args:
+            dut_id: Device under test ID
+            system_ids: List of system IDs to query
+            log_service: Log service name (default: "Dump")
+
+        Returns:
+            Dict mapping system_id to list of valid OEMDiagnosticDataType values.
+            Returns empty dict if ActionInfo is unavailable (graceful fallback).
+
+        Example return:
+            {
+                "System_0": ["DiagnosticType=NetIR;DeviceType=NIC_0", ...],
+                "HGX_Baseboard_0": ["DiagnosticType=GPUDiagnostics;DeviceType=GPU_SMA_0", ...]
+            }
+        """
+        action_info_by_system: Dict[str, List[str]] = {}
+
+        for system_id in system_ids:
+            try:
+                # Build the ActionInfo URI
+                action_info_uri = f"/redfish/v1/Systems/{system_id}/LogServices/{log_service}/CollectDiagnosticDataActionInfo"
+
+                await self._log_runtime(
+                    "DEBUG",
+                    "RedfishService",
+                    f"[ActionInfo] Querying ActionInfo for system {system_id}: {action_info_uri}",
+                    dut_id,
+                )
+
+                success, response, _ = await self.dispatch_request(
+                    dut_id, "GET", action_info_uri, bypass_cache=True
+                )
+
+                if not success or not response:
+                    await self._log_runtime(
+                        "WARNING",
+                        "RedfishService",
+                        f"[ActionInfo] Failed to query ActionInfo for {system_id}, will use fallback behavior",
+                        dut_id,
+                    )
+                    continue
+
+                # Parse the Parameters to find OEMDiagnosticDataType allowable values
+                parameters = response.get("Parameters", [])
+                oem_diagnostic_values = []
+
+                for param in parameters:
+                    if param.get("Name") == "OEMDiagnosticDataType":
+                        oem_diagnostic_values = param.get("AllowableValues", [])
+                        break
+
+                if oem_diagnostic_values:
+                    action_info_by_system[system_id] = oem_diagnostic_values
+                    await self._log_runtime(
+                        "INFO",
+                        "RedfishService",
+                        f"[ActionInfo] System {system_id} supports {len(oem_diagnostic_values)} diagnostic types",
+                        dut_id,
+                    )
+                    await self._log_runtime(
+                        "DEBUG",
+                        "RedfishService",
+                        f"[ActionInfo] System {system_id} types: {oem_diagnostic_values}",
+                        dut_id,
+                    )
+                else:
+                    await self._log_runtime(
+                        "WARNING",
+                        "RedfishService",
+                        f"[ActionInfo] No OEMDiagnosticDataType values found for {system_id}",
+                        dut_id,
+                    )
+
+            except Exception as e:
+                await self._log_runtime(
+                    "WARNING",
+                    "RedfishService",
+                    f"[ActionInfo] Exception querying ActionInfo for {system_id}: {str(e)}",
+                    dut_id,
+                )
+                continue
+
+        return action_info_by_system
+
+    def _check_diagnostic_type_in_action_info(
+        self,
+        oem_diagnostic_type: str,
+        action_info_values: List[str],
+    ) -> bool:
+        """Check if a diagnostic type is in the ActionInfo allowable values.
+
+        Args:
+            oem_diagnostic_type: The OEMDiagnosticDataType value being requested
+            action_info_values: List of allowable values from ActionInfo
+
+        Returns:
+            True if the diagnostic type is in ActionInfo, False otherwise
+        """
+        if not action_info_values:
+            # No ActionInfo available, assume it's valid (backward compatible)
+            return True
+
+        return oem_diagnostic_type in action_info_values
+
+    async def _collect_for_system(
+        self,
+        dut_id: str,
+        system_id: str,
+        device_tasks: List[Dict[str, Any]],
+        action_info_values: List[str],
+        use_action_info_validation: bool,
+        collector_name: str,
+        collector_id: str,
+        kwargs: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """Collect all diagnostic data for a single system sequentially.
+
+        This helper method is used for parallel collection across systems.
+        Within a single system, collections are executed sequentially to avoid
+        BMC ResourceInUse errors (BMC enforces sequential collection per LogService).
+
+        Args:
+            dut_id: Device under test ID
+            system_id: The system ID to collect from
+            device_tasks: List of device task dicts, each containing:
+                - device_type: Type of device (e.g., "sma", "nvswitch")
+                - device_id: Device ID number
+                - device_config: Resolved config for this device
+                - payload: The diagnostic payload to send
+                - oem_diag_type: The OEMDiagnosticDataType value
+                - is_in_action_info: Whether this type is in ActionInfo
+                - device_identifier: Full device identifier string
+                - diagnostic_type: The diagnostic type string
+            action_info_values: List of valid diagnostic types from ActionInfo for this system
+            use_action_info_validation: Whether ActionInfo validation is enabled
+            collector_name: Name of the collector (for logging)
+            collector_id: Collector ID for tracking
+            kwargs: Additional kwargs to pass to collect_diagnostic_data
+
+        Returns:
+            List of result dicts, one per device task, containing:
+                - success: Whether collection succeeded
+                - output_files: List of output files
+                - status: Boolean status
+                - error_messages: List of error messages
+                - device_type: The device type
+                - device_id: The device ID
+                - is_in_action_info: Whether this type was in ActionInfo
+                - oem_diag_type: The OEMDiagnosticDataType value
+        """
+        results = []
+
+        await self._log_runtime(
+            "INFO",
+            "RedfishService",
+            f"[Parallel] Starting sequential collection for system {system_id} with {len(device_tasks)} tasks",
+            dut_id,
+        )
+
+        for idx, task in enumerate(device_tasks):
+            device_type = task["device_type"]
+            device_id = task["device_id"]
+            payload = task["payload"]
+            diagnostic_type = task["diagnostic_type"]
+            device_identifier = task["device_identifier"]
+            is_in_action_info = task["is_in_action_info"]
+            oem_diag_type = task["oem_diag_type"]
+
+            # Log if attempting a task that's not in ActionInfo (might still work if ActionInfo is incomplete)
+            if (
+                use_action_info_validation
+                and action_info_values
+                and not is_in_action_info
+            ):
+                await self._log_runtime(
+                    "DEBUG",
+                    "RedfishService",
+                    f"[ActionInfo] Attempting {device_type}_{device_id} on {system_id} - "
+                    f"'{oem_diag_type}' not in ActionInfo (may fail, won't count against success)",
+                    dut_id,
+                )
+
+            await self._log_runtime(
+                "DEBUG",
+                "RedfishService",
+                f"[Parallel] System {system_id}: Collecting task {idx + 1}/{len(device_tasks)} - "
+                f"{device_type}_{device_id}",
+                dut_id,
+            )
+
+            # Create a filtered systems context for this specific system
+            filtered_systems_for_device = [{"id": system_id}]
+
+            # Create substitutions for output pattern
+            device_substitutions = {
+                "system_id": system_id,
+                "device_id": device_id,
+                "device_type": device_type,
+                "diagnostic_type": diagnostic_type,
+                "device_identifier": device_identifier,
+            }
+
+            # Create a clean kwargs dict without conflicting parameters
+            clean_kwargs = {
+                k: v for k, v in kwargs.items() if k not in ["function_tag"]
+            }
+            clean_kwargs["substitutions"] = device_substitutions
+            clean_kwargs["filtered_systems"] = filtered_systems_for_device
+
+            # Use existing collect_diagnostic_data method with custom payload
+            result = await self.collect_diagnostic_data(
+                dut_id=dut_id,
+                entity_type="Systems",
+                log_service="Dump",
+                payload_types=[diagnostic_type],
+                default_payload=payload,
+                function_tag=f"{collector_name}_{device_type}",
+                fallback_payloads=[payload],
+                **clean_kwargs,
+            )
+
+            # Build result with metadata
+            task_result = {
+                "success": result.get("success", False),
+                "output_files": result.get("output_files", []),
+                "status": result.get("success", False),
+                "error_messages": result.get("error_messages", []),
+                "device_type": device_type,
+                "device_id": device_id,
+                "system_id": system_id,
+                "is_in_action_info": is_in_action_info,
+                "oem_diag_type": oem_diag_type,
+                "raw_result": result,
+            }
+            results.append(task_result)
+
+            await self._log_runtime(
+                "DEBUG",
+                "RedfishService",
+                f"[Parallel] System {system_id}: Task {idx + 1}/{len(device_tasks)} complete - "
+                f"{device_type}_{device_id} success={task_result['success']}",
+                dut_id,
+            )
+
+            # Add sleep between devices (but not after the last device)
+            if idx < len(device_tasks) - 1:
+                collector_def = kwargs.get("collector_def", {})
+                dut_config = self.dut_manager.get_dut_config(dut_id)
+                sleep_duration = get_collector_sleep_duration(
+                    kwargs.get("collector_id", collector_id),
+                    collector_def,
+                    dut_config,
+                    5,
+                )
+                await self._log_runtime(
+                    "DEBUG",
+                    "RedfishService",
+                    f"[Parallel] System {system_id}: Sleeping {sleep_duration}s between device dumps",
+                    dut_id,
+                )
+                await asyncio.sleep(sleep_duration)
+
+        await self._log_runtime(
+            "INFO",
+            "RedfishService",
+            f"[Parallel] Completed collection for system {system_id}: "
+            f"{sum(1 for r in results if r['success'])}/{len(results)} successful",
+            dut_id,
+        )
+
+        return results
+
     async def collect_device_diagnostic_data(
         self,
         dut_id: str,
@@ -10736,7 +14169,7 @@ class RedfishService(BaseService):
 
             # Log filtered IDs if any were filtered
             if len(system_ids) != len(original_system_ids):
-                log_filtered_ids(
+                await log_filtered_ids(
                     original_system_ids, system_ids, "system", self.logger, dut_id
                 )
 
@@ -10744,12 +14177,130 @@ class RedfishService(BaseService):
                 "INFO", "RedfishService", f"Using system IDs: {system_ids}", dut_id
             )
 
+            # Query ActionInfo for validated systems if enabled
+            # This provides the authoritative list of valid diagnostic types per system
+            # First check baseboard_diagnostic_config, then fallback to kwargs
+            use_action_info_validation = baseboard_diagnostic_config.get(
+                "use_action_info_validation",
+                kwargs.get("use_action_info_validation", False),
+            )
+            action_info_by_system: Dict[str, List[str]] = {}
+
+            if use_action_info_validation and system_ids:
+                await self._log_runtime(
+                    "INFO",
+                    "RedfishService",
+                    f"[ActionInfo] Querying ActionInfo for {len(system_ids)} systems (validation enabled)",
+                    dut_id,
+                )
+                action_info_by_system = await self._query_action_info_for_systems(
+                    dut_id, system_ids, log_service="Dump"
+                )
+                if action_info_by_system:
+                    await self._log_runtime(
+                        "INFO",
+                        "RedfishService",
+                        f"[ActionInfo] Retrieved ActionInfo for {len(action_info_by_system)} systems",
+                        dut_id,
+                    )
+                else:
+                    await self._log_runtime(
+                        "WARNING",
+                        "RedfishService",
+                        "[ActionInfo] No ActionInfo retrieved, using fallback behavior (all failures count)",
+                        dut_id,
+                    )
+
+            # If no eligible systems remain after filtering, optionally treat as complete
+            # Rely on config to opt into empty-target completion behavior
+            complete_on_empty_targets = kwargs.get("complete_on_empty_targets", False)
+            if not system_ids:
+                if complete_on_empty_targets:
+                    # No systems to operate on (e.g., all filtered) — consider this a completed no-op
+                    return await self._create_standardized_collector_result(
+                        successful_operations=1,
+                        total_operations=1,
+                        output_files=[],
+                        error_messages=[],
+                        operation_name="device_diagnostic_data",
+                        additional_context={
+                            "collector_name": collector_name,
+                            "reason": "No eligible systems after filtering; treating as complete",
+                            "systems_before_filter": original_system_ids,
+                            "systems_after_filter": system_ids,
+                            "devices_discovered": discovered_devices,
+                        },
+                    )
+
             all_output_files = []
             all_status_list = []
             error_messages = []
 
-            # Process each device type in the diagnostic config
+            # ActionInfo-aware result tracking
+            # These track whether each operation was expected based on ActionInfo
+            action_info_results = {
+                "expected_successes": 0,  # In ActionInfo and succeeded
+                "expected_failures": 0,  # In ActionInfo and failed (counts against us)
+                "unexpected_failures": 0,  # NOT in ActionInfo and failed (doesn't count)
+                "bonus_successes": 0,  # NOT in ActionInfo but succeeded
+                "action_info_available": bool(action_info_by_system),
+            }
+
+            # Parallel collection configuration (disabled by default)
+            # NOTE: Some BMC implementations do not support parallel collection within a single
+            # system's LogService (returns ResourceInUse error). However, parallel collection
+            # across DIFFERENT systems typically works. This infrastructure supports cross-system
+            # parallelism while maintaining sequential execution within each system.
+            # First check baseboard_diagnostic_config, then fallback to kwargs
+            parallel_collection = baseboard_diagnostic_config.get(
+                "parallel_collection", kwargs.get("parallel_collection", False)
+            )
+            max_concurrent_tasks = baseboard_diagnostic_config.get(
+                "max_concurrent_tasks", kwargs.get("max_concurrent_tasks", 4)
+            )
+
+            if parallel_collection:
+                await self._log_runtime(
+                    "INFO",
+                    "RedfishService",
+                    f"[Parallel] Parallel collection enabled with max_concurrent_tasks={max_concurrent_tasks}. "
+                    f"Note: BMC may enforce sequential collection within a single LogService.",
+                    dut_id,
+                )
+
+            # ================================================================
+            # PHASE 1: Build tasks grouped by system_id
+            # This prepares all collection tasks before execution, enabling
+            # either sequential or parallel collection strategies.
+            # ================================================================
+            config_keys_to_skip = {
+                "use_action_info_validation",
+                "parallel_collection",
+                "max_concurrent_tasks",
+            }
+            tasks_by_system: Dict[str, List[Dict[str, Any]]] = {}
+
+            await self._log_runtime(
+                "INFO",
+                "RedfishService",
+                f"[TaskBuild] Building collection tasks for {len(system_ids)} systems",
+                dut_id,
+            )
+
             for device_type, device_config in baseboard_diagnostic_config.items():
+                # Skip non-device configuration keys
+                if device_type in config_keys_to_skip:
+                    continue
+                # Skip non-dict device configs (shouldn't happen but be safe)
+                if not isinstance(device_config, dict):
+                    await self._log_runtime(
+                        "WARNING",
+                        "RedfishService",
+                        f"Skipping non-dict config key: {device_type}",
+                        dut_id,
+                    )
+                    continue
+
                 await self._log_runtime(
                     "INFO",
                     "RedfishService",
@@ -10757,8 +14308,14 @@ class RedfishService(BaseService):
                     dut_id,
                 )
 
-                # Get discovered device IDs for this type
-                device_ids = discovered_devices.get(device_type, [])
+                # Get discovered device IDs for this type.
+                # device_ids_override bypasses discovery for system-level queries
+                # (e.g. DiagnosticType=SMA with no per-device suffix).
+                device_ids_override = device_config.get("device_ids_override")
+                if device_ids_override is not None:
+                    device_ids = device_ids_override
+                else:
+                    device_ids = discovered_devices.get(device_type, [])
                 if not device_ids:
                     await self._log_runtime(
                         "WARNING",
@@ -10768,28 +14325,27 @@ class RedfishService(BaseService):
                     )
                     continue
 
-                # Extract diagnostic configuration
-                diagnostic_type = device_config.get("diagnostic_type", "")
-                device_id_key = device_config.get("device_id_key", "DeviceID")
-                device_id_prefix = device_config.get("device_id_prefix", "")
-
-                await self._log_runtime(
-                    "INFO",
-                    "RedfishService",
-                    f"Using diagnostic_type: {diagnostic_type}, device_id_key: {device_id_key}, device_id_prefix: {device_id_prefix}",
-                    dut_id,
-                )
-
-                # Collect dumps for each system and device combination
+                # Build tasks for each system and device combination
                 for system_id in system_ids:
-                    for device_id in device_ids:
-                        await self._log_runtime(
-                            "INFO",
-                            "RedfishService",
-                            f"Collecting diagnostic data for system {system_id}, device {device_id}",
-                            dut_id,
-                        )
+                    # Resolve system-specific configuration (supports multi-system platforms)
+                    resolved_config = await self.resolve_system_config(
+                        system_id, device_config, dut_id, device_type
+                    )
 
+                    # Extract diagnostic configuration from resolved config
+                    diagnostic_type = resolved_config.get("diagnostic_type", "")
+                    device_id_key = resolved_config.get("device_id_key", "DeviceID")
+                    device_id_prefix = resolved_config.get("device_id_prefix", "")
+
+                    await self._log_runtime(
+                        "DEBUG",
+                        "RedfishService",
+                        f"[TaskBuild] {system_id}: diagnostic_type={diagnostic_type}, "
+                        f"device_id_key={device_id_key}, device_id_prefix={device_id_prefix}",
+                        dut_id,
+                    )
+
+                    for device_id in device_ids:
                         # Build device identifier
                         if device_id_prefix:
                             device_identifier = f"{device_id_prefix}{device_id}"
@@ -10797,7 +14353,7 @@ class RedfishService(BaseService):
                             device_identifier = str(device_id)
 
                         # Create diagnostic payload using configurable template
-                        payload_template = device_config.get(
+                        payload_template = resolved_config.get(
                             "payload_template",
                             {
                                 "DiagnosticDataType": "OEM",
@@ -10809,7 +14365,6 @@ class RedfishService(BaseService):
                         payload = {}
                         for key, value in payload_template.items():
                             if isinstance(value, str):
-                                # Substitute placeholders
                                 substituted_value = value.format(
                                     diagnostic_type=diagnostic_type,
                                     device_id_key=device_id_key,
@@ -10822,131 +14377,399 @@ class RedfishService(BaseService):
                             else:
                                 payload[key] = value
 
-                        await self._log_runtime(
-                            "INFO",
-                            "RedfishService",
-                            f"Using payload: {payload}",
-                            dut_id,
+                        # Check if this diagnostic type is in ActionInfo (if available)
+                        oem_diag_type = payload.get("OEMDiagnosticDataType", "")
+                        system_action_info = action_info_by_system.get(system_id, [])
+                        is_in_action_info = self._check_diagnostic_type_in_action_info(
+                            oem_diag_type, system_action_info
                         )
 
-                        # Create a filtered systems context for this specific system
-                        filtered_systems_for_device = [{"id": system_id}]
-
-                        # Create substitutions for output pattern that includes device information
-                        device_substitutions = {
-                            "system_id": system_id,
-                            "device_id": device_id,
-                            "device_type": device_type,
-                            "diagnostic_type": diagnostic_type,
-                            "device_identifier": device_identifier,
-                        }
-
-                        # Create a clean kwargs dict without conflicting parameters
-                        clean_kwargs = {
-                            k: v for k, v in kwargs.items() if k not in ["function_tag"]
-                        }
-                        clean_kwargs["substitutions"] = device_substitutions
-                        clean_kwargs["filtered_systems"] = filtered_systems_for_device
-
-                        # Use existing collect_diagnostic_data method with custom payload
-                        result = await self.collect_diagnostic_data(
-                            dut_id=dut_id,
-                            entity_type="Systems",
-                            log_service="Dump",
-                            payload_types=[diagnostic_type],  # Required parameter
-                            default_payload=payload,  # Required parameter
-                            function_tag=f"{collector_name}_{device_type}",  # Required parameter
-                            fallback_payloads=[payload],
-                            **clean_kwargs,
-                        )
-
-                        # Process result using common function
-                        await self._process_collector_result(
-                            result=result,
-                            all_output_files=all_output_files,
-                            all_status_list=all_status_list,
-                            error_messages=error_messages,
-                            entity_type=device_type,
-                            entity_id=device_id,
-                            dut_id=dut_id,
-                            collector_id=collector_id,
-                        )
-
-                        await self._log_runtime(
-                            "INFO",
-                            "RedfishService",
-                            f"Device {device_type}_{device_id} collection result: {result.get('success', False)}",
-                            dut_id,
-                        )
-
-                        # Add configurable sleep duration between device dumps
-                        # Get sleep duration from collector definition and DUT config
-                        collector_def = kwargs.get("collector_def", {})
-                        dut_config = self.dut_manager.get_dut_config(dut_id)
-                        sleep_duration = get_collector_sleep_duration(
-                            kwargs.get("collector_id", ""), collector_def, dut_config, 5
-                        )
-
-                        # Sleep between devices (but not after the last device)
-                        if device_id != device_ids[-1] or system_id != system_ids[-1]:
+                        if use_action_info_validation:
                             await self._log_runtime(
                                 "DEBUG",
                                 "RedfishService",
-                                f"Sleeping {sleep_duration}s between device dumps",
+                                f"[TaskBuild] {oem_diag_type} in ActionInfo for {system_id}: {is_in_action_info}",
                                 dut_id,
                             )
-                            await asyncio.sleep(sleep_duration)
+
+                        # Build task dict
+                        task = {
+                            "device_type": device_type,
+                            "device_id": device_id,
+                            "device_config": resolved_config,
+                            "payload": payload,
+                            "oem_diag_type": oem_diag_type,
+                            "is_in_action_info": is_in_action_info,
+                            "device_identifier": device_identifier,
+                            "diagnostic_type": diagnostic_type,
+                        }
+
+                        # Add to system's task list
+                        if system_id not in tasks_by_system:
+                            tasks_by_system[system_id] = []
+                        tasks_by_system[system_id].append(task)
+
+            # Log task summary
+            total_tasks = sum(len(tasks) for tasks in tasks_by_system.values())
+            await self._log_runtime(
+                "INFO",
+                "RedfishService",
+                f"[TaskBuild] Built {total_tasks} tasks across {len(tasks_by_system)} systems: "
+                + ", ".join(
+                    f"{sid}={len(tasks)}" for sid, tasks in tasks_by_system.items()
+                ),
+                dut_id,
+            )
+
+            # ================================================================
+            # PHASE 2: Execute tasks (parallel or sequential)
+            # Parallel: Different systems run concurrently via asyncio.gather
+            # Sequential: Systems processed one at a time (original behavior)
+            # Within each system, tasks always run sequentially (BMC limitation)
+            # ================================================================
+            all_task_results: List[Dict[str, Any]] = []
+
+            if parallel_collection and len(tasks_by_system) > 1:
+                # Parallel execution across systems
+                await self._log_runtime(
+                    "INFO",
+                    "RedfishService",
+                    f"[Parallel] Executing {len(tasks_by_system)} systems in parallel "
+                    f"(max_concurrent={max_concurrent_tasks})",
+                    dut_id,
+                )
+
+                semaphore = asyncio.Semaphore(max_concurrent_tasks)
+
+                async def limited_collect_for_system(
+                    sid: str, tasks: List[Dict]
+                ) -> List[Dict]:
+                    """Wrapper to limit concurrent system collections."""
+                    async with semaphore:
+                        return await self._collect_for_system(
+                            dut_id=dut_id,
+                            system_id=sid,
+                            device_tasks=tasks,
+                            action_info_values=action_info_by_system.get(sid, []),
+                            use_action_info_validation=use_action_info_validation,
+                            collector_name=collector_name,
+                            collector_id=collector_id,
+                            kwargs=kwargs,
+                        )
+
+                # Run all systems in parallel
+                parallel_results = await asyncio.gather(
+                    *[
+                        limited_collect_for_system(sid, tasks)
+                        for sid, tasks in tasks_by_system.items()
+                    ],
+                    return_exceptions=True,
+                )
+
+                # Flatten results and handle exceptions
+                for sid, result in zip(tasks_by_system.keys(), parallel_results):
+                    if isinstance(result, Exception):
+                        await self._log_runtime(
+                            "ERROR",
+                            "RedfishService",
+                            f"[Parallel] Exception collecting system {sid}: {str(result)}",
+                            dut_id,
+                        )
+                        # Create failure results for all tasks in this system
+                        for task in tasks_by_system[sid]:
+                            all_task_results.append(
+                                {
+                                    "success": False,
+                                    "output_files": [],
+                                    "status": False,
+                                    "error_messages": [
+                                        f"System collection exception: {str(result)}"
+                                    ],
+                                    "device_type": task["device_type"],
+                                    "device_id": task["device_id"],
+                                    "system_id": sid,
+                                    "is_in_action_info": task["is_in_action_info"],
+                                    "oem_diag_type": task["oem_diag_type"],
+                                }
+                            )
+                    else:
+                        all_task_results.extend(result)
+
+                await self._log_runtime(
+                    "INFO",
+                    "RedfishService",
+                    f"[Parallel] Parallel execution complete: {len(all_task_results)} results",
+                    dut_id,
+                )
+
+            else:
+                # Sequential execution (original behavior or single system)
+                mode = "sequential" if not parallel_collection else "single-system"
+                await self._log_runtime(
+                    "INFO",
+                    "RedfishService",
+                    f"[Sequential] Executing {len(tasks_by_system)} systems in {mode} mode",
+                    dut_id,
+                )
+
+                for system_id, system_tasks in tasks_by_system.items():
+                    system_results = await self._collect_for_system(
+                        dut_id=dut_id,
+                        system_id=system_id,
+                        device_tasks=system_tasks,
+                        action_info_values=action_info_by_system.get(system_id, []),
+                        use_action_info_validation=use_action_info_validation,
+                        collector_name=collector_name,
+                        collector_id=collector_id,
+                        kwargs=kwargs,
+                    )
+                    all_task_results.extend(system_results)
+
+            # ================================================================
+            # PHASE 3: Process all results
+            # Aggregate output files, status, errors, and ActionInfo metrics
+            # ================================================================
+            await self._log_runtime(
+                "INFO",
+                "RedfishService",
+                f"[Results] Processing {len(all_task_results)} task results",
+                dut_id,
+            )
+
+            # Mapping: system_id -> {oem_diag_type -> [output filenames]}
+            # Written as a JSON file at the end for easy query-to-file lookups.
+            dump_query_map: Dict[str, Dict[str, List[str]]] = {}
+
+            for task_result in all_task_results:
+                # Extract ActionInfo-aware metadata first for conditional processing
+                collection_success = task_result.get("success", False)
+                is_in_action_info = task_result.get("is_in_action_info", True)
+                oem_diag_type = task_result.get("oem_diag_type", "")
+                system_id = task_result.get("system_id", "unknown")
+
+                # Determine if this is an expected failure (not in ActionInfo)
+                # Expected failures should not generate error logs
+                is_expected_failure = (
+                    use_action_info_validation
+                    and not collection_success
+                    and not is_in_action_info
+                )
+
+                if is_expected_failure:
+                    # For expected failures (not in ActionInfo), don't generate error logs
+                    # but still track the attempt for metrics
+                    await self._log_runtime(
+                        "INFO",
+                        "RedfishService",
+                        f"[ActionInfo] Expected failure for {task_result['device_type']}_{task_result['device_id']} "
+                        f"on {system_id} - '{oem_diag_type}' not in ActionInfo (no error log generated)",
+                        dut_id,
+                    )
+                    # Don't add to all_status_list (doesn't count toward success/failure rate)
+                    # Don't generate error log file
+                else:
+                    # Process result using common function (may generate error logs)
+                    raw_result = task_result.get("raw_result", task_result)
+                    await self._process_collector_result(
+                        result=raw_result,
+                        all_output_files=all_output_files,
+                        all_status_list=all_status_list,
+                        error_messages=error_messages,
+                        entity_type=task_result["device_type"],
+                        entity_id=task_result["device_id"],
+                        dut_id=dut_id,
+                        collector_id=collector_id,
+                    )
+
+                # Track ActionInfo-aware results for metrics
+                if use_action_info_validation:
+                    if collection_success:
+                        if is_in_action_info:
+                            action_info_results["expected_successes"] += 1
+                        else:
+                            action_info_results["bonus_successes"] += 1
+                    else:
+                        if is_in_action_info:
+                            action_info_results["expected_failures"] += 1
+                        else:
+                            action_info_results["unexpected_failures"] += 1
+
+                # Populate dump query map for successful collections
+                if collection_success and oem_diag_type:
+                    raw_result = task_result.get("raw_result", task_result)
+                    task_files = list(
+                        set(
+                            raw_result.get("output_files", [])
+                            + raw_result.get("context", {}).get("output_files", [])
+                        )
+                    )
+                    if task_files:
+                        dump_query_map.setdefault(system_id, {})[oem_diag_type] = [
+                            os.path.basename(f) for f in task_files if f
+                        ]
+
+                await self._log_runtime(
+                    "DEBUG",
+                    "RedfishService",
+                    f"[Results] {task_result['device_type']}_{task_result['device_id']} "
+                    f"on {system_id}: success={collection_success}",
+                    dut_id,
+                )
+
+            # Write dump query map JSON if any successful collections were made
+            if dump_query_map:
+                map_data = {
+                    "collector_id": collector_id,
+                    "collector_name": collector_name
+                    or kwargs.get("collector_name", ""),
+                    "generated_at": datetime.now().isoformat(),
+                    "mappings": dump_query_map,
+                }
+                map_filename = f"{collector_id}_dump_query_map.json"
+                map_file_path = await self._save_data_to_file_with_pattern(
+                    dut_id,
+                    map_data,
+                    map_filename,
+                    collector_id=collector_id,
+                )
+                if map_file_path:
+                    all_output_files.append(map_file_path)
 
             # Calculate overall success
             successful_operations = sum(all_status_list) if all_status_list else 0
             total_operations = len(all_status_list) if all_status_list else 0
 
+            # ActionInfo-aware success calculation
+            # When enabled, failures on items NOT in ActionInfo don't count against us
+            action_info_adjusted_success = successful_operations
+            action_info_adjusted_total = total_operations
+
+            if (
+                use_action_info_validation
+                and action_info_results["action_info_available"]
+            ):
+                # Calculate expected total (items that were in ActionInfo)
+                expected_total = (
+                    action_info_results["expected_successes"]
+                    + action_info_results["expected_failures"]
+                )
+
+                if expected_total > 0:
+                    action_info_adjusted_success = action_info_results[
+                        "expected_successes"
+                    ]
+                    action_info_adjusted_total = expected_total
+
+                    await self._log_runtime(
+                        "INFO",
+                        "RedfishService",
+                        f"[ActionInfo] Adjusted success rate: {action_info_adjusted_success}/{action_info_adjusted_total} "
+                        f"(original: {successful_operations}/{total_operations}, "
+                        f"unexpected_failures_excluded: {action_info_results['unexpected_failures']}, "
+                        f"bonus_successes: {action_info_results['bonus_successes']})",
+                        dut_id,
+                    )
+
             # Check if no devices were discovered - treat as skipped
             total_devices = sum(len(devices) for devices in discovered_devices.values())
             if total_devices == 0:
+                no_device_reason = f"No {list(discovered_devices.keys())} devices discovered for {collector_name}"
+                if complete_on_empty_targets:
+                    await self._log_runtime(
+                        "INFO",
+                        "RedfishService",
+                        f"=== Device diagnostic collection complete. {no_device_reason} - treating as complete ===",
+                        dut_id,
+                    )
+                    return await self._create_standardized_collector_result(
+                        successful_operations=1,
+                        total_operations=1,
+                        output_files=[],
+                        error_messages=[],
+                        operation_name="device_diagnostic_data",
+                        additional_context={
+                            "collector_name": collector_name,
+                            "target_baseboard": target_baseboard,
+                            "devices_processed": 0,
+                            "successful_collections": 1,
+                            "total_collections": 1,
+                            "reason": f"{no_device_reason} - nothing to collect (expected)",
+                        },
+                    )
+                else:
+                    await self._log_runtime(
+                        "INFO",
+                        "RedfishService",
+                        f"=== Device diagnostic collection complete. {no_device_reason} - treating as skipped ===",
+                        dut_id,
+                    )
+                    return await self._create_standardized_collector_result(
+                        successful_operations=0,
+                        total_operations=0,
+                        output_files=[],
+                        error_messages=[],
+                        operation_name="device_diagnostic_data",
+                        additional_context={
+                            "collector_name": collector_name,
+                            "target_baseboard": target_baseboard,
+                            "devices_processed": 0,
+                            "successful_collections": 0,
+                            "total_collections": 0,
+                            "status": "skipped",
+                            "reason": f"{no_device_reason} - collector skipped",
+                        },
+                    )
+
+            # Log completion with ActionInfo-aware metrics if enabled
+            if (
+                use_action_info_validation
+                and action_info_results["action_info_available"]
+            ):
                 await self._log_runtime(
                     "INFO",
                     "RedfishService",
-                    f"=== Device diagnostic collection complete. No devices discovered - treating as skipped ===",
+                    f"=== Device diagnostic collection complete. ActionInfo-adjusted: {action_info_adjusted_success}/{action_info_adjusted_total}, "
+                    f"Raw: {successful_operations}/{total_operations}, Files: {len(all_output_files)} ===",
                     dut_id,
                 )
-                return await self._create_standardized_collector_result(
-                    successful_operations=0,
-                    total_operations=0,
-                    output_files=[],
-                    error_messages=[],
-                    operation_name="device_diagnostic_data",
-                    additional_context={
-                        "collector_name": collector_name,
-                        "target_baseboard": target_baseboard,
-                        "devices_processed": 0,
-                        "successful_collections": 0,
-                        "total_collections": 0,
-                        "status": "skipped",
-                        "reason": f"No {list(discovered_devices.keys())} devices discovered for {collector_name} - collector skipped",
-                    },
+            else:
+                await self._log_runtime(
+                    "INFO",
+                    "RedfishService",
+                    f"=== Device diagnostic collection complete. Success: {successful_operations}/{total_operations}, Files: {len(all_output_files)} ===",
+                    dut_id,
                 )
 
-            await self._log_runtime(
-                "INFO",
-                "RedfishService",
-                f"=== Device diagnostic collection complete. Success: {successful_operations}/{total_operations}, Files: {len(all_output_files)} ===",
-                dut_id,
-            )
+            # Build additional context with ActionInfo results if available
+            additional_context = {
+                "collector_name": collector_name,
+                "target_baseboard": target_baseboard,
+                "devices_processed": total_devices,
+                "successful_collections": successful_operations,
+                "total_collections": total_operations,
+            }
+
+            if use_action_info_validation:
+                additional_context["action_info_validation"] = {
+                    "enabled": True,
+                    "action_info_available": action_info_results[
+                        "action_info_available"
+                    ],
+                    "expected_successes": action_info_results["expected_successes"],
+                    "expected_failures": action_info_results["expected_failures"],
+                    "unexpected_failures": action_info_results["unexpected_failures"],
+                    "bonus_successes": action_info_results["bonus_successes"],
+                    "adjusted_success": action_info_adjusted_success,
+                    "adjusted_total": action_info_adjusted_total,
+                }
 
             return await self._create_standardized_collector_result(
-                successful_operations=successful_operations,
-                total_operations=total_operations,
+                successful_operations=action_info_adjusted_success,
+                total_operations=action_info_adjusted_total,
                 output_files=all_output_files,
                 error_messages=error_messages,
                 operation_name="device_diagnostic_data",
-                additional_context={
-                    "collector_name": collector_name,
-                    "target_baseboard": target_baseboard,
-                    "devices_processed": total_devices,
-                    "successful_collections": successful_operations,
-                    "total_collections": total_operations,
-                },
+                additional_context=additional_context,
             )
 
         except Exception as e:
@@ -11001,9 +14824,34 @@ class RedfishService(BaseService):
             await self._log_collection_start(dut_id, "multi-step", function_tag)
 
             # Extract configuration
-            entity_type = collection_config.get("entity_type", "Chassis")
-            base_uri_pattern = collection_config.get("base_uri_pattern", "")
-            steps = collection_config.get("steps", [])
+            dut_config = (
+                self.dut_manager.get_dut_config(dut_id) if self.dut_manager else {}
+            )
+            target_baseboard = dut_config.get(
+                "TargetBaseboard", dut_config.get("baseboard", "")
+            )
+            effective_collection_config = collection_config
+            baseboard_specific_config = effective_collection_config.get(
+                "baseboard_specific_config", {}
+            )
+            if (
+                baseboard_specific_config
+                and target_baseboard in baseboard_specific_config
+            ):
+                effective_collection_config = self._deep_merge_config(
+                    effective_collection_config,
+                    baseboard_specific_config[target_baseboard],
+                )
+                await self._log_runtime(
+                    "INFO",
+                    "RedfishService",
+                    f"Using baseboard-specific multi-step config for {target_baseboard}",
+                    dut_id,
+                )
+
+            entity_type = effective_collection_config.get("entity_type", "Chassis")
+            base_uri_pattern = effective_collection_config.get("base_uri_pattern", "")
+            steps = effective_collection_config.get("steps", [])
 
             # Apply prefix override if URI config manager is available
             if (
@@ -11020,25 +14868,62 @@ class RedfishService(BaseService):
                 "collector_id", ""
             )  # Extract collector_id from kwargs
 
+            # Prefer filtered entities from validation when available to avoid
+            # probing unrelated Redfish resources during multi-step collection.
+            filtered_systems = kwargs.get("filtered_systems", [])
+            filtered_managers = kwargs.get("filtered_managers", [])
+            filtered_chassis = kwargs.get("filtered_chassis", [])
+
+            entity_ids = []
+            success = True
+            entities_response = {}
+
             # Get entities to process
             if entity_type == "Chassis":
-                chassis_uri = self.get_configured_uri(dut_id, "Chassis")
-                success, entities_response, _ = await self.dispatch_request(
-                    dut_id, "GET", chassis_uri, bypass_cache=True
-                )
                 entity_key = "chassis_id"
+                if filtered_chassis:
+                    entity_ids = [chassis["id"] for chassis in filtered_chassis]
+                    await self._log_runtime(
+                        "INFO",
+                        "RedfishService",
+                        f"Using {len(entity_ids)} filtered chassis from validation: {entity_ids}",
+                        dut_id,
+                    )
+                else:
+                    chassis_uri = self.get_configured_uri(dut_id, "Chassis")
+                    success, entities_response, _ = await self.dispatch_request(
+                        dut_id, "GET", chassis_uri, bypass_cache=True
+                    )
             elif entity_type == "Systems":
-                systems_uri = self.get_configured_uri(dut_id, "Systems")
-                success, entities_response, _ = await self.dispatch_request(
-                    dut_id, "GET", systems_uri, bypass_cache=True
-                )
                 entity_key = "system_id"
+                if filtered_systems:
+                    entity_ids = [system["id"] for system in filtered_systems]
+                    await self._log_runtime(
+                        "INFO",
+                        "RedfishService",
+                        f"Using {len(entity_ids)} filtered systems from validation: {entity_ids}",
+                        dut_id,
+                    )
+                else:
+                    systems_uri = self.get_configured_uri(dut_id, "Systems")
+                    success, entities_response, _ = await self.dispatch_request(
+                        dut_id, "GET", systems_uri, bypass_cache=True
+                    )
             elif entity_type == "Managers":
-                managers_uri = self.get_configured_uri(dut_id, "Managers")
-                success, entities_response, _ = await self.dispatch_request(
-                    dut_id, "GET", managers_uri, bypass_cache=True
-                )
                 entity_key = "manager_id"
+                if filtered_managers:
+                    entity_ids = [manager["id"] for manager in filtered_managers]
+                    await self._log_runtime(
+                        "INFO",
+                        "RedfishService",
+                        f"Using {len(entity_ids)} filtered managers from validation: {entity_ids}",
+                        dut_id,
+                    )
+                else:
+                    managers_uri = self.get_configured_uri(dut_id, "Managers")
+                    success, entities_response, _ = await self.dispatch_request(
+                        dut_id, "GET", managers_uri, bypass_cache=True
+                    )
             else:
                 return await self._create_standardized_collector_result(
                     successful_operations=0,
@@ -11061,13 +14946,13 @@ class RedfishService(BaseService):
                     additional_context={"entity_type": entity_type},
                 )
 
-            # Extract entity IDs
-            entities = entities_response.get("Members", [])
-            entity_ids = []
-            for entity in entities:
-                entity_id = entity.get("@odata.id", "").split("/")[-1]
-                if entity_id:
-                    entity_ids.append(entity_id)
+            # Extract entity IDs when validation did not already provide them.
+            if not entity_ids:
+                entities = entities_response.get("Members", [])
+                for entity in entities:
+                    entity_id = entity.get("@odata.id", "").split("/")[-1]
+                    if entity_id:
+                        entity_ids.append(entity_id)
 
             if not entity_ids:
                 return await self._create_standardized_collector_result(
@@ -11187,6 +15072,7 @@ class RedfishService(BaseService):
                     step_responses[step_name] = response_data
 
                     # Save step response
+                    final_output_pattern = None
                     if output_pattern:
                         try:
                             # Substitute variables in output pattern using VariableSubstitutionService
@@ -11260,11 +15146,16 @@ class RedfishService(BaseService):
                     if member_processing and response_data.get("Members"):
                         members = response_data.get("Members", [])
                         member_uris = []
+                        member_filters = member_processing.get("filters", {})
+                        filter_collection_members = member_processing.get(
+                            "filter_collection_members", False
+                        )
+                        kept_member_uris = []
 
                         # Extract member URIs
                         for member in members:
                             member_uri = member.get("@odata.id")
-                            if member_uri:
+                            if member_uri and validate_redfish_uri(member_uri):
                                 member_uris.append(member_uri)
 
                         # If no members found, try fallback member patterns
@@ -11337,6 +15228,11 @@ class RedfishService(BaseService):
 
                         # Process each member
                         for member_uri in member_uris:
+                            if not self._member_matches_filters(
+                                member_uri, None, member_filters
+                            ):
+                                continue
+
                             member_id = member_uri.split("/")[-1]
                             step_responses[f"{step_name}_member_id"] = member_id
 
@@ -11344,6 +15240,16 @@ class RedfishService(BaseService):
                                 dut_id, "GET", member_uri
                             )
                             if success:
+                                if not self._member_matches_filters(
+                                    member_uri, member_data, member_filters
+                                ):
+                                    continue
+
+                                kept_member_uris.append(member_uri)
+                                filtered_member_data = self._apply_list_filters_to_data(
+                                    member_data,
+                                    member_processing.get("saved_data_filters", []),
+                                )
                                 # Save member data
                                 member_output_pattern = member_processing.get(
                                     "member_output_pattern", ""
@@ -11360,7 +15266,7 @@ class RedfishService(BaseService):
                                     file_path = (
                                         await self._save_data_with_common_pattern(
                                             dut_id,
-                                            member_data,
+                                            filtered_member_data,
                                             function_tag,
                                             output_pattern=final_member_pattern,
                                             substitutions=step_responses,
@@ -11369,6 +15275,85 @@ class RedfishService(BaseService):
                                     )
                                     if file_path:
                                         output_files.append(file_path)
+
+                                linked_member_resources = member_processing.get(
+                                    "linked_member_resources", []
+                                )
+
+                                for linked_resource in linked_member_resources:
+                                    link_name = linked_resource.get("name", "linked")
+                                    link_path = linked_resource.get("link_path")
+                                    linked_output_pattern = linked_resource.get(
+                                        "member_output_pattern", ""
+                                    )
+                                    linked_filters = linked_resource.get("filters", {})
+                                    member_id_variable = linked_resource.get(
+                                        "member_id_variable",
+                                        f"{link_name}_member_id",
+                                    )
+                                    member_uri_variable = linked_resource.get(
+                                        "member_uri_variable",
+                                        f"{link_name}_member_uri",
+                                    )
+                                    member_uri_path = linked_resource.get(
+                                        "member_uri_path", "@odata.id"
+                                    )
+
+                                    linked_member_uris = (
+                                        self._extract_member_uris_from_data(
+                                            member_data, link_path, member_uri_path
+                                        )
+                                    )
+
+                                    for linked_member_uri in linked_member_uris:
+                                        if not self._member_matches_filters(
+                                            linked_member_uri, None, linked_filters
+                                        ):
+                                            continue
+
+                                        linked_member_id = linked_member_uri.rstrip(
+                                            "/"
+                                        ).split("/")[-1]
+                                        linked_substitutions = dict(step_responses)
+                                        linked_substitutions[member_id_variable] = (
+                                            linked_member_id
+                                        )
+                                        linked_substitutions[member_uri_variable] = (
+                                            linked_member_uri
+                                        )
+
+                                        success, linked_member_data, _ = (
+                                            await self.dispatch_request(
+                                                dut_id, "GET", linked_member_uri
+                                            )
+                                        )
+                                        if (
+                                            success
+                                            and self._member_matches_filters(
+                                                linked_member_uri,
+                                                linked_member_data,
+                                                linked_filters,
+                                            )
+                                            and linked_output_pattern
+                                        ):
+                                            final_linked_pattern = (
+                                                await self.substitute_variables(
+                                                    linked_output_pattern,
+                                                    linked_substitutions,
+                                                    dut_id,
+                                                )
+                                            )
+
+                                            file_path = await self._save_data_with_common_pattern(
+                                                dut_id,
+                                                linked_member_data,
+                                                function_tag,
+                                                output_pattern=final_linked_pattern,
+                                                substitutions=linked_substitutions,
+                                                collector_id=collector_id,
+                                            )
+                                            if file_path:
+                                                output_files.append(file_path)
 
                                 # Process member-related resources if configured
                                 member_resources = member_processing.get(
@@ -11430,6 +15415,200 @@ class RedfishService(BaseService):
                                             )
                                             if file_path:
                                                 output_files.append(file_path)
+
+                                            resource_member_processing = resource.get(
+                                                "member_processing", {}
+                                            )
+                                            if resource_member_processing:
+                                                resource_filters = (
+                                                    resource_member_processing.get(
+                                                        "filters", {}
+                                                    )
+                                                )
+                                                filter_collection_members = (
+                                                    resource_member_processing.get(
+                                                        "filter_collection_members",
+                                                        False,
+                                                    )
+                                                )
+                                                resource_member_output_pattern = (
+                                                    resource_member_processing.get(
+                                                        "member_output_pattern", ""
+                                                    )
+                                                )
+                                                resource_member_id_variable = (
+                                                    resource_member_processing.get(
+                                                        "member_id_variable",
+                                                        f"{resource_name}_member_id",
+                                                    )
+                                                )
+                                                resource_member_uri_variable = (
+                                                    resource_member_processing.get(
+                                                        "member_uri_variable",
+                                                        f"{resource_name}_member_uri",
+                                                    )
+                                                )
+                                                resource_member_uri_path = (
+                                                    resource_member_processing.get(
+                                                        "member_uri_path",
+                                                        "@odata.id",
+                                                    )
+                                                )
+                                                resource_link_path = (
+                                                    resource_member_processing.get(
+                                                        "link_path", "Members"
+                                                    )
+                                                )
+
+                                                resource_member_uris = (
+                                                    self._extract_member_uris_from_data(
+                                                        resource_data,
+                                                        resource_link_path,
+                                                        resource_member_uri_path,
+                                                    )
+                                                )
+                                                kept_resource_member_uris = []
+
+                                                for (
+                                                    resource_member_uri
+                                                ) in resource_member_uris:
+                                                    if not self._member_matches_filters(
+                                                        resource_member_uri,
+                                                        None,
+                                                        resource_filters,
+                                                    ):
+                                                        continue
+
+                                                    resource_member_id = (
+                                                        resource_member_uri.rstrip(
+                                                            "/"
+                                                        ).split("/")[-1]
+                                                    )
+                                                    resource_substitutions = dict(
+                                                        step_responses
+                                                    )
+                                                    resource_substitutions[
+                                                        resource_member_id_variable
+                                                    ] = resource_member_id
+                                                    resource_substitutions[
+                                                        resource_member_uri_variable
+                                                    ] = resource_member_uri
+
+                                                    success, resource_member_data, _ = (
+                                                        await self.dispatch_request(
+                                                            dut_id,
+                                                            "GET",
+                                                            resource_member_uri,
+                                                        )
+                                                    )
+                                                    if (
+                                                        success
+                                                        and self._member_matches_filters(
+                                                            resource_member_uri,
+                                                            resource_member_data,
+                                                            resource_filters,
+                                                        )
+                                                        and resource_member_output_pattern
+                                                    ):
+                                                        kept_resource_member_uris.append(
+                                                            resource_member_uri
+                                                        )
+                                                        final_resource_member_pattern = await self.substitute_variables(
+                                                            resource_member_output_pattern,
+                                                            resource_substitutions,
+                                                            dut_id,
+                                                        )
+
+                                                        file_path = await self._save_data_with_common_pattern(
+                                                            dut_id,
+                                                            resource_member_data,
+                                                            function_tag,
+                                                            output_pattern=final_resource_member_pattern,
+                                                            substitutions=resource_substitutions,
+                                                            collector_id=collector_id,
+                                                        )
+                                                        if file_path:
+                                                            output_files.append(
+                                                                file_path
+                                                            )
+
+                                                if (
+                                                    filter_collection_members
+                                                    and isinstance(resource_data, dict)
+                                                    and "Members" in resource_data
+                                                ):
+                                                    filtered_members = [
+                                                        member
+                                                        for member in resource_data.get(
+                                                            "Members", []
+                                                        )
+                                                        if member.get("@odata.id")
+                                                        in kept_resource_member_uris
+                                                    ]
+                                                    filtered_resource_data = dict(
+                                                        resource_data
+                                                    )
+                                                    filtered_resource_data[
+                                                        "Members"
+                                                    ] = filtered_members
+                                                    if (
+                                                        "Members@odata.count"
+                                                        in filtered_resource_data
+                                                    ):
+                                                        filtered_resource_data[
+                                                            "Members@odata.count"
+                                                        ] = len(filtered_members)
+
+                                                    filtered_file_path = await self._save_data_with_common_pattern(
+                                                        dut_id,
+                                                        filtered_resource_data,
+                                                        function_tag,
+                                                        output_pattern=final_resource_pattern,
+                                                        substitutions=step_responses,
+                                                        collector_id=collector_id,
+                                                    )
+                                                    if (
+                                                        filtered_file_path
+                                                        and filtered_file_path
+                                                        not in output_files
+                                                    ):
+                                                        output_files.append(
+                                                            filtered_file_path
+                                                        )
+
+                        if (
+                            filter_collection_members
+                            and isinstance(response_data, dict)
+                            and "Members" in response_data
+                            and final_output_pattern
+                        ):
+                            filtered_members = [
+                                member
+                                for member in response_data.get("Members", [])
+                                if member.get("@odata.id") in kept_member_uris
+                            ]
+                            filtered_response_data = dict(response_data)
+                            filtered_response_data["Members"] = filtered_members
+                            if "Members@odata.count" in filtered_response_data:
+                                filtered_response_data["Members@odata.count"] = len(
+                                    filtered_members
+                                )
+
+                            filtered_file_path = (
+                                await self._save_data_with_common_pattern(
+                                    dut_id,
+                                    filtered_response_data,
+                                    function_tag,
+                                    output_pattern=final_output_pattern,
+                                    substitutions=step_responses,
+                                    collector_id=collector_id,
+                                )
+                            )
+                            if (
+                                filtered_file_path
+                                and filtered_file_path not in output_files
+                            ):
+                                output_files.append(filtered_file_path)
 
                 if entity_success:
                     successful_operations += 1
@@ -11753,6 +15932,1621 @@ class RedfishService(BaseService):
                 },
             )
 
+    async def _substitute_uri_variables(
+        self, dut_id: str, uri_pattern: str, context: Dict[str, Any]
+    ) -> str:
+        """
+        Substitute variables in URI pattern using context values.
+
+        Supports patterns like {system_id}, {chassis_id}, {device_id}, etc.
+
+        Args:
+            dut_id: DUT identifier
+            uri_pattern: URI pattern with placeholders
+            context: Context containing variable values
+
+        Returns:
+            Substituted URI string
+        """
+        uri = uri_pattern
+
+        # Simple string substitution for common variables
+        # Look for {variable_name} patterns and replace with values from context
+        import re
+
+        # Find all {variable} patterns
+        variables = re.findall(r"\{(\w+)\}", uri)
+
+        for var in variables:
+            # Check if variable exists in context
+            if var in context:
+                value = context[var]
+                uri = uri.replace(f"{{{var}}}", str(value))
+            else:
+                await self._log_runtime(
+                    "WARN",
+                    "RedfishService",
+                    f"[_substitute_uri_variables] Variable '{var}' not found in context for URI: {uri_pattern}",
+                    dut_id,
+                )
+
+        return uri
+
+    async def _substitute_payload_variables(
+        self, dut_id: str, payload: Any, context: Dict[str, Any]
+    ) -> Any:
+        """
+        Recursively substitute variables in payload using context values.
+
+        Supports patterns like {system_id} in string values within the payload.
+
+        Args:
+            dut_id: DUT identifier
+            payload: Payload to substitute (dict, list, str, or other)
+            context: Context containing variable values
+
+        Returns:
+            Payload with substituted values
+        """
+        import re
+
+        if isinstance(payload, dict):
+            result = {}
+            for key, value in payload.items():
+                result[key] = await self._substitute_payload_variables(
+                    dut_id, value, context
+                )
+            return result
+        elif isinstance(payload, list):
+            return [
+                await self._substitute_payload_variables(dut_id, item, context)
+                for item in payload
+            ]
+        elif isinstance(payload, str):
+            # Find all {variable} patterns
+            variables = re.findall(r"\{(\w+)\}", payload)
+            result = payload
+            for var in variables:
+                if var in context:
+                    value = context[var]
+                    result = result.replace(f"{{{var}}}", str(value))
+                else:
+                    await self._log_runtime(
+                        "WARN",
+                        "RedfishService",
+                        f"[_substitute_payload_variables] Variable '{var}' not found in context for payload substitution",
+                        dut_id,
+                    )
+            return result
+        else:
+            # For non-string types (int, bool, etc.), return as-is
+            return payload
+
+    async def execute_redfish_action(
+        self, dut_id: str, function_tag: str = "", **kwargs
+    ) -> Dict[str, Any]:
+        """
+        Generic Redfish action executor - execute any HTTP method (GET, POST, PUT, DELETE, PATCH).
+
+        This is a generic building block that can be used by any collector to execute
+        Redfish actions and optionally store results in context for subsequent hooks.
+
+        Args:
+            dut_id: DUT identifier
+            function_tag: Function tag for logging
+            **kwargs: Configuration parameters:
+                - action: HTTP method (GET, POST, PUT, DELETE, PATCH) [default: "GET"]
+                - uri_pattern: URI pattern with substitutions like {system_id}
+                - payload: Request body for POST/PUT [default: {}]
+                - store_task_id: Extract and store task ID from response [default: False]
+                - context_key: Key to store task_id under in context [default: "task_id"]
+                - store_response: Store full response in context [default: False]
+                - response_key: Key to store response under [default: "response"]
+                - wait_after_action: Wait N seconds after action [default: None]
+                - timeout: Request timeout in seconds [default: 300]
+
+        Returns:
+            Dict with success status and context:
+                {
+                    "success": bool,
+                    "context": {
+                        "task_id": "...",  # if store_task_id=True
+                        "response": {...}  # if store_response=True
+                    },
+                    "reason": str  # if failed
+                }
+
+        Examples:
+            # Simple POST action
+            - method: execute_redfish_action
+              params:
+                action: POST
+                uri_pattern: "/redfish/v1/Systems/{system_id}/Actions/ComputerSystem.Reset"
+                payload:
+                  ResetType: PowerCycle
+
+            # POST with task_id storage for next hook
+            - method: execute_redfish_action
+              params:
+                action: POST
+                uri_pattern: "/redfish/v1/Systems/{system_id}/Actions/ComputerSystem.StartIST"
+                payload:
+                  TargetSOC: ["/redfish/v1/Systems/{system_id}/CPU_0", 1]
+                store_task_id: true
+                context_key: ist_task_id
+        """
+        try:
+            # Extract parameters
+            action = kwargs.get("action", "GET").upper()
+            uri_pattern = kwargs.get("uri_pattern", "")
+            payload = kwargs.get("payload", {})
+            timeout = kwargs.get("timeout", 300)
+
+            await self._log_runtime(
+                "INFO",
+                "RedfishService",
+                f"[execute_redfish_action] Executing {action} on {uri_pattern}",
+                dut_id,
+            )
+
+            # Substitute variables in URI pattern
+            uri = await self._substitute_uri_variables(dut_id, uri_pattern, kwargs)
+
+            # Substitute variables in payload if it contains string values
+            substituted_payload = await self._substitute_payload_variables(
+                dut_id, payload, kwargs
+            )
+
+            await self._log_runtime(
+                "DEBUG",
+                "RedfishService",
+                f"[execute_redfish_action] URI: {uri}, Payload: {substituted_payload}",
+                dut_id,
+            )
+
+            # Execute the request using existing dispatch_request
+            success, response, metadata = await self.dispatch_request(
+                dut_id=dut_id,
+                method=action,
+                uri=uri,
+                body=(
+                    substituted_payload if action in ["POST", "PUT", "PATCH"] else None
+                ),
+                timeout=timeout,
+                bypass_cache=True,
+            )
+
+            result = {
+                "success": success,
+                "context": {},
+            }
+
+            if not success:
+                result["reason"] = f"{action} request to {uri} failed: {response}"
+                await self._log_runtime(
+                    "ERROR",
+                    "RedfishService",
+                    f"[execute_redfish_action] Failed: {result['reason']}",
+                    dut_id,
+                )
+                return result
+
+            await self._log_runtime(
+                "INFO",
+                "RedfishService",
+                f"[execute_redfish_action] {action} succeeded on {uri}",
+                dut_id,
+            )
+
+            # Store task ID if requested
+            if kwargs.get("store_task_id", False):
+                task_id = None
+
+                # Try to extract task ID from various response formats
+                if isinstance(response, dict):
+                    # Check for @odata.id in response
+                    if "@odata.id" in response:
+                        task_uri = response["@odata.id"]
+                        # Extract task ID from URI like "/redfish/v1/TaskService/Tasks/12345"
+                        if "/Tasks/" in task_uri:
+                            task_id = task_uri.split("/Tasks/")[-1]
+
+                    # Check for Id field
+                    elif "Id" in response:
+                        task_id = response["Id"]
+
+                if task_id:
+                    context_key = kwargs.get("context_key", "task_id")
+                    result["context"][context_key] = task_id
+
+                    await self._log_runtime(
+                        "INFO",
+                        "RedfishService",
+                        f"[execute_redfish_action] Stored task_id '{task_id}' in context['{context_key}']",
+                        dut_id,
+                    )
+                else:
+                    await self._log_runtime(
+                        "WARN",
+                        "RedfishService",
+                        "[execute_redfish_action] store_task_id=True but no task ID found in response",
+                        dut_id,
+                    )
+
+            # Store full response if requested
+            if kwargs.get("store_response", False):
+                response_key = kwargs.get("response_key", "response")
+                result["context"][response_key] = response
+
+                await self._log_runtime(
+                    "DEBUG",
+                    "RedfishService",
+                    f"[execute_redfish_action] Stored response in context['{response_key}']",
+                    dut_id,
+                )
+
+            # Wait after action if requested
+            wait_seconds = kwargs.get("wait_after_action")
+            if wait_seconds:
+                await self._log_runtime(
+                    "INFO",
+                    "RedfishService",
+                    f"[execute_redfish_action] Waiting {wait_seconds} seconds after action",
+                    dut_id,
+                )
+                await asyncio.sleep(wait_seconds)
+
+            return result
+
+        except Exception as e:
+            await self._log_runtime(
+                "ERROR",
+                "RedfishService",
+                f"[execute_redfish_action] Exception: {str(e)}",
+                dut_id,
+            )
+            return {
+                "success": False,
+                "context": {},
+                "reason": f"Exception during execute_redfish_action: {str(e)}",
+            }
+
+    def _resolve_hook_value_from_context(
+        self, value: Any, context: Dict[str, Any]
+    ) -> Any:
+        """Resolve simple ${var} placeholders for hook parameters."""
+        if isinstance(value, list):
+            return [
+                self._resolve_hook_value_from_context(item, context) for item in value
+            ]
+        return self._resolve_placeholder(value, context)
+
+    def _extract_binary_blob_from_response(
+        self,
+        response: Any,
+        binary_response_paths: Optional[List[Any]] = None,
+    ) -> Optional[bytes]:
+        """Extract a binary payload from bytes or a JSON/base64 response body."""
+        if isinstance(response, bytes):
+            return response
+
+        if not isinstance(response, dict):
+            return None
+
+        candidate_paths = binary_response_paths or [
+            "Payload",
+            "Data",
+            "Binary",
+            "Content",
+            "Oem.Nvidia.Payload",
+            "Oem.Nvidia.Data",
+            "Oem.NVIDIA.Payload",
+            "Oem.NVIDIA.Data",
+        ]
+
+        for path in candidate_paths:
+            candidate = self._extract_nested_value(response, path)
+            if candidate is None:
+                continue
+
+            if isinstance(candidate, str):
+                try:
+                    return base64.b64decode(candidate, validate=True)
+                except (ValueError, binascii.Error):
+                    continue
+
+            if isinstance(candidate, list):
+                try:
+                    return bytes(candidate)
+                except ValueError:
+                    continue
+
+        return None
+
+    async def _check_power_state_off(
+        self,
+        dut_id: str,
+        power_state_uris: List[str],
+        context: Dict[str, Any],
+    ) -> Tuple[bool, str]:
+        """
+        Require at least one configured Redfish resource to report PowerState=Off.
+        """
+        if not power_state_uris:
+            return (
+                False,
+                "require_host_power_off enabled but no power_state_uris provided",
+            )
+
+        observations: List[str] = []
+        found_non_off = False
+
+        for uri_template in power_state_uris:
+            uri = await self.substitute_variables(uri_template, context, dut_id)
+            success, response, error_details = await self.dispatch_request(
+                dut_id=dut_id,
+                method="GET",
+                uri=uri,
+                bypass_cache=True,
+                error_context=f"power state check for {uri}",
+            )
+            if not success:
+                observations.append(
+                    f"{uri}: request failed ({error_details or response})"
+                )
+                continue
+
+            if not isinstance(response, dict):
+                observations.append(
+                    f"{uri}: invalid response type {type(response).__name__}"
+                )
+                continue
+
+            power_state = response.get("PowerState")
+            if power_state == "Off":
+                return True, f"{uri}: PowerState=Off"
+            if power_state:
+                found_non_off = True
+                observations.append(f"{uri}: PowerState={power_state}")
+            else:
+                observations.append(f"{uri}: PowerState missing")
+
+        if found_non_off:
+            return False, "; ".join(observations)
+        return False, "No configured power state resource reported PowerState=Off"
+
+    def _resolve_oem_action_target(
+        self,
+        resource_data: Dict[str, Any],
+        action_name_candidates: List[str],
+    ) -> Optional[str]:
+        """Resolve an OEM action target from a resource's Actions block."""
+        actions = resource_data.get("Actions", {})
+        if not isinstance(actions, dict):
+            return None
+
+        for candidate in action_name_candidates:
+            action_data = actions.get(candidate)
+            if isinstance(action_data, dict) and action_data.get("target"):
+                return action_data["target"]
+
+        return None
+
+    async def _download_binary_from_uri(
+        self,
+        dut_id: str,
+        uri: str,
+        context: Dict[str, Any],
+        function_tag: str,
+        output_pattern: str,
+        collector_id: str,
+    ) -> Tuple[Optional[str], Optional[bytes], Optional[str]]:
+        """Download a binary blob from a Redfish URI and persist it."""
+        success, response, error_details = await self.dispatch_request(
+            dut_id=dut_id,
+            method="GET",
+            uri=uri,
+            get_raw_content=True,
+            bypass_cache=True,
+            error_context=f"binary download from {uri}",
+        )
+        if not success:
+            return (
+                None,
+                None,
+                f"Failed to download binary from {uri}: {error_details or response}",
+            )
+
+        data = response
+        if not isinstance(data, bytes):
+            data = self._extract_binary_blob_from_response(data)
+            if data is None:
+                return (
+                    None,
+                    None,
+                    f"Response from {uri} did not contain a binary payload",
+                )
+
+        file_path = await self._save_data_to_file_with_pattern(
+            dut_id,
+            data,
+            function_tag,
+            output_pattern=output_pattern,
+            substitutions=context,
+            collector_id=collector_id,
+        )
+        if not file_path:
+            return None, None, f"Downloaded binary from {uri} but failed to save it"
+
+        return file_path, data, None
+
+    async def _save_oem_binary_metadata(
+        self,
+        dut_id: str,
+        metadata: Dict[str, Any],
+        function_tag: str,
+        metadata_output_pattern: str,
+        collector_id: str,
+        substitutions: Dict[str, Any],
+    ) -> Optional[str]:
+        """Persist metadata sidecar for an OEM binary action artifact."""
+        if not metadata_output_pattern:
+            return None
+
+        return await self._save_data_to_file_with_pattern(
+            dut_id,
+            metadata,
+            function_tag,
+            output_pattern=metadata_output_pattern,
+            substitutions=substitutions,
+            collector_id=collector_id,
+        )
+
+    async def collect_chassis_oem_binary_action(
+        self,
+        dut_id: str,
+        function_tag: str,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """
+        Execute a chassis OEM action that returns or stages a binary artifact.
+
+        Supported response paths:
+        - direct binary body from the action response
+        - base64 payload embedded in the action response JSON
+        - Task/TaskMonitor response followed by binary download from TaskMonitor
+        - explicit download URI embedded in the action or task response
+        """
+        try:
+            collector_id = kwargs.get("collector_id", "")
+            output_pattern = kwargs.get("output_pattern", "")
+            metadata_output_pattern = kwargs.get("metadata_output_pattern", "")
+            payload = kwargs.get("payload", {})
+            action_name_candidates = kwargs.get("action_name_candidates", [])
+            action_uri_fallback_pattern = kwargs.get("action_uri_fallback_pattern")
+            binary_response_paths = kwargs.get("binary_response_paths")
+            download_uri_paths = kwargs.get("download_uri_paths", [])
+            require_host_power_off = kwargs.get("require_host_power_off", False)
+            power_state_uris = kwargs.get("power_state_uris", [])
+            min_size_bytes = int(kwargs.get("min_size_bytes", 0))
+            hash_algorithm = kwargs.get("hash_algorithm", "sha256")
+            task_max_retries = int(kwargs.get("task_max_retries", 50))
+            task_poll_interval = int(kwargs.get("task_poll_interval", 30))
+            action_timeout = int(
+                kwargs.get("action_timeout", kwargs.get("timeout", 300))
+            )
+
+            raw_uri_list = self._resolve_hook_value_from_context(
+                kwargs.get("uri_list", []), kwargs
+            )
+            if isinstance(raw_uri_list, str):
+                uri_list = [raw_uri_list]
+            else:
+                uri_list = [uri for uri in raw_uri_list if uri]
+
+            if not uri_list:
+                return await self._create_standardized_collector_result(
+                    successful_operations=0,
+                    total_operations=0,
+                    output_files=[],
+                    error_messages=[],
+                    operation_name="chassis_oem_binary_action",
+                    additional_context={
+                        "status": "skipped",
+                        "reason": "No chassis OEM action targets provided",
+                    },
+                    dut_id=dut_id,
+                    collector_id=collector_id,
+                )
+
+            output_files: List[str] = []
+            error_messages: List[str] = []
+            successful_operations = 0
+
+            for chassis_uri in uri_list:
+                context = dict(kwargs)
+                context.update(self._extract_entity_id_from_uri(chassis_uri))
+                chassis_id = context.get(
+                    "chassis_id"
+                ) or self._extract_entity_id_from_uri(chassis_uri, "Chassis")
+                context["chassis_id"] = chassis_id
+
+                socket_match = re.search(r"ProcessorModule_(\d+)_", str(chassis_id))
+                socket_id = socket_match.group(1) if socket_match else "unknown"
+                context["socket_id"] = socket_id
+
+                success, chassis_data, error_details = await self.dispatch_request(
+                    dut_id=dut_id,
+                    method="GET",
+                    uri=chassis_uri,
+                    bypass_cache=True,
+                    error_context=f"resolve chassis OEM action for {chassis_uri}",
+                )
+                if not success or not isinstance(chassis_data, dict):
+                    error_messages.append(
+                        f"{chassis_uri}: failed to retrieve chassis resource ({error_details or chassis_data})"
+                    )
+                    continue
+
+                action_target = self._resolve_oem_action_target(
+                    chassis_data, action_name_candidates
+                )
+                if not action_target and action_uri_fallback_pattern:
+                    action_target = await self.substitute_variables(
+                        action_uri_fallback_pattern, context, dut_id
+                    )
+
+                if not action_target:
+                    error_messages.append(
+                        f"{chassis_uri}: OEM action target not found for candidates {action_name_candidates}"
+                    )
+                    continue
+
+                if require_host_power_off:
+                    host_off, reason = await self._check_power_state_off(
+                        dut_id, power_state_uris, context
+                    )
+                    if not host_off:
+                        error_messages.append(
+                            f"{chassis_id}: host power precondition failed ({reason})"
+                        )
+                        continue
+
+                substituted_payload = await self._substitute_payload_variables(
+                    dut_id, payload, context
+                )
+                post_success, post_response, _ = await self.dispatch_request(
+                    dut_id=dut_id,
+                    method="POST",
+                    uri=action_target,
+                    body=substituted_payload,
+                    timeout=action_timeout,
+                    bypass_cache=True,
+                    error_context=f"invoke OEM action {action_target}",
+                )
+                if not post_success:
+                    error_messages.append(
+                        f"{chassis_id}: OEM action failed at {action_target}: {post_response}"
+                    )
+                    continue
+
+                saved_file_path: Optional[str] = None
+                artifact_bytes: Optional[bytes] = None
+                action_response_mode = "unknown"
+
+                direct_blob = self._extract_binary_blob_from_response(
+                    post_response, binary_response_paths
+                )
+                if direct_blob is not None:
+                    action_response_mode = (
+                        "direct_binary"
+                        if isinstance(post_response, bytes)
+                        else "direct_base64_json"
+                    )
+                    saved_file_path = await self._save_data_to_file_with_pattern(
+                        dut_id,
+                        direct_blob,
+                        function_tag,
+                        output_pattern=output_pattern,
+                        substitutions=context,
+                        collector_id=collector_id,
+                    )
+                    artifact_bytes = direct_blob
+                else:
+                    download_uri = None
+                    task_id = None
+                    task_monitor_uri = None
+
+                    if isinstance(post_response, dict):
+                        for path in download_uri_paths:
+                            candidate_uri = self._extract_nested_value(
+                                post_response, path
+                            )
+                            if isinstance(candidate_uri, str) and candidate_uri:
+                                download_uri = candidate_uri
+                                break
+
+                        task_monitor_uri = post_response.get("TaskMonitor")
+                        odata_id = post_response.get("@odata.id", "")
+                        if isinstance(odata_id, str) and "/Tasks/" in odata_id:
+                            task_id = odata_id.split("/Tasks/")[-1]
+                        elif post_response.get("Id") and not download_uri:
+                            task_id = str(post_response["Id"])
+
+                    if task_id:
+                        action_response_mode = "task"
+                        monitor_result = await self.monitor_task(
+                            dut_id=dut_id,
+                            task_id=task_id,
+                            success_states=["Completed", "CompletedOK", "Success"],
+                            failure_states=[
+                                "Exception",
+                                "Cancelled",
+                                "Killed",
+                                "Failed",
+                            ],
+                            terminal_states=[
+                                "Completed",
+                                "CompletedOK",
+                                "Success",
+                                "Exception",
+                                "Cancelled",
+                                "Killed",
+                                "Failed",
+                            ],
+                            max_retries=task_max_retries,
+                            poll_interval=task_poll_interval,
+                        )
+                        if not monitor_result.get("success", False):
+                            error_messages.append(
+                                f"{chassis_id}: task {task_id} did not complete successfully ({monitor_result.get('reason')})"
+                            )
+                            continue
+
+                        if not task_monitor_uri:
+                            task_service_uri = self.get_configured_uri(
+                                dut_id, "TaskService"
+                            )
+                            task_monitor_uri = (
+                                f"{task_service_uri}/TaskMonitors/{task_id}"
+                            )
+
+                        saved_file_path, artifact_bytes, error_message = (
+                            await self._download_binary_from_uri(
+                                dut_id=dut_id,
+                                uri=task_monitor_uri,
+                                context=context,
+                                function_tag=function_tag,
+                                output_pattern=output_pattern,
+                                collector_id=collector_id,
+                            )
+                        )
+                        if error_message:
+                            error_messages.append(f"{chassis_id}: {error_message}")
+                            continue
+                    elif download_uri:
+                        action_response_mode = "download_uri"
+                        saved_file_path, artifact_bytes, error_message = (
+                            await self._download_binary_from_uri(
+                                dut_id=dut_id,
+                                uri=download_uri,
+                                context=context,
+                                function_tag=function_tag,
+                                output_pattern=output_pattern,
+                                collector_id=collector_id,
+                            )
+                        )
+                        if error_message:
+                            error_messages.append(f"{chassis_id}: {error_message}")
+                            continue
+                    else:
+                        error_messages.append(
+                            f"{chassis_id}: OEM action response did not contain a binary payload, task reference, or download URI"
+                        )
+                        continue
+
+                if not saved_file_path or artifact_bytes is None:
+                    error_messages.append(
+                        f"{chassis_id}: binary artifact was retrieved but could not be saved"
+                    )
+                    continue
+
+                if min_size_bytes and len(artifact_bytes) < min_size_bytes:
+                    error_messages.append(
+                        f"{chassis_id}: binary artifact smaller than expected ({len(artifact_bytes)} < {min_size_bytes} bytes)"
+                    )
+                    continue
+
+                output_files.append(saved_file_path)
+                successful_operations += 1
+
+                artifact_hash = None
+                try:
+                    artifact_hash = hashlib.new(
+                        hash_algorithm, artifact_bytes
+                    ).hexdigest()
+                except ValueError:
+                    artifact_hash = hashlib.sha256(artifact_bytes).hexdigest()
+                    hash_algorithm = "sha256"
+
+                metadata = {
+                    "chassis_id": chassis_id,
+                    "socket_id": socket_id,
+                    "resource_uri": chassis_uri,
+                    "action_target": action_target,
+                    "read_method": "redfish_oem",
+                    "response_mode": action_response_mode,
+                    "size_bytes": len(artifact_bytes),
+                    hash_algorithm: artifact_hash,
+                    "artifact_path": saved_file_path,
+                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                }
+                metadata_path = await self._save_oem_binary_metadata(
+                    dut_id=dut_id,
+                    metadata=metadata,
+                    function_tag=function_tag,
+                    metadata_output_pattern=metadata_output_pattern,
+                    collector_id=collector_id,
+                    substitutions=context,
+                )
+                if metadata_path:
+                    output_files.append(metadata_path)
+
+            return await self._create_standardized_collector_result(
+                successful_operations=successful_operations,
+                total_operations=len(uri_list),
+                output_files=output_files,
+                error_messages=error_messages,
+                operation_name="chassis_oem_binary_action",
+                additional_context={
+                    "function_tag": function_tag,
+                    "targets": uri_list,
+                    "successful_targets": successful_operations,
+                },
+                dut_id=dut_id,
+                collector_id=collector_id,
+            )
+
+        except Exception as e:
+            await self._log_runtime(
+                "ERROR",
+                "RedfishService",
+                f"Exception in collect_chassis_oem_binary_action: {e}",
+                dut_id,
+            )
+            return await self._create_standardized_collector_result(
+                successful_operations=0,
+                total_operations=0,
+                output_files=[],
+                error_messages=[f"Exception in collect_chassis_oem_binary_action: {e}"],
+                operation_name="chassis_oem_binary_action",
+                additional_context={"error_type": type(e).__name__},
+                dut_id=dut_id,
+                collector_id=kwargs.get("collector_id"),
+            )
+
+    async def monitor_task(
+        self, dut_id: str, function_tag: str = "", **kwargs
+    ) -> Dict[str, Any]:
+        """
+        Generic task monitoring with configurable state checking.
+
+        Monitor a Redfish task until it reaches a terminal state. Supports reading
+        task_id from context (passed from previous hook) and configurable success/failure
+        state definitions.
+
+        Args:
+            dut_id: DUT identifier
+            function_tag: Function tag for logging
+            **kwargs: Configuration parameters:
+                - task_id: Direct task ID (if not reading from context)
+                - task_id_from_context: Key to read task_id from context
+                - success_states: List of states considered success [default: ["Completed"]]
+                - failure_states: List of states considered failure [default: ["Exception", "Cancelled", "Killed"]]
+                - terminal_states: List of states to stop on [default: success + failure states]
+                - check_field: Field to check in task response [default: "TaskState"]
+                - max_retries: Maximum polling attempts [default: 50]
+                - poll_interval: Seconds between polls [default: 30]
+                - timeout_config: Config key for timeout (e.g., "REDFISH_DUMP_TIMEOUT")
+                - store_result: Store full task result in context [default: False]
+                - result_key: Key to store result under [default: "task_result"]
+                - store_state: Store final state in context [default: False]
+                - state_key: Key to store state under [default: "task_final_state"]
+
+        Returns:
+            Dict with success status and context:
+                {
+                    "success": bool,  # True if task reached success_states
+                    "context": {
+                        "task_result": {...},  # if store_result=True
+                        "task_final_state": "Completed"  # if store_state=True
+                    },
+                    "reason": str
+                }
+
+        Examples:
+            # Basic monitoring (uses defaults)
+            - method: monitor_task
+              params:
+                task_id_from_context: ist_task_id
+                max_retries: 50
+                poll_interval: 30
+
+            # Custom state checking
+            - method: monitor_task
+              params:
+                task_id_from_context: task_id
+                success_states: ["Completed", "CompletedWithWarnings"]
+                failure_states: ["Exception", "Failed"]
+                store_state: true
+                state_key: operation_state
+
+            # Check different field (e.g., PercentComplete)
+            - method: monitor_task
+              params:
+                task_id_from_context: task_id
+                check_field: "PercentComplete"
+                success_states: ["100"]
+                terminal_states: ["100", "Exception"]
+        """
+        try:
+            # Get task ID from context or direct parameter
+            task_id = kwargs.get("task_id")
+            if not task_id:
+                context_key = kwargs.get("task_id_from_context")
+                if context_key:
+                    task_id = kwargs.get(context_key)
+                    await self._log_runtime(
+                        "INFO",
+                        "RedfishService",
+                        f"[monitor_task] Read task_id '{task_id}' from context['{context_key}']",
+                        dut_id,
+                    )
+
+            if not task_id:
+                error_msg = "No task_id provided (neither direct nor from context)"
+                await self._log_runtime(
+                    "ERROR",
+                    "RedfishService",
+                    f"[monitor_task] {error_msg}",
+                    dut_id,
+                )
+                return {
+                    "success": False,
+                    "context": {},
+                    "reason": error_msg,
+                }
+
+            # Configurable state checking
+            success_states = kwargs.get("success_states", ["Completed"])
+            failure_states = kwargs.get(
+                "failure_states", ["Exception", "Cancelled", "Killed"]
+            )
+            terminal_states = kwargs.get(
+                "terminal_states", success_states + failure_states
+            )
+            check_field = kwargs.get("check_field", "TaskState")
+
+            # Polling configuration
+            max_retries = kwargs.get("max_retries", 50)
+            poll_interval = kwargs.get("poll_interval", 30)
+
+            await self._log_runtime(
+                "INFO",
+                "RedfishService",
+                f"[monitor_task] Monitoring task {task_id}, checking '{check_field}' for success_states={success_states}",
+                dut_id,
+            )
+
+            # Build task URI
+            task_service_uri = self.get_configured_uri(dut_id, "TaskService")
+            task_uri = f"{task_service_uri}/Tasks/{task_id}"
+
+            # Initial wait for quick tasks
+            await asyncio.sleep(2)
+
+            # Poll until terminal state
+            for attempt in range(max_retries):
+                await self._log_runtime(
+                    "DEBUG",
+                    "RedfishService",
+                    f"[monitor_task] Poll attempt {attempt + 1}/{max_retries} for task {task_id}",
+                    dut_id,
+                )
+
+                # Get task status
+                success, response, _ = await self.dispatch_request(
+                    dut_id=dut_id,
+                    method="GET",
+                    uri=task_uri,
+                    bypass_cache=True,
+                )
+
+                if not success:
+                    await self._log_runtime(
+                        "WARN",
+                        "RedfishService",
+                        f"[monitor_task] Failed to get task status on attempt {attempt + 1}",
+                        dut_id,
+                    )
+                    await asyncio.sleep(poll_interval)
+                    continue
+
+                if not isinstance(response, dict):
+                    await self._log_runtime(
+                        "WARN",
+                        "RedfishService",
+                        f"[monitor_task] Invalid response type: {type(response)}",
+                        dut_id,
+                    )
+                    await asyncio.sleep(poll_interval)
+                    continue
+
+                # Check the configured field
+                current_state = response.get(check_field)
+
+                if not current_state:
+                    await self._log_runtime(
+                        "WARN",
+                        "RedfishService",
+                        f"[monitor_task] Field '{check_field}' not found in response",
+                        dut_id,
+                    )
+                    await asyncio.sleep(poll_interval)
+                    continue
+
+                await self._log_runtime(
+                    "INFO",
+                    "RedfishService",
+                    f"[monitor_task] Task {task_id} current {check_field}: {current_state}",
+                    dut_id,
+                )
+
+                # Check if we've reached a terminal state
+                if current_state in terminal_states:
+                    # Determine success based on configured states
+                    is_success = current_state in success_states
+
+                    result = {
+                        "success": is_success,
+                        "context": {},
+                        "reason": f"Task reached {check_field}='{current_state}' (success={is_success})",
+                    }
+
+                    await self._log_runtime(
+                        "INFO" if is_success else "WARN",
+                        "RedfishService",
+                        f"[monitor_task] {result['reason']}",
+                        dut_id,
+                    )
+
+                    # Store full result if requested
+                    if kwargs.get("store_result", False):
+                        result_key = kwargs.get("result_key", "task_result")
+                        result["context"][result_key] = response
+                        await self._log_runtime(
+                            "DEBUG",
+                            "RedfishService",
+                            f"[monitor_task] Stored task result in context['{result_key}']",
+                            dut_id,
+                        )
+
+                    # Store state if requested
+                    if kwargs.get("store_state", False):
+                        state_key = kwargs.get("state_key", "task_final_state")
+                        result["context"][state_key] = current_state
+                        await self._log_runtime(
+                            "DEBUG",
+                            "RedfishService",
+                            f"[monitor_task] Stored state '{current_state}' in context['{state_key}']",
+                            dut_id,
+                        )
+
+                    return result
+
+                # Not terminal yet, wait and retry
+                await asyncio.sleep(poll_interval)
+
+            # Timeout
+            error_msg = f"Task monitoring timed out after {max_retries * poll_interval}s (max_retries={max_retries}, poll_interval={poll_interval})"
+            await self._log_runtime(
+                "ERROR",
+                "RedfishService",
+                f"[monitor_task] {error_msg}",
+                dut_id,
+            )
+            return {
+                "success": False,
+                "context": {},
+                "reason": error_msg,
+            }
+
+        except Exception as e:
+            await self._log_runtime(
+                "ERROR",
+                "RedfishService",
+                f"[monitor_task] Exception: {str(e)}",
+                dut_id,
+            )
+            return {
+                "success": False,
+                "context": {},
+                "reason": f"Exception during monitor_task: {str(e)}",
+            }
+
+    async def _wait_for_system_ready_after_reset(
+        self,
+        dut_id: str,
+        system_id: str,
+        timeout_seconds: int,
+        poll_interval: int,
+    ) -> Tuple[bool, str]:
+        """Wait for a system resource to become reachable again after a reset."""
+        system_uri = f"/redfish/v1/Systems/{system_id}"
+        deadline = time.monotonic() + max(0, timeout_seconds)
+        attempt = 0
+        last_observation = "system resource not reachable"
+
+        while True:
+            attempt += 1
+            success, response, error_details = await self.dispatch_request(
+                dut_id=dut_id,
+                method="GET",
+                uri=system_uri,
+                bypass_cache=True,
+            )
+            if success and isinstance(response, dict):
+                power_state = response.get("PowerState")
+                boot_progress = response.get("BootProgress")
+                if power_state == "On":
+                    return True, "PowerState=On"
+                if isinstance(boot_progress, dict):
+                    last_state = boot_progress.get("LastState")
+                    if last_state:
+                        return True, f"BootProgress.LastState={last_state}"
+
+                # Some platforms do not expose useful power/boot indicators. A
+                # successful GET confirms the system resource is reachable again.
+                return True, "system resource reachable"
+
+            last_observation = str(error_details or response)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+
+            await self._log_runtime(
+                "DEBUG",
+                "RedfishService",
+                (
+                    f"[ist] Waiting for {system_id} to return after entry reset; "
+                    f"attempt {attempt}, remaining={int(remaining)}s"
+                ),
+                dut_id,
+            )
+            await asyncio.sleep(min(max(1, poll_interval), remaining))
+
+        return False, last_observation
+
+    async def _start_ist_for_system(
+        self,
+        dut_id: str,
+        system_id: str,
+        start_uri_pattern: str,
+        payload: Dict[str, Any],
+        start_context: Dict[str, Any],
+        task_service_uri: str,
+    ) -> Tuple[Optional[str], Optional[str], Union[Dict[str, Any], str]]:
+        """Start IST for a system and extract the task metadata."""
+        substituted_start_uri = await self._substitute_uri_variables(
+            dut_id, start_uri_pattern, start_context
+        )
+        substituted_start_payload = await self._substitute_payload_variables(
+            dut_id, payload, start_context
+        )
+
+        await self._log_runtime(
+            "INFO",
+            "RedfishService",
+            f"[ist] Starting IST for {system_id} via {substituted_start_uri}",
+            dut_id,
+        )
+        start_success, start_response, _ = await self.dispatch_request(
+            dut_id=dut_id,
+            method="POST",
+            uri=substituted_start_uri,
+            body=substituted_start_payload,
+            bypass_cache=True,
+        )
+        if not start_success:
+            return (
+                None,
+                None,
+                f"Systems {system_id}: failed to start IST: {start_response}",
+            )
+
+        task_id = None
+        task_monitor_uri = None
+        if isinstance(start_response, dict):
+            task_monitor_uri = start_response.get("TaskMonitor")
+            odata_id = start_response.get("@odata.id", "")
+            if odata_id and "/Tasks/" in odata_id:
+                task_id = odata_id.split("/Tasks/")[-1]
+            elif start_response.get("Id"):
+                task_id = str(start_response["Id"])
+
+        if not task_id:
+            return (
+                None,
+                None,
+                f"Systems {system_id}: IST start response did not include a task ID",
+            )
+
+        if not task_monitor_uri:
+            task_monitor_uri = f"{task_service_uri}/TaskMonitors/{task_id}"
+
+        return task_id, task_monitor_uri, start_response
+
+    async def _monitor_ist_initial_phase(
+        self,
+        dut_id: str,
+        task_id: str,
+        max_retries: int,
+        poll_interval: int,
+    ) -> Tuple[bool, Optional[str], Dict[str, Any]]:
+        """Monitor IST until it reaches a runnable or completed state."""
+        initial_monitor = await self.monitor_task(
+            dut_id=dut_id,
+            task_id=task_id,
+            success_states=["Suspended", "Completed"],
+            failure_states=["Exception", "Cancelled", "Killed"],
+            terminal_states=[
+                "Suspended",
+                "Completed",
+                "Exception",
+                "Cancelled",
+                "Killed",
+            ],
+            max_retries=max_retries,
+            poll_interval=poll_interval,
+            store_state=True,
+            state_key="ist_initial_state",
+            store_result=True,
+            result_key="ist_initial_result",
+        )
+        initial_state = initial_monitor.get("context", {}).get("ist_initial_state")
+        return initial_monitor.get("success", False), initial_state, initial_monitor
+
+    async def _handle_ist_entry_power_cycle(
+        self,
+        dut_id: str,
+        system_id: str,
+        reset_uri: str,
+        payload: Dict[str, Any],
+        task_id: str,
+        wait_after_entry_reset: int,
+        poll_interval: int,
+    ) -> Optional[str]:
+        """Issue the entry power cycle and optionally verify the system returns."""
+        await self._log_runtime(
+            "INFO",
+            "RedfishService",
+            f"[ist] Task {task_id} suspended for {system_id}; issuing entry power cycle",
+            dut_id,
+        )
+        reset_success, reset_response, _ = await self.dispatch_request(
+            dut_id=dut_id,
+            method="POST",
+            uri=reset_uri,
+            body=payload,
+            bypass_cache=True,
+        )
+        if not reset_success:
+            return f"Systems {system_id}: failed to power cycle into IST mode: {reset_response}"
+
+        if wait_after_entry_reset:
+            verification_success, verification_reason = (
+                await self._wait_for_system_ready_after_reset(
+                    dut_id=dut_id,
+                    system_id=system_id,
+                    timeout_seconds=wait_after_entry_reset,
+                    poll_interval=poll_interval,
+                )
+            )
+            if not verification_success:
+                return (
+                    f"Systems {system_id}: power cycle into IST mode did not complete "
+                    f"within {wait_after_entry_reset}s: {verification_reason}"
+                )
+
+        return None
+
+    async def _monitor_ist_completion(
+        self,
+        dut_id: str,
+        task_id: str,
+        max_retries: int,
+        poll_interval: int,
+    ) -> Tuple[Optional[str], Dict[str, Any]]:
+        """Monitor IST until the task reaches completion."""
+        completion_monitor = await self.monitor_task(
+            dut_id=dut_id,
+            task_id=task_id,
+            success_states=["Completed"],
+            failure_states=["Exception", "Cancelled", "Killed"],
+            terminal_states=[
+                "Completed",
+                "Exception",
+                "Cancelled",
+                "Killed",
+            ],
+            max_retries=max_retries,
+            poll_interval=poll_interval,
+            store_state=True,
+            state_key="ist_completion_state",
+            store_result=True,
+            result_key="ist_completion_result",
+        )
+        completion_state = completion_monitor.get("context", {}).get(
+            "ist_completion_state"
+        )
+        return completion_state, completion_monitor
+
+    async def _download_ist_results(
+        self,
+        dut_id: str,
+        task_monitor_uri: str,
+        system_id: str,
+        function_tag: str,
+        output_pattern: str,
+        task_id: str,
+        collector_id: str,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Download and persist IST results for a system."""
+        await self._log_runtime(
+            "INFO",
+            "RedfishService",
+            f"[ist] Downloading IST results for {system_id} from {task_monitor_uri}",
+            dut_id,
+        )
+        download_success, download_data, _ = await self.dispatch_request(
+            dut_id=dut_id,
+            method="GET",
+            uri=task_monitor_uri,
+            get_raw_content=True,
+            bypass_cache=True,
+        )
+        if not download_success or not isinstance(download_data, bytes):
+            return (
+                None,
+                f"Systems {system_id}: failed to download IST results from "
+                f"{task_monitor_uri}: {download_data}",
+            )
+
+        file_path = await self._save_data_to_file_with_pattern(
+            dut_id,
+            download_data,
+            function_tag,
+            output_pattern=output_pattern,
+            substitutions={
+                "system_id": system_id,
+                "task_id": task_id,
+            },
+            collector_id=collector_id,
+        )
+        if file_path:
+            return file_path, None
+
+        return (
+            None,
+            f"Systems {system_id}: IST results downloaded but could not be saved",
+        )
+
+    async def _perform_ist_exit_power_cycle(
+        self,
+        dut_id: str,
+        system_id: str,
+        reset_uri: str,
+        payload: Dict[str, Any],
+        completion_state: Optional[str],
+        wait_after_exit_reset: int,
+    ) -> None:
+        """Issue the post-IST power cycle back to functional mode."""
+        await self._log_runtime(
+            "INFO",
+            "RedfishService",
+            (
+                f"[ist] Issuing exit power cycle for {system_id} "
+                f"after state {completion_state}"
+            ),
+            dut_id,
+        )
+        await self.dispatch_request(
+            dut_id=dut_id,
+            method="POST",
+            uri=reset_uri,
+            body=payload,
+            bypass_cache=True,
+        )
+        if wait_after_exit_reset:
+            await asyncio.sleep(wait_after_exit_reset)
+
+    async def run_ist_workflow(
+        self,
+        dut_id: str,
+        function_tag: str = "",
+        entity_type: str = "Systems",
+        start_uri_pattern: str = "/redfish/v1/Systems/{system_id}/Actions/Oem/NvidiaComputerSystem.StartIST",
+        reset_uri_pattern: str = "/redfish/v1/Systems/{system_id}/Actions/ComputerSystem.Reset",
+        start_payload: Optional[Dict[str, Any]] = None,
+        reset_payload: Optional[Dict[str, Any]] = None,
+        poll_interval: int = 30,
+        wait_after_entry_reset: int = 300,
+        wait_after_exit_reset: int = 300,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """
+        Run the IST workflow for one or more systems.
+
+        Workflow:
+        1. Start IST
+        2. Monitor until either Suspended or Completed
+        3. If Suspended, issue a power cycle to enter IST mode
+        4. Monitor until Completed
+        5. Download results from TaskMonitor
+        6. If AutoRebootOnComplete is false, power cycle back to functional mode
+        """
+        start_payload = start_payload or {}
+        reset_payload = reset_payload or {"ResetType": "PowerCycle"}
+
+        collector_id = kwargs.get("collector_id", function_tag)
+        collector_def = kwargs.get("collector_def", {})
+        output_pattern = kwargs.get("output_pattern", "")
+
+        try:
+            filtered_systems = kwargs.get("filtered_systems", [])
+            if filtered_systems and entity_type == "Systems":
+                entity_ids = [sys["id"] for sys in filtered_systems]
+            else:
+                entity_uri = self.get_configured_uri(dut_id, entity_type)
+                success, entities, _ = await self.dispatch_request(
+                    dut_id,
+                    "GET",
+                    entity_uri,
+                    bypass_cache=True,
+                )
+                if not success:
+                    return await self._create_standardized_collector_result(
+                        dut_id=dut_id,
+                        collector_id=collector_id,
+                        successful_operations=0,
+                        total_operations=1,
+                        output_files=[],
+                        error_messages=[f"Failed to get {entity_type}: {entities}"],
+                        operation_name="ist_workflow",
+                        additional_context={"entity_type": entity_type},
+                    )
+
+                entity_ids = [
+                    member.get("@odata.id", "").split("/")[-1]
+                    for member in entities.get("Members", [])
+                    if member.get("@odata.id")
+                ]
+
+            if not entity_ids:
+                return await self._create_standardized_collector_result(
+                    dut_id=dut_id,
+                    collector_id=collector_id,
+                    successful_operations=0,
+                    total_operations=0,
+                    output_files=[],
+                    error_messages=[f"No {entity_type} found"],
+                    operation_name="ist_workflow",
+                    additional_context={"entity_type": entity_type},
+                )
+
+            tool_config = {}
+            if self.orchestrator and getattr(self.orchestrator, "config_manager", None):
+                tool_config = self.orchestrator.config_manager.get_tool_config()
+            elif self.dut_manager:
+                tool_config = getattr(self.dut_manager, "tool_config", {}) or {}
+            dut_config = (
+                self.dut_manager.get_dut_config(dut_id)
+                if self.dut_manager is not None
+                else None
+            )
+
+            timeout_seconds = get_collector_timeout(
+                collector_id,
+                collector_def,
+                dut_config,
+                7200,
+                tool_config,
+            )
+            max_retries = kwargs.get(
+                "max_retries",
+                max(1, int((timeout_seconds + poll_interval - 1) / poll_interval)),
+            )
+
+            output_files: List[str] = []
+            error_messages: List[str] = []
+            successful_systems = 0
+            task_service_uri = self.get_configured_uri(dut_id, "TaskService")
+            auto_reboot_on_complete = bool(
+                start_payload.get("AutoRebootOnComplete", False)
+            )
+
+            for system_id in entity_ids:
+                start_context = {
+                    **kwargs,
+                    "system_id": system_id,
+                    "entity_id": system_id,
+                }
+
+                try:
+                    task_id, task_monitor_uri, start_result = (
+                        await self._start_ist_for_system(
+                            dut_id=dut_id,
+                            system_id=system_id,
+                            start_uri_pattern=start_uri_pattern,
+                            payload=start_payload,
+                            start_context=start_context,
+                            task_service_uri=task_service_uri,
+                        )
+                    )
+                    if not task_id or not task_monitor_uri:
+                        error_messages.append(
+                            start_result
+                            if isinstance(start_result, str)
+                            else f"Systems {system_id}: failed to start IST"
+                        )
+                        continue
+
+                    reset_uri = await self._substitute_uri_variables(
+                        dut_id, reset_uri_pattern, start_context
+                    )
+                    reset_body = await self._substitute_payload_variables(
+                        dut_id, reset_payload, start_context
+                    )
+                    initial_success, initial_state, initial_monitor = (
+                        await self._monitor_ist_initial_phase(
+                            dut_id=dut_id,
+                            task_id=task_id,
+                            max_retries=max_retries,
+                            poll_interval=poll_interval,
+                        )
+                    )
+                    if not initial_success:
+                        error_messages.append(
+                            f"Systems {system_id}: IST did not reach a runnable/completed state: "
+                            f"{initial_monitor.get('reason', 'Unknown error')}"
+                        )
+                        if not auto_reboot_on_complete:
+                            await self._perform_ist_exit_power_cycle(
+                                dut_id=dut_id,
+                                system_id=system_id,
+                                reset_uri=reset_uri,
+                                payload=reset_body,
+                                completion_state=initial_state,
+                                wait_after_exit_reset=0,
+                            )
+                        continue
+
+                    completion_state = initial_state
+                    if initial_state == "Suspended":
+                        entry_reset_error = await self._handle_ist_entry_power_cycle(
+                            dut_id=dut_id,
+                            system_id=system_id,
+                            reset_uri=reset_uri,
+                            payload=reset_body,
+                            task_id=task_id,
+                            wait_after_entry_reset=wait_after_entry_reset,
+                            poll_interval=poll_interval,
+                        )
+                        if entry_reset_error:
+                            error_messages.append(entry_reset_error)
+                            continue
+
+                        completion_state, completion_monitor = (
+                            await self._monitor_ist_completion(
+                                dut_id=dut_id,
+                                task_id=task_id,
+                                max_retries=max_retries,
+                                poll_interval=poll_interval,
+                            )
+                        )
+                        completion_response = completion_monitor.get("context", {}).get(
+                            "ist_completion_result", {}
+                        )
+                        if isinstance(completion_response, dict):
+                            task_monitor_uri = (
+                                completion_response.get("TaskMonitor")
+                                or task_monitor_uri
+                            )
+                        if not completion_monitor.get("success"):
+                            error_messages.append(
+                                f"Systems {system_id}: IST did not complete successfully: {completion_monitor.get('reason', 'Unknown error')}"
+                            )
+                            if not auto_reboot_on_complete:
+                                await self._perform_ist_exit_power_cycle(
+                                    dut_id=dut_id,
+                                    system_id=system_id,
+                                    reset_uri=reset_uri,
+                                    payload=reset_body,
+                                    completion_state=completion_state,
+                                    wait_after_exit_reset=wait_after_exit_reset,
+                                )
+                            continue
+                    else:
+                        initial_response = initial_monitor.get("context", {}).get(
+                            "ist_initial_result", {}
+                        )
+                        if isinstance(initial_response, dict):
+                            task_monitor_uri = (
+                                initial_response.get("TaskMonitor") or task_monitor_uri
+                            )
+
+                    file_path, download_error = await self._download_ist_results(
+                        dut_id=dut_id,
+                        task_monitor_uri=task_monitor_uri,
+                        system_id=system_id,
+                        function_tag=function_tag,
+                        output_pattern=output_pattern,
+                        task_id=task_id,
+                        collector_id=collector_id,
+                    )
+                    if download_error:
+                        error_messages.append(download_error)
+                    else:
+                        output_files.append(file_path)
+                        successful_systems += 1
+
+                    if not auto_reboot_on_complete:
+                        await self._perform_ist_exit_power_cycle(
+                            dut_id=dut_id,
+                            system_id=system_id,
+                            reset_uri=reset_uri,
+                            payload=reset_body,
+                            completion_state=completion_state,
+                            wait_after_exit_reset=wait_after_exit_reset,
+                        )
+
+                except Exception as system_error:
+                    error_messages.append(
+                        f"Systems {system_id}: IST workflow exception: {system_error}"
+                    )
+
+            return await self._create_standardized_collector_result(
+                dut_id=dut_id,
+                collector_id=collector_id,
+                successful_operations=successful_systems,
+                total_operations=len(entity_ids),
+                output_files=output_files,
+                error_messages=error_messages,
+                operation_name="ist_workflow",
+                additional_context={
+                    "entity_type": entity_type,
+                    "systems_processed": entity_ids,
+                },
+            )
+
+        except Exception as e:
+            await self._log_runtime(
+                "ERROR",
+                "RedfishService",
+                f"[ist] Exception: {e}",
+                dut_id,
+            )
+            return await self._create_standardized_collector_result(
+                dut_id=dut_id,
+                collector_id=collector_id,
+                successful_operations=0,
+                total_operations=0,
+                output_files=[],
+                error_messages=[f"Exception during IST workflow: {e}"],
+                operation_name="ist_workflow",
+                additional_context={"error_type": type(e).__name__},
+            )
+
     async def collect_command_executor(
         self, dut_id: str, function_tag: str, command_config: Dict[str, Any], **kwargs
     ) -> Dict[str, Any]:
@@ -11798,6 +17592,30 @@ class RedfishService(BaseService):
                 dut_id,
             )
 
+            def _make_json_safe(value: Any) -> Any:
+                """
+                Convert arbitrary content into a JSON-serializable structure while preserving ordering.
+                """
+                if isinstance(value, (str, int, float, bool)) or value is None:
+                    return value
+                if isinstance(value, dict):
+                    return {k: _make_json_safe(v) for k, v in value.items()}
+                if isinstance(value, (list, tuple)):
+                    return [_make_json_safe(v) for v in value]
+                if isinstance(value, set):
+                    # Sets are unordered; sort for deterministic JSON representation
+                    return [
+                        _make_json_safe(v)
+                        for v in sorted(value, key=lambda item: str(item))
+                    ]
+                if isinstance(value, bytes):
+                    try:
+                        encoded = base64.b64encode(value).decode("ascii")
+                    except (UnicodeDecodeError, binascii.Error):
+                        encoded = str(value)
+                    return {"encoding": "base64", "value": encoded}
+                return str(value)
+
             # Apply prefix override if URI config manager is available
             if base_uri and self.dut_manager and self.dut_manager.uri_config_manager:
                 base_uri = self.dut_manager.uri_config_manager._apply_prefix_override(
@@ -11813,6 +17631,98 @@ class RedfishService(BaseService):
                     operation_name="command_executor",
                     additional_context={"command_config": command_config},
                 )
+
+            # === PRE-CHECK ENDPOINT ===
+            # Verify the base endpoint exists before running commands
+            # This prevents wasting time on 48+ commands if the endpoint doesn't exist
+            await self._log_runtime(
+                "INFO",
+                "RedfishService",
+                f"Pre-checking endpoint availability: {base_uri}",
+                dut_id,
+            )
+
+            # For POST endpoints, we need to check if the Actions endpoint exists
+            # Extract the base path without the action part
+            endpoint_check_uri = base_uri
+            if "/Actions/" in base_uri:
+                # For action URIs, check the parent resource
+                endpoint_check_uri = base_uri.split("/Actions/")[0]
+
+            success, response, _ = await self.dispatch_request(
+                dut_id, "GET", endpoint_check_uri
+            )
+
+            if not success:
+                skip_message = (
+                    f"Endpoint not available: {endpoint_check_uri}. "
+                    f"The command executor service may not be supported on this baseboard."
+                )
+                await self._log_runtime(
+                    "WARNING",
+                    "RedfishService",
+                    skip_message,
+                    dut_id,
+                )
+                return await self._create_standardized_collector_result(
+                    successful_operations=0,
+                    total_operations=0,
+                    output_files=[],
+                    error_messages=[],
+                    operation_name="command_executor",
+                    additional_context={
+                        "status": "skipped",
+                        "reason": skip_message,
+                        "endpoint_checked": endpoint_check_uri,
+                    },
+                    dut_id=dut_id,
+                    collector_id=kwargs.get("collector_id"),
+                )
+
+            # If this is an Actions endpoint, also verify the action is supported
+            if "/Actions/" in base_uri:
+                actions = response.get("Actions", {})
+                # Extract action name
+                action_parts = base_uri.split("/Actions/")[-1].split("/")
+                action_name = action_parts[0] if action_parts else ""
+
+                if action_name:
+                    oem_actions = actions.get("Oem", {})
+                    action_key = f"#{action_name}"
+                    if action_key not in oem_actions and action_name not in str(
+                        actions
+                    ):
+                        skip_message = (
+                            f"Action '{action_name}' not supported on this endpoint. "
+                            f"Available actions: {list(actions.keys())}"
+                        )
+                        await self._log_runtime(
+                            "WARNING",
+                            "RedfishService",
+                            skip_message,
+                            dut_id,
+                        )
+                        return await self._create_standardized_collector_result(
+                            successful_operations=0,
+                            total_operations=0,
+                            output_files=[],
+                            error_messages=[],
+                            operation_name="command_executor",
+                            additional_context={
+                                "status": "skipped",
+                                "reason": skip_message,
+                                "action_name": action_name,
+                            },
+                            dut_id=dut_id,
+                            collector_id=kwargs.get("collector_id"),
+                        )
+
+            await self._log_runtime(
+                "INFO",
+                "RedfishService",
+                f"Endpoint pre-check passed: {endpoint_check_uri}",
+                dut_id,
+            )
 
             # Get device discovery configuration
             use_firmware_inventory = device_discovery.get(
@@ -11882,6 +17792,19 @@ class RedfishService(BaseService):
             status_list = []
             error_messages = []
 
+            # === FAIL-FAST CONFIGURATION ===
+            # Stop a command group if consecutive failures exceed threshold
+            fail_fast_threshold = command_config.get("fail_fast_threshold", 3)
+            fail_fast_enabled = command_config.get("fail_fast_enabled", True)
+
+            # Track overall failure patterns for early termination
+            total_commands_attempted = 0
+            total_commands_failed = 0
+            consecutive_500_errors = 0
+            max_consecutive_500_for_abort = (
+                5  # Abort entire collector if 5 consecutive 500s
+            )
+
             # Process each command group
             for group in command_groups:
                 group_name = group.get("name", "unknown_group")
@@ -11929,10 +17852,27 @@ class RedfishService(BaseService):
                     dut_id,
                 )
 
+                # Track failures within this command group for fail-fast
+                group_consecutive_failures = 0
+                group_failure_reason = None
+                group_skipped = False
+
                 # Execute commands for each device instance
                 for device_instance in device_instances:
+                    # Check if we should skip remaining commands in this group due to fail-fast
+                    if group_skipped:
+                        await self._log_runtime(
+                            "INFO",
+                            "RedfishService",
+                            f"Skipping remaining commands in group {group_name} due to fail-fast (device {device_instance})",
+                            dut_id,
+                        )
+                        break
+
                     for command in commands:
-                        task = command.get("task", "unknown_task")
+                        task = command.get("task", "unknown_task").replace(
+                            "{device_instance}", str(device_instance)
+                        )
                         action = command.get("action", "POST")
                         payload_template = command.get("payload_template", {})
                         output_pattern = command.get("output_pattern", "")
@@ -11980,6 +17920,20 @@ class RedfishService(BaseService):
                         )
 
                         if success:
+                            request_entry = {
+                                "method": action,
+                                "uri": base_uri,
+                                "group": group_name,
+                                "device_type": device_type,
+                                "device_instance": device_instance,
+                                "payload": _make_json_safe(payload),
+                            }
+                            response_entry = _make_json_safe(response_data)
+                            record = {
+                                "request": request_entry,
+                                "response": response_entry,
+                            }
+
                             # Save response
                             if output_pattern:
                                 final_output_pattern = output_pattern
@@ -12006,7 +17960,7 @@ class RedfishService(BaseService):
 
                                 file_path = await self._save_data_with_common_pattern(
                                     dut_id,
-                                    response_data,
+                                    record,
                                     function_tag,
                                     output_pattern=final_output_pattern,
                                     substitutions={
@@ -12024,7 +17978,14 @@ class RedfishService(BaseService):
                             if is_long_running:
                                 await asyncio.sleep(wait_time)
 
+                            # Reset failure counters on success
+                            group_consecutive_failures = 0
+                            consecutive_500_errors = 0
+                            total_commands_attempted += 1
+
                         if not success:
+                            total_commands_attempted += 1
+                            total_commands_failed += 1
                             # Capture detailed error information with HTTP status codes
                             error_msg = f"Command failed: {group_name}/{task} for {device_type} device {device_instance}"
 
@@ -12111,6 +18072,75 @@ class RedfishService(BaseService):
                                     dut_id,
                                 )
 
+                            # === FAIL-FAST TRACKING ===
+                            # Track consecutive failures for this group
+                            group_consecutive_failures += 1
+                            if group_failure_reason is None:
+                                group_failure_reason = error_msg
+
+                            # Track 500-series errors specifically
+                            http_status = (
+                                error_details.get("http_status")
+                                if error_details
+                                else None
+                            )
+                            is_500_error = (
+                                (http_status and 500 <= http_status < 600)
+                                or response_data == "retry"
+                                or "HTTP 5" in str(error_msg)
+                            )
+
+                            if is_500_error:
+                                consecutive_500_errors += 1
+                            else:
+                                consecutive_500_errors = 0  # Reset on non-500 errors
+
+                            # Check if we should skip remaining commands in this group
+                            if (
+                                fail_fast_enabled
+                                and group_consecutive_failures >= fail_fast_threshold
+                            ):
+                                await self._log_runtime(
+                                    "WARNING",
+                                    "RedfishService",
+                                    f"FAIL-FAST: Skipping remaining commands in group '{group_name}' after {group_consecutive_failures} consecutive failures. First error: {group_failure_reason[:200] if group_failure_reason else 'Unknown'}",
+                                    dut_id,
+                                )
+                                group_skipped = True
+
+                            # Check if we should abort the entire collector due to persistent 500 errors
+                            if consecutive_500_errors >= max_consecutive_500_for_abort:
+                                await self._log_runtime(
+                                    "WARNING",
+                                    "RedfishService",
+                                    f"ABORT: Stopping command executor after {consecutive_500_errors} consecutive HTTP 500 errors. The endpoint may be unavailable or not supported.",
+                                    dut_id,
+                                )
+                                # Add summary error message
+                                abort_msg = (
+                                    f"Command executor aborted after {consecutive_500_errors} consecutive HTTP 500 errors. "
+                                    f"Attempted {total_commands_attempted} commands, {total_commands_failed} failed. "
+                                    f"The NSM endpoint may not be supported on this baseboard."
+                                )
+                                error_messages.append(abort_msg)
+
+                                # Return early with partial results
+                                return await self._create_standardized_collector_result(
+                                    successful_operations=total_commands_attempted
+                                    - total_commands_failed,
+                                    total_operations=total_commands_attempted,
+                                    output_files=output_files,
+                                    error_messages=error_messages,
+                                    operation_name="command_executor",
+                                    additional_context={
+                                        "aborted_early": True,
+                                        "abort_reason": "consecutive_500_errors",
+                                        "consecutive_500_count": consecutive_500_errors,
+                                    },
+                                    dut_id=dut_id,
+                                    collector_id=kwargs.get("collector_id"),
+                                )
+
                             # Create error log file for failed command (including POST payload in context)
                             error_log_path = await self._create_error_log_file(
                                 dut_id=dut_id,
@@ -12171,11 +18201,20 @@ class RedfishService(BaseService):
             )
 
             if total_operations == 0:
-                # No operations attempted - treat as skipped
+                complete_on_empty_targets = kwargs.get(
+                    "complete_on_empty_targets", False
+                )
+                reason_msg = f"No operations attempted for {function_tag} - " + (
+                    "treated as complete"
+                    if complete_on_empty_targets
+                    else "collector skipped"
+                )
+
                 await self._log_runtime(
                     "INFO",
                     "RedfishService",
-                    f"Completed command executor for {function_tag} - no operations attempted, treating as skipped",
+                    f"Completed command executor for {function_tag} - no operations attempted, "
+                    f"treating as {'complete' if complete_on_empty_targets else 'skipped'}",
                     dut_id,
                 )
 
@@ -12185,16 +18224,19 @@ class RedfishService(BaseService):
                     function_tag=function_tag,
                     collection_name=collection_name,
                     total_operations=0,
-                    successful_operations=0,
+                    successful_operations=1 if complete_on_empty_targets else 0,
                     failed_operations=0,
                     output_files=[],
                     additional_details={},
                     kwargs=kwargs,
                 )
 
-                return await self._create_standardized_collector_result(
-                    successful_operations=0,
-                    total_operations=0,
+                # Force status/reason to reflect completion when allowed
+                status_override = "success" if complete_on_empty_targets else "skipped"
+
+                result = await self._create_standardized_collector_result(
+                    successful_operations=1 if complete_on_empty_targets else 0,
+                    total_operations=1 if complete_on_empty_targets else 0,
                     output_files=[],
                     error_messages=[],
                     operation_name="command_executor",
@@ -12202,10 +18244,17 @@ class RedfishService(BaseService):
                         "command_groups_processed": len(command_groups),
                         "total_commands": len(status_list),
                         "successful_commands": successful_operations,
-                        "status": "skipped",
-                        "reason": f"No operations attempted for {function_tag} - collector skipped",
+                        "status": status_override,
+                        "reason": reason_msg,
                     },
                 )
+
+                # Propagate overrides in the execution_result for downstream handling
+                if complete_on_empty_targets:
+                    result["status_override"] = "success"
+                    result["reason_override"] = reason_msg
+
+                return result
             elif successful_operations == 0:
                 # All operations failed - treat as error
                 await self._log_runtime(

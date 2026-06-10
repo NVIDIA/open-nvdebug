@@ -21,7 +21,6 @@ This module contains the CLI handlers for various commands:
 - CLIListCollectors: Handles list-collectors command
 - CLIDefaultCollectors: Handles default-collectors command
 - CLIPreflight: Handles preflight command
-- CLICollector: Handles collect command
 - BaseCLICommand: Base class for common CLI functionality
 """
 
@@ -32,8 +31,10 @@ import os
 import re
 import shutil
 import sys
+import tarfile
 import tempfile
 import time
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
@@ -41,14 +42,6 @@ from typing import Any, Dict, List, Optional, Set
 import aiohttp
 import yaml
 from rich.console import Console
-from rich.progress import (
-    BarColumn,
-    Progress,
-    SpinnerColumn,
-    TaskProgressColumn,
-    TextColumn,
-    TimeElapsedColumn,
-)
 from rich.table import Table
 
 from .config import (
@@ -60,7 +53,6 @@ from .config import (
 from .core.async_logger import AsyncSafeLogger
 from .core.baseboard_manager import BaseboardManager
 from .core.workflow_orchestrator import WorkflowOrchestrator
-from .utils import get_tool_resource_content
 from .utils.console_output import create_sanitized_console
 from .utils.constants import ASCII_HEADER
 from .utils.logging import create_timestamped_log_dir
@@ -69,9 +61,11 @@ from .utils.resources import find_config_directory
 from .utils.sanitizer import (
     create_sanitizer_from_config,
     patch_print_with_sanitizer,
+    sanitize_config_text,
 )
 from .utils.spreadsheet_utils import auto_detect_spreadsheet
 from .utils.validation import display_dut_config_error, run_comprehensive_validation
+from .utils.zip_utils import safe_extract_zip
 
 
 @dataclass
@@ -106,9 +100,27 @@ class ToolConfig:
         collector_group (Optional[List[str]]): Specific collector groups to run.
         skip_collectors (Optional[List[str]]): Collector IDs to skip.
         include_collectors (Optional[List[str]]): Collector IDs to include exclusively.
+        streaming_only (bool): When True, only run collectors marked with
+            ``streaming_candidate: true`` in collector_definitions.yaml.
+            Requires ``stream_destination`` to be set. If ``stream_destination``
+            is provided without this flag, it is automatically enabled.
+        stream_begin (Any): Start of the streaming time window as an absolute
+            UTC timestamp (``YYYYMMDDTHHMMZ``) or a relative hours-ago value.
+        stream_end (Any): End of the streaming time window as an absolute UTC
+            timestamp (``YYYYMMDDTHHMMZ``) or a relative hours-ago value.
+        stream_destination (Optional[str]): Absolute path for streamed log
+            output (e.g. a shared NFS mount like ``/mnt/shared/logs``).
+            When set, this overrides ``output_directory`` as the base path
+            for the timestamped log directory. Must be an absolute,
+            writable path accessible from the machine running the tool.
+        append (bool): Reuse the resolved output directory instead of creating
+            a timestamped run root.
+        rack_id (Optional[str]): Optional rack identifier used as an
+            intermediate directory beneath the stream destination.
         spreadsheet (Optional[str]): Path to collector definitions spreadsheet.
         enable_status_tracking (bool): Enable real-time status tracking.
         disable_live_display (bool): Disable live status display.
+        execution_scheduler (str): Collector scheduler mode (per_dut or legacy_global).
         parallel_dut_sequential_collectors (bool): Run DUTs in parallel, collectors sequential.
         service_grouped_sequential_collectors (bool): Group collectors by service.
         task_id_prefix (str): Prefix for task IDs.
@@ -122,7 +134,7 @@ class ToolConfig:
     retry_count: int = 1
 
     # Output Configuration
-    output_directory: str = "/tmp"
+    output_directory: str = "/tmp/nvdebug"
     skip_zip: bool = False
     skip_zip_split: bool = False
     zip_split_threshold: float = 200.0
@@ -141,6 +153,7 @@ class ToolConfig:
     skip_preflight: bool = False
     skip_sanitization: bool = False
     skip_html_reports: bool = False
+    report_format: str = "spa"  # "legacy", "spa", or "both"
     skip_auto_parse: bool = False
 
     # Collector Configuration
@@ -151,6 +164,14 @@ class ToolConfig:
     skip_collectors: Optional[List[str]] = None
     include_collectors: Optional[List[str]] = None
 
+    # Streaming Configuration
+    streaming_only: bool = False
+    stream_begin: Any = "24"
+    stream_end: Any = "0"
+    stream_destination: Optional[str] = None
+    append: bool = False
+    rack_id: Optional[str] = None
+
     # Configuration files
     spreadsheet: Optional[str] = None
 
@@ -159,6 +180,7 @@ class ToolConfig:
     disable_live_display: bool = False
 
     # Parallelization Configuration
+    execution_scheduler: str = "per_dut"
     parallel_dut_sequential_collectors: bool = True
     service_grouped_sequential_collectors: bool = True
 
@@ -169,6 +191,9 @@ class ToolConfig:
     # Global feature flags / passthroughs
     # H11: Enable nvidia-bug-report extra mode globally when true
     EXTRA_LOG_COLLECTION: Optional[bool] = None
+
+    # I2C Configuration - Global overrides for baseboard i2c_config defaults
+    i2c_config: Optional[Dict[str, Any]] = None
 
     # Skip Flags - Global tool-level settings
     SKIP_PORT_FW: bool = False
@@ -207,10 +232,38 @@ class ToolConfig:
     NVLINK_OOB_URI: List[str] = field(default_factory=list)
 
     # Custom Dump Services Configuration - Global tool-level settings
-    CUSTOM_DUMP_SERVICES: List[str] = field(default_factory=list)
+    CUSTOM_DUMP_SERVICES: List[Dict[str, Any]] = field(default_factory=list)
 
     # Post Codes URI Configuration - Global tool-level settings
     POST_CODES_URI: List[str] = field(default_factory=list)
+
+    # Preflight credential validation configuration
+    preflight_config: Optional[Dict[str, Any]] = None
+
+    # Redfish session configuration (connection pool settings)
+    redfish_session_config: Optional[Dict[str, Any]] = None
+
+    # URI and Redfish pagination guardrails
+    uri_overrides: Optional[Dict[str, Any]] = None
+    max_pagination_pages: int = 100
+    max_duplicate_url_retries: int = 3
+
+    def __post_init__(self) -> None:
+        self.report_format = str(self.report_format or "spa").strip().lower()
+        if self.report_format not in {"legacy", "spa", "both"}:
+            raise ValueError(
+                "Invalid report_format value "
+                f"{self.report_format!r}; expected 'legacy', 'spa', or 'both'"
+            )
+
+        self.execution_scheduler = (
+            str(self.execution_scheduler or "per_dut").strip().lower()
+        )
+        if self.execution_scheduler not in {"per_dut", "legacy_global"}:
+            raise ValueError(
+                "Invalid execution_scheduler value "
+                f"{self.execution_scheduler!r}; expected 'per_dut' or 'legacy_global'"
+            )
 
 
 @dataclass
@@ -266,7 +319,7 @@ class CLIConfig:
     host_ip: Optional[str] = None
     host_user: Optional[str] = None
     host_pass: Optional[str] = None
-    host_ssh_port: Optional[str] = None
+    host_ssh_port: Optional[int] = None
     host_ssh_key_path: Optional[str] = None
     host_ssh_passwordless: bool = False
     host_ssh_max_retries: Optional[int] = 3
@@ -284,7 +337,6 @@ class CLIConfig:
     hmc_http_port: Optional[int] = None
     hmc_https_port: Optional[int] = None
     hmc_use_https: bool = False
-    hmc_use_port_forwarding: bool = False
     use_port_forwarding: bool = False
     tunnel_tcp_port: Optional[int] = None
     setup_port_forwarding: Optional[bool] = None
@@ -310,6 +362,7 @@ class CLIConfig:
     skip_preflight: bool = False
     skip_sanitization: bool = False
     skip_html_reports: bool = False
+    report_format: str = "spa"  # "legacy", "spa", or "both"
 
 
 class CLICollector:
@@ -336,6 +389,8 @@ class CLICollector:
         self,
         tool_config: ToolConfig,
         dut_configs: List["DUTConfig"],
+        source_tool_config: Optional[Path] = None,
+        source_dut_config: Optional[Path] = None,
         enable_status_tracking: bool = True,
         disable_live_display: bool = False,
         skip_validation: bool = False,
@@ -352,6 +407,10 @@ class CLICollector:
         """
         self.tool_config = tool_config
         self.dut_configs = dut_configs
+        # Track original config file paths (CLI-provided or auto-detected) so we can
+        # archive them into the run-level log directory.
+        self.source_tool_config = source_tool_config
+        self.source_dut_config = source_dut_config
         self.enable_status_tracking = enable_status_tracking
         self.disable_live_display = disable_live_display
         self.skip_validation = skip_validation
@@ -415,11 +474,18 @@ class CLICollector:
                     "hmc_http_port": config.hmc_http_port,
                     "hmc_https_port": config.hmc_https_port,
                     "hmc_use_https": config.hmc_use_https,
-                    "use_port_forwarding": config.use_port_forwarding
-                    or config.hmc_use_port_forwarding,
+                    "use_port_forwarding": config.use_port_forwarding,
                     "tunnel_tcp_port": config.tunnel_tcp_port,
-                    "setup_port_forwarding": config.setup_port_forwarding,
-                    "force_port_fw": config.force_port_fw,
+                    "setup_port_forwarding": (
+                        config.setup_port_forwarding
+                        if config.setup_port_forwarding is not None
+                        else False
+                    ),
+                    "force_port_fw": (
+                        config.force_port_fw
+                        if config.force_port_fw is not None
+                        else False
+                    ),
                     "rf_hmc_access_method": config.hmc_access_method,
                     # SSH Proxy Configuration
                     "ssh_proxy_host": config.ssh_proxy_host,
@@ -442,6 +508,7 @@ class CLICollector:
             # Note: Temporary files don't need sanitization as they're cleaned up
             yaml.dump(dut_config_data, tmp_file)
             dut_config = Path(tmp_file.name)
+        os.chmod(tmp_file.name, 0o600)
 
         sanitized_console = create_sanitized_console()
         sanitized_console.print_warning(
@@ -493,10 +560,18 @@ class CLICollector:
             "SERVICE_GROUPED_SEQUENTIAL_COLLECTORS": tool_config.service_grouped_sequential_collectors,
             # Add skip flags for orchestrator
             "skip_html_reports": tool_config.skip_html_reports,
+            "report_format": tool_config.report_format,
             "skip_zip": tool_config.skip_zip,
             "skip_zip_split": tool_config.skip_zip_split,
             "zip_split_threshold": tool_config.zip_split_threshold,
             "skip_auto_parse": tool_config.skip_auto_parse,
+            # Streaming configuration
+            "streaming_only": tool_config.streaming_only,
+            "stream_begin": tool_config.stream_begin,
+            "stream_end": tool_config.stream_end,
+            "stream_destination": tool_config.stream_destination,
+            "append": tool_config.append,
+            "rack_id": tool_config.rack_id,
         }
 
         # Create temporary tool config file
@@ -506,6 +581,7 @@ class CLICollector:
             # Note: Temporary files don't need sanitization as they're cleaned up
             yaml.dump(tool_config_data, tmp_file)
             tool_config = Path(tmp_file.name)
+        os.chmod(tmp_file.name, 0o600)
 
         # Note: This is a static method, so we create a temporary sanitized console
         sanitized_console = create_sanitized_console()
@@ -692,200 +768,62 @@ class CLICollector:
         # Use the tool start time for overall runtime tracking
         start_time = self.tool_start_time
 
-        # Create early sanitizer for validation messages to avoid exposing usernames
         current_username = getpass.getuser()
-        early_sanitizer = create_sanitizer_from_config(
-            {},
-            enabled=True,
-            extra_strings=[current_username] if current_username else [],
-        )
+        extra_strings = [current_username] if current_username else []
 
-        try:
-            # Run final validation with config manager before starting collection (only if not skipped)
-            if not self.skip_validation:
-
-                # Prepare CLI credentials for validation
-                cli_credentials = {}
-                if self.dut_configs:
-                    # Validate each DUT separately to ensure all configurations are valid
-                    validation_errors = []
-                    for dut_config in self.dut_configs:
-                        dut_credentials = {
-                            "bmc_ip": dut_config.bmc_ip,
-                            "bmc_user": dut_config.bmc_user,
-                            "bmc_pass": dut_config.bmc_pass,
-                            "host_ip": dut_config.host_ip,
-                            "host_user": dut_config.host_user,
-                            "host_pass": dut_config.host_pass,
-                        }
-
-                        # Validate this DUT's configuration
-                        is_valid, errors = run_comprehensive_validation(
-                            dut_config=dut_config,
-                            local=getattr(dut_config, "local", False),
-                            cli_credentials=dut_credentials,
-                            collector_ids=self.tool_config.collector_id,
-                            collector_groups=self.tool_config.collector_group,
-                            collection_level=self.tool_config.collection_level,
-                            output_dir=Path(self.tool_config.output_directory),
-                            config_manager=None,
-                        )
-
-                        if not is_valid:
-                            validation_errors.extend(
-                                [f"DUT {dut_config.name}: {error}" for error in errors]
-                            )
-
-                    # Validate credentials for all DUTs to ensure they're complete
-                    all_validation_errors = []
-
-                    for dut_config in self.dut_configs:
-                        cli_credentials = {
-                            "bmc_ip": dut_config.bmc_ip,
-                            "bmc_user": dut_config.bmc_user,
-                            "bmc_pass": dut_config.bmc_pass,
-                            "host_ip": dut_config.host_ip,
-                            "host_user": dut_config.host_user,
-                            "host_pass": dut_config.host_pass,
-                        }
-
-                        # Run validation for this DUT's credentials
-                        is_valid, validation_errors = run_comprehensive_validation(
-                            dut_config=None,  # Already validated
-                            local=getattr(
-                                dut_config, "local", False
-                            ),  # Use DUT's local setting
-                            cli_credentials=cli_credentials,
-                            collector_ids=self.tool_config.collector_id,
-                            collector_groups=self.tool_config.collector_group,
-                            collection_level=self.tool_config.collection_level,
-                            output_dir=Path(self.tool_config.output_directory),
-                            config_manager=None,  # Will be set after orchestrator initialization
-                        )
-
-                        if not is_valid:
-                            all_validation_errors.extend(
-                                [
-                                    f"DUT {dut_config.name}: {error}"
-                                    for error in validation_errors
-                                ]
-                            )
-
-                    # Report any DUT-specific validation errors
-                    if validation_errors:
-                        for error in validation_errors:
-                            sanitized_error = early_sanitizer.sanitize(str(error))
-                            print(f"Validation error: {sanitized_error}")
-
-                    # Report any credential validation errors
-                    if all_validation_errors:
-                        for error in all_validation_errors:
-                            sanitized_error = early_sanitizer.sanitize(str(error))
-                            print(f"Credential validation error: {sanitized_error}")
-
-                # Note: We don't exit here as this is just a final validation check
-                # The main validation should have already been done in main.py
-                if not is_valid:
-                    # Log validation errors but continue (they should have been caught earlier)
-                    for error in validation_errors:
-                        sanitized_error = early_sanitizer.sanitize(str(error))
-                        print(f"Validation warning: {sanitized_error}")
-
-        except Exception as e:
-            # If validation fails, log but continue
-            sanitized_error = early_sanitizer.sanitize(str(e))
-            print(f"Validation check failed: {sanitized_error}")
+        processed_cids = []
 
         try:
             # Create tool config file from ToolConfig object
             config_file = self.create_tool_config_from_object(self.tool_config)
 
-            # Create timestamped log directory
-            timestamped_log_dir = create_timestamped_log_dir(
-                self.tool_config.output_directory
+            output_base = (
+                self.tool_config.stream_destination
+                if self.tool_config.streaming_only
+                and self.tool_config.stream_destination
+                else self.tool_config.output_directory
             )
-            log_dir = Path(timestamped_log_dir)
+            if self.tool_config.rack_id:
+                output_base = os.path.join(output_base, self.tool_config.rack_id)
+
+            if self.tool_config.append:
+                log_dir = Path(output_base)
+            else:
+                timestamped_log_dir = create_timestamped_log_dir(output_base)
+                log_dir = Path(timestamped_log_dir)
             log_dir.mkdir(parents=True, exist_ok=True)
 
-            # Load tool config to check sanitization settings first
-            tool_config_obj = load_config(config_file) if config_file else None
-
-            # Determine sanitization setting (sanitize by default, CLI can disable)
-            sanitization_enabled = True  # Default: always sanitize
-            if self.tool_config.skip_sanitization:
-                sanitization_enabled = False
-            elif (
-                tool_config_obj
-                and hasattr(tool_config_obj, "sanitization")
-                and tool_config_obj.sanitization
-            ):
-                # Check new sanitization format
-                if (
-                    isinstance(tool_config_obj.sanitization, dict)
-                    and "enabled" in tool_config_obj.sanitization
-                ):
-                    sanitization_enabled = tool_config_obj.sanitization["enabled"]
-            elif tool_config_obj and hasattr(tool_config_obj, "LogSanitization"):
-                # Check legacy LogSanitization format
-                sanitization_enabled = tool_config_obj.LogSanitization
-
-            # Set global sanitization setting for early print statements in config.py
+            sanitization_enabled = not self.tool_config.skip_sanitization
             set_global_sanitization_enabled(sanitization_enabled)
 
-            # Note: This is before sanitized_console is initialized, so we create a temporary one
-            # Create a basic sanitizer for early messages that respects the sanitization setting
-            current_username = getpass.getuser()
-            extra_strings = [current_username] if current_username else []
-            early_sanitizer = create_sanitizer_from_config(
-                {}, enabled=sanitization_enabled, extra_strings=extra_strings
-            )
-
-            sanitized_console = create_sanitized_console(early_sanitizer)
-            sanitized_console.print_success(
-                f"Created timestamped log directory: {log_dir}"
-            )
-            # Note: --sanitize flag is redundant since sanitization is enabled by default
-
-            # Always create a sanitizer, but with enabled=False if sanitization is disabled
-            # Load DUT config for sanitization
-            # Convert DUT config objects to dictionary format for sanitizer
-            dut_config_data = {}
-            for dut in self.dut_configs:
-                dut_config_data[dut.name] = dut.__dict__
-
-            # Add current username to sanitizer to mask paths
-            current_username = getpass.getuser()
-            extra_strings = [current_username] if current_username else []
-
-            # Create sanitizer (enabled or disabled based on setting)
+            dut_config_data = {dut.name: dut.__dict__ for dut in self.dut_configs}
             self.sanitizer = create_sanitizer_from_config(
                 dut_config_data,
                 enabled=sanitization_enabled,
                 extra_strings=extra_strings,
             )
-
-            # Patch print function
             patch_print_with_sanitizer(self.sanitizer)
-
             self.sanitized_console = create_sanitized_console(self.sanitizer)
+
             if sanitization_enabled:
                 self.sanitized_console.print_warning("Log sanitization enabled")
             else:
                 self.sanitized_console.print_warning("Log sanitization disabled")
 
+            if self.tool_config.append:
+                self.sanitized_console.print_success(
+                    f"Using append-mode log directory: {log_dir}"
+                )
+            else:
+                self.sanitized_console.print_success(
+                    f"Created timestamped log directory: {log_dir}"
+                )
+
+            # Archive config files into the run directory (sanitized, best-effort)
+            self._archive_config_files(log_dir)
+
             # Print ASCII header to console
             self.sanitized_console.print_info(ASCII_HEADER)
-
-            # Start timing for configuration loading
-            if (
-                hasattr(self, "orchestrator")
-                and self.orchestrator
-                and hasattr(self.orchestrator, "timing_manager")
-                and self.orchestrator.timing_manager
-            ):
-                self.orchestrator.timing_manager.start_component(
-                    "configuration_loading"
-                )
 
             # Create orchestrator with ToolConfig object
             self.orchestrator = WorkflowOrchestrator(
@@ -988,632 +926,74 @@ class CLICollector:
                 await self.orchestrator.logger.log_runtime(
                     "WARN",
                     "CLICollector",
-                    f"DUTs without baseboard configured: {duts_without_baseboard}",
+                    f"DUTs without baseboard configured: {duts_without_baseboard} - will attempt auto-detection after preflight checks",
                 )
                 self.sanitized_console.print_warning(
-                    f"\n\nWarning: DUTs without baseboard configured: {', '.join(duts_without_baseboard)}"
-                )
-
-            if duts_without_baseboard:
-                await self.orchestrator.logger.log_runtime(
-                    "INFO",
-                    "CLICollector",
-                    "Some DUTs have no baseboard specified - will attempt auto-detection after preflight checks",
+                    f"\n\nDUTs without baseboard configured: {', '.join(duts_without_baseboard)}"
                 )
                 self.sanitized_console.print_info(
-                    "Some DUTs have no baseboard specified - will attempt auto-detection from hardware/system information after preflight checks"
+                    "Auto-detection will be attempted from hardware/system information after preflight checks"
                 )
 
-            # Process collector IDs and groups
-            processed_cids = []
-            group_cids = []
-            specific_cids = []
-            current_level = self.tool_config.collection_level
-            await self.orchestrator.logger.log_runtime(
-                "DEBUG",
-                "CLICollector",
-                f"Collection level from tool config: {current_level}",
-            )
-
-            # Process include_collectors from CLI arguments
-            # Note: include_collectors are added to the final list, not processed as specific_cids
-            include_collectors = self.tool_config.include_collectors or []
-
-            # Get baseboard information for filtering
-            baseboard_info = None
-            if self.orchestrator.dut_manager:
-                dut_ids_for_baseboard = self.orchestrator.dut_manager.get_all_dut_ids()
-                if dut_ids_for_baseboard:
-                    # Get baseboard info from all DUTs for logging purposes
-                    baseboards = set()
-                    for dut_id in dut_ids_for_baseboard:
-                        dut = self.orchestrator.dut_manager.get_dut(dut_id)
-                        if dut and dut.config:
-                            baseboard = dut.config.get("baseboard", "Unknown")
-                            baseboards.add(baseboard)
-
-                    # Log baseboard information for transparency
-                    if len(baseboards) == 1:
-                        baseboard_info = list(baseboards)[0]
-                        await self.orchestrator.logger.log_runtime(
-                            "INFO",
-                            "CLICollector",
-                            f"Single baseboard detected: {baseboard_info}",
-                        )
-                    elif len(baseboards) > 1:
-                        # Multiple baseboards detected - no global filtering, per-DUT filtering will occur during execution
-                        baseboard_list = list(baseboards)
-                        await self.orchestrator.logger.log_runtime(
-                            "INFO",
-                            "CLICollector",
-                            f"Multiple baseboards detected ({', '.join(baseboard_list)}). No global baseboard filtering applied - each DUT will filter collectors based on its own baseboard during execution.",
-                        )
-                        self.sanitized_console.print_info(
-                            f"\n\nMultiple baseboards detected ({', '.join(baseboard_list)}). Each DUT will filter collectors based on its own baseboard during execution."
-                        )
-                        # Set baseboard_info to None to indicate no global filtering
-                        # Per-DUT filtering will occur during execution for each DUT's specific baseboard
-                        baseboard_info = None
-                    else:
-                        baseboard_info = "Unknown"
-                        # This is a critical error - all DUTs must have baseboard configured
-                        raise ValueError(
-                            f"CRITICAL ERROR: All DUTs must have baseboard configured. Found DUTs with unknown baseboard. Please configure baseboard in DUT config for all DUTs."
-                        )
-
-            # Handle collector groups first - filter by collection level and baseboard
-            if self.tool_config.collector_group:
-                await self.orchestrator.logger.log_runtime(
-                    "INFO",
-                    "CLICollector",
-                    f"Processing collector groups: {self.tool_config.collector_group} for level {current_level}",
-                )
-                self.sanitized_console.print_info(
-                    f"Processing collector groups: {', '.join(self.tool_config.collector_group)} for level {current_level}"
-                )
-
-                for group in self.tool_config.collector_group:
-                    group_collectors = (
-                        self.orchestrator.config_manager.get_collectors_for_group(group)
-                    )
-                    if group_collectors:
-                        # Filter collectors by collection level and baseboard
-                        level_filtered_collectors = []
-                        baseboard_filtered_collectors = []
-
-                        for (
-                            collector_id,
-                            collector_info,
-                        ) in group_collectors.items():
-                            collector_level = collector_info.get(
-                                "collection_level", "L1"
-                            )
-                            if self.orchestrator._is_collector_level_applicable(
-                                collector_level, current_level
-                            ):
-                                level_filtered_collectors.append(collector_id)
-
-                                # Apply baseboard filtering only if we have a single baseboard
-                                if baseboard_info is None:
-                                    # No global filtering - include all collectors, per-DUT baseboard filtering will occur during execution
-                                    baseboard_filtered_collectors.append(collector_id)
-                                elif self.orchestrator.is_collector_applicable_for_baseboard(
-                                    collector_info, baseboard_info
-                                ):
-                                    baseboard_filtered_collectors.append(collector_id)
-                                else:
-                                    await self.orchestrator.logger.log_runtime(
-                                        "WARN",
-                                        "CLICollector",
-                                        f"Collector {collector_id} in group '{group}' is not applicable for baseboard {baseboard_info} - skipping",
-                                    )
-
-                        group_cids.extend(baseboard_filtered_collectors)
-                        if baseboard_info is None:
-                            await self.orchestrator.logger.log_runtime(
-                                "INFO",
-                                "CLICollector",
-                                f"Found {len(baseboard_filtered_collectors)} collectors in group '{group}' for level {current_level} (no global baseboard filtering - per-DUT filtering will occur during execution): {baseboard_filtered_collectors}",
-                            )
-                            self.sanitized_console.print_info(
-                                f"Found {len(baseboard_filtered_collectors)} collectors in group '{group}' for level {current_level} (per-DUT baseboard filtering during execution): {', '.join(baseboard_filtered_collectors)}"
-                            )
-                        else:
-                            await self.orchestrator.logger.log_runtime(
-                                "INFO",
-                                "CLICollector",
-                                f"Found {len(baseboard_filtered_collectors)} collectors in group '{group}' for level {current_level} and baseboard {baseboard_info}: {baseboard_filtered_collectors}",
-                            )
-                            self.sanitized_console.print_info(
-                                f"Found {len(baseboard_filtered_collectors)} collectors in group '{group}' for level {current_level} and baseboard {baseboard_info}: {', '.join(baseboard_filtered_collectors)}"
-                            )
-
-                        # Log if some collectors were filtered out due to level or baseboard
-                        total_in_group = len(group_collectors)
-                        level_filtered_out = total_in_group - len(
-                            level_filtered_collectors
-                        )
-                        baseboard_filtered_out = len(level_filtered_collectors) - len(
-                            baseboard_filtered_collectors
-                        )
-
-                        if level_filtered_out > 0:
-                            await self.orchestrator.logger.log_runtime(
-                                "INFO",
-                                "CLICollector",
-                                f"Filtered out {level_filtered_out} collectors from group '{group}' that don't match level {current_level}",
-                            )
-                            self.sanitized_console.print_info(
-                                f"Filtered out {level_filtered_out} collectors from group '{group}' that don't match level {current_level}"
-                            )
-
-                        if baseboard_filtered_out > 0:
-                            if baseboard_info is None:
-                                await self.orchestrator.logger.log_runtime(
-                                    "INFO",
-                                    "CLICollector",
-                                    f"Note: {baseboard_filtered_out} collectors from group '{group}' may be filtered out during execution based on individual DUT baseboards",
-                                )
-                                self.sanitized_console.print_info(
-                                    f"Note: {baseboard_filtered_out} collectors from group '{group}' may be filtered out during execution based on individual DUT baseboards"
-                                )
-                            else:
-                                await self.orchestrator.logger.log_runtime(
-                                    "INFO",
-                                    "CLICollector",
-                                    f"Filtered out {baseboard_filtered_out} collectors from group '{group}' that don't match baseboard {baseboard_info}",
-                                )
-                                self.sanitized_console.print_info(
-                                    f"Filtered out {baseboard_filtered_out} collectors from group '{group}' that don't match baseboard {baseboard_info}"
-                                )
-                    else:
-                        await self.orchestrator.logger.log_runtime(
-                            "WARN",
-                            "CLICollector",
-                            f"No collectors found for group '{group}'",
-                        )
-                        self.sanitized_console.print_warning(
-                            f"No collectors found for group '{group}'"
-                        )
-
-            # Handle specific collector IDs (these are added regardless of level since user explicitly wants them)
-            cids = self.tool_config.collector_id
-            if cids:
-                await self.orchestrator.logger.log_runtime(
-                    "INFO",
-                    "CLICollector",
-                    f"Processing specific collector IDs: {cids}",
-                )
-                self.sanitized_console.print_info(
-                    f"\n\nProcessing specific collector IDs: {cids}"
-                )
-
-                # Split by spaces first, then handle commas within each item
-                cid_items = cids.split()
-                for cid_item in cid_items:
-                    if "," in cid_item:
-                        # Handle comma-separated items: "R1,R2" or "I4,I5"
-                        split_items = [item.strip() for item in cid_item.split(",")]
-                        specific_cids.extend(split_items)
-                    else:
-                        # Handle space-separated items: "I2" or "I3"
-                        specific_cids.append(cid_item.strip())
-
-            # Combine group and specific collectors, with specific collectors taking precedence
-            if specific_cids and group_cids:
-                # Start with group collectors
-                processed_cids = group_cids.copy()
-
-                # Add specific collectors (they will override any duplicates from groups)
-                for cid in specific_cids:
-                    if cid in processed_cids:
-                        await self.orchestrator.logger.log_runtime(
-                            "INFO",
-                            "CLICollector",
-                            f"Specific collector ID '{cid}' overrides group selection",
-                        )
-                        self.sanitized_console.print_info(
-                            f"Specific collector ID '{cid}' overrides group selection"
-                        )
-                    processed_cids.append(cid)
-
-                await self.orchestrator.logger.log_runtime(
-                    "INFO",
-                    "CLICollector",
-                    f"Combined group and specific collectors: {processed_cids}",
-                )
-                self.sanitized_console.print_info(
-                    f"Combined group and specific collectors: {', '.join(processed_cids)}"
-                )
-
-            elif specific_cids:
-                # Only specific IDs specified
-                processed_cids = specific_cids
-                await self.orchestrator.logger.log_runtime(
-                    "INFO",
-                    "CLICollector",
-                    f"Using specific collector IDs: {specific_cids}",
-                )
-                self.sanitized_console.print_info(
-                    f"Using specific collector IDs: {', '.join(specific_cids)}"
-                )
-
-            elif group_cids:
-                # Only groups specified
-                processed_cids = group_cids
-                await self.orchestrator.logger.log_runtime(
-                    "INFO",
-                    "CLICollector",
-                    f"Using collectors from groups for level {current_level}: {group_cids}",
-                )
-                self.sanitized_console.print_info(
-                    f"Using collectors from groups for level {current_level}: {', '.join(group_cids)}"
-                )
-
-            else:
-                # Neither specified - will run all applicable collectors
-                await self.orchestrator.logger.log_runtime(
-                    "INFO",
-                    "CLICollector",
-                    f"No specific collectors or groups specified - will run all applicable collectors for level {current_level}",
-                )
-                self.sanitized_console.print_info(
-                    f"\nNo specific collectors or groups specified - will run all applicable collectors for level {current_level}\n"
-                )
-                # Get all collectors for the current level
-                all_collectors = self.orchestrator.get_all_collectors(current_level)
-                processed_cids = list(all_collectors.keys())
-                await self.orchestrator.logger.log_runtime(
-                    "INFO",
-                    "CLICollector",
-                    f"Using all {len(processed_cids)} collectors for level {current_level}",
-                )
-
-            # Apply include_collectors as a filter (only these collectors will run)
-            # This overrides any previous selection (groups, specific collectors, etc.)
-            if include_collectors:
-                await self.orchestrator.logger.log_runtime(
-                    "INFO",
-                    "CLICollector",
-                    f"Applying --include-collectors filter (only these collectors will run): {include_collectors}",
-                )
-
-                # If other collectors were selected (via -g or -S), take the intersection
-                # Otherwise, use include_collectors as the full list
-                if processed_cids:
-                    # Intersection: only include collectors that are in BOTH lists
-                    original_count = len(processed_cids)
-                    processed_cids = [
-                        cid for cid in processed_cids if cid in include_collectors
-                    ]
-                    filtered_out = original_count - len(processed_cids)
-
-                    if filtered_out > 0:
-                        await self.orchestrator.logger.log_runtime(
-                            "INFO",
-                            "CLICollector",
-                            f"Filtered out {filtered_out} collectors that were not in --include-collectors list",
-                        )
-                        self.sanitized_console.print_info(
-                            f"Applied --include-collectors filter: {filtered_out} collectors from groups/selection were filtered out"
-                        )
-
-                    # Add any include_collectors that weren't in the original list
-                    # (this allows including collectors outside of selected groups)
-                    for cid in include_collectors:
-                        if cid not in processed_cids:
-                            # Verify collector exists before adding
-                            collector_info = (
-                                self.orchestrator.config_manager.get_collector_info(cid)
-                            )
-                            if collector_info:
-                                processed_cids.append(cid)
-                                await self.orchestrator.logger.log_runtime(
-                                    "INFO",
-                                    "CLICollector",
-                                    f"Added collector {cid} from --include-collectors (not in original selection)",
-                                )
-                else:
-                    # No other selection was made, use include_collectors as the full list
-                    processed_cids = list(include_collectors)
-
-                # Check for baseboard compatibility warnings for include_collectors
-                if baseboard_info:
-                    # Single baseboard environment
-                    for collector_id in include_collectors:
-                        collector_info = (
-                            self.orchestrator.config_manager.get_collector_info(
-                                collector_id
-                            )
-                        )
-                        if collector_info:
-                            supported_baseboards = collector_info.get(
-                                "applicable_baseboards", []
-                            )
-                            if (
-                                supported_baseboards
-                                and baseboard_info not in supported_baseboards
-                            ):
-                                supported_str = ", ".join(supported_baseboards)
-                                self.sanitized_console.print_warning(
-                                    f"Warning: Collector {collector_id} in --include-collectors is not supported on baseboard '{baseboard_info}'. Supported baseboards: {supported_str}"
-                                )
-                        else:
-                            self.sanitized_console.print_warning(
-                                f"Warning: Collector {collector_id} in --include-collectors not found in collector catalog"
-                            )
-                else:
-                    # Multi-DUT environment - check against all baseboards
-                    if self.orchestrator.dut_manager:
-                        all_baseboards = set()
-                        for dut_id in self.orchestrator.dut_manager.get_all_dut_ids():
-                            dut_config = self.orchestrator.dut_manager.duts[
-                                dut_id
-                            ].config
-                            baseboard = dut_config.get("baseboard", "Unknown")
-                            all_baseboards.add(baseboard)
-
-                        for collector_id in include_collectors:
-                            collector_info = (
-                                self.orchestrator.config_manager.get_collector_info(
-                                    collector_id
-                                )
-                            )
-                            if collector_info:
-                                supported_baseboards = collector_info.get(
-                                    "applicable_baseboards", []
-                                )
-                                if supported_baseboards:
-                                    # Check if collector is supported on ANY of the baseboards
-                                    unsupported_baseboards = all_baseboards - set(
-                                        supported_baseboards
-                                    )
-                                    if unsupported_baseboards:
-                                        supported_str = ", ".join(supported_baseboards)
-                                        unsupported_str = ", ".join(
-                                            sorted(unsupported_baseboards)
-                                        )
-                                        self.sanitized_console.print_warning(
-                                            f"Warning: Collector {collector_id} in --include-collectors is not supported on baseboard(s) '{unsupported_str}'. Supported baseboards: {supported_str}"
-                                        )
-                            else:
-                                self.sanitized_console.print_warning(
-                                    f"Warning: Collector {collector_id} in --include-collectors not found in collector catalog"
-                                )
-
-            # Remove duplicates while preserving order (specific collectors should come after group collectors)
-            if processed_cids:
-                seen = set()
-                unique_cids = []
-                for cid in processed_cids:
-                    if cid not in seen:
-                        seen.add(cid)
-                        unique_cids.append(cid)
-                processed_cids = unique_cids
-
-                await self.orchestrator.logger.log_runtime(
-                    "INFO",
-                    "CLICollector",
-                    f"Final processed CIDs: {processed_cids}",
-                )
-                # self.sanitized_console.print_info(
-                #     f"Processed collector selection: {', '.join(processed_cids)}"
-                # )
-
-            # Get all DUTs for filtering
             dut_ids = self.orchestrator.dut_manager.get_all_dut_ids()
 
             await self.orchestrator.logger.log_runtime(
                 "INFO", "CLICollector", f"Found {len(dut_ids)} DUT(s): {dut_ids}"
             )
+
+            preflight_results = None
+            if getattr(self.tool_config, "dry_run", False):
+                await self.orchestrator.logger.log_runtime(
+                    "INFO",
+                    "CLICollector",
+                    "Skipping preflight checks in dry-run mode",
+                )
+            elif not getattr(self.tool_config, "skip_preflight", False):
+                preflight_results = await self.orchestrator.run_preflight_checks(
+                    show_progress=True
+                )
+                if preflight_results and "error" in preflight_results:
+                    _preflight_err = preflight_results.get(
+                        "error", "Preflight checks failed"
+                    )
+                    _preflight_err_str = (
+                        _preflight_err
+                        if isinstance(_preflight_err, str)
+                        else str(_preflight_err)
+                    )
+                    await self.orchestrator.logger.log_runtime(
+                        "ERROR",
+                        "CLICollector",
+                        f"Preflight checks failed: {_preflight_err_str}",
+                    )
+                    self.sanitized_console.print_error(
+                        f"Preflight checks failed: {_preflight_err_str}"
+                    )
+                    return {
+                        "success": False,
+                        "error": _preflight_err_str,
+                        "preflight_results": preflight_results,
+                    }
+            else:
+                await self.orchestrator.logger.log_runtime(
+                    "INFO",
+                    "CLICollector",
+                    "Skipping preflight checks before autodetection",
+                )
+
+            await self._run_autodetection(dut_ids, preflight_results)
+
+            processed_cids, requested_cids = await self._resolve_collector_selection()
+
             await self.orchestrator.logger.log_runtime(
                 "INFO", "CLICollector", f"Input processed_cids: {processed_cids}"
             )
 
-            # Check if any DUTs need autodetection before filtering
-            duts_needing_autodetection = []
-            for dut_id in dut_ids:
-                dut = self.orchestrator.dut_manager.get_dut(dut_id)
-                if dut and dut.config:
-                    baseboard = dut.config.get("baseboard") or dut.config.get(
-                        "TargetBaseboard"
-                    )
-                    if not baseboard:
-                        duts_needing_autodetection.append(dut_id)
-
-            if duts_needing_autodetection:
-                await self.orchestrator.logger.log_runtime(
-                    "INFO",
-                    "CLICollector",
-                    f"DUTs needing autodetection: {duts_needing_autodetection} - running autodetection before filtering",
-                )
-
-                # Run autodetection for DUTs that need it
-                for dut_id in duts_needing_autodetection:
-                    await self.orchestrator.logger.log_runtime(
-                        "INFO",
-                        "CLICollector",
-                        f"Running autodetection for DUT: {dut_id}",
-                    )
-
-                    # Get non_interactive flag from DUT config
-                    dut = self.orchestrator.dut_manager.get_dut(dut_id)
-                    non_interactive = dut.config.get("non_interactive", False)
-
-                    # Simple console output for autodetection
-                    autodetection_start_time = time.time()
-
-                    self.orchestrator.sanitized_console.console.print(
-                        f"[bold blue]Auto-detecting platform and baseboard for {dut_id}...[/bold blue]"
-                    )
-
-                    # Run autodetection
-                    success, detected_info = (
-                        await self.orchestrator.dut_manager.detect_platform_and_baseboard(
-                            dut_id, {}, non_interactive
-                        )
-                    )
-
-                    # Show completion message with elapsed time
-                    elapsed_time = time.time() - autodetection_start_time
-                    self.orchestrator.sanitized_console.console.print(
-                        f"[green]Auto-detection completed in {elapsed_time:.1f}s![/green]"
-                    )
-
-                    if success:
-                        detected_baseboard = detected_info.get("baseboard")
-                        detected_platform = detected_info.get("platform")
-                        detected_node_type = detected_info.get("node_type")
-
-                        # Validate that we have actual detected values, not None
-                        if not detected_baseboard or not detected_platform:
-                            await self.orchestrator.logger.log_runtime(
-                                "WARNING",
-                                "CLICollector",
-                                f"Autodetection returned success but with invalid values for DUT {dut_id}: Baseboard={detected_baseboard}, Platform={detected_platform}",
-                            )
-                            # Treat this as a detection failure
-                            success = False
-                        else:
-                            await self.orchestrator.logger.log_runtime(
-                                "INFO",
-                                "CLICollector",
-                                f"Autodetection successful for DUT {dut_id}: Baseboard={detected_baseboard}, Platform={detected_platform}, NodeType={detected_node_type}",
-                            )
-
-                            # Update DUT config
-                            dut = self.orchestrator.dut_manager.get_dut(dut_id)
-                            dut.config["baseboard"] = detected_baseboard
-                            dut.config["platform"] = detected_platform
-                            if detected_node_type:
-                                dut.config["node_type"] = detected_node_type
-
-                            # Update the signature files with the newly detected values
-                            await self.orchestrator.logger.create_log_signature(
-                                dut_id, detected_platform, detected_baseboard
-                            )
-                            await self.orchestrator.logger.log_runtime(
-                                "INFO",
-                                "CLICollector",
-                                f"Updated signature files with detected values for DUT {dut_id}",
-                            )
-
-                    if not success:
-                        await self.orchestrator.logger.log_runtime(
-                            "WARNING",
-                            "CLICollector",
-                            f"Autodetection failed for DUT {dut_id} - will continue with unknown baseboard",
-                        )
-
-            # Step 1: Apply all filtering to get final collectors
-            await self.orchestrator.logger.log_runtime(
-                "INFO",
-                "CLICollector",
-                "Applying all filtering (level, baseboard, skip flags, include/exclude)...",
-            )
-
-            filtering_results = await self.orchestrator.execution_engine.get_filtered_collectors_per_dut(
-                processed_cids, dut_ids
-            )
-
-            filtered_collectors_per_dut = filtering_results["filtered_collectors"]
-            skipped_collectors_per_dut = filtering_results["skipped_collectors"]
-
-            # Store pre-filtered results in orchestrator to avoid double filtering
-            self.orchestrator._pre_filtered_results = {
-                "filtered_collectors": filtered_collectors_per_dut,
-                "skipped_collectors": skipped_collectors_per_dut,
-            }
-
-            # Get union of all filtered collectors
-            all_filtered_collectors = set()
-            for dut_collectors in filtered_collectors_per_dut.values():
-                all_filtered_collectors.update(dut_collectors)
-            all_filtered_collectors = list(all_filtered_collectors)
-
-            # Step 2: Print final filtered collectors (regardless of dry run or not)
-            await self.orchestrator.logger.log_runtime(
-                "INFO",
-                "CLICollector",
-                f"Final filtering complete. {len(all_filtered_collectors)} collectors will run.",
-            )
-
-            def natural_sort_key(text):
-                return [
-                    int(c) if c.isdigit() else c.lower()
-                    for c in re.split(r"(\d+)", text)
-                ]
-
-            # Create a Rich table to display filtered collectors per DUT
-            table = Table(title="Filtered Collectors by DUT")
-            table.add_column("DUT Name", style="cyan", no_wrap=True)
-            table.add_column("Baseboard", style="magenta", no_wrap=True)
-            table.add_column("Filtered Collectors", style="green", overflow="fold")
-            table.add_column("Count", style="yellow", justify="right")
-
-            # Sort DUT IDs for consistent display
-            sorted_dut_ids = sorted(filtered_collectors_per_dut.keys())
-
-            for dut_id in sorted_dut_ids:
-                dut_collectors = filtered_collectors_per_dut[dut_id]
-                sorted_collectors = sorted(dut_collectors, key=natural_sort_key)
-
-                # Get baseboard info for this DUT
-                dut_config = self.orchestrator.dut_manager.duts[dut_id].config
-                baseboard = dut_config.get("baseboard", "Unknown")
-
-                # Group collectors by their collection group for better readability
-                collector_groups = {}
-                for collector_id in sorted_collectors:
-                    collector_info = (
-                        self.orchestrator.config_manager.get_collector_info(
-                            collector_id
-                        )
-                    )
-                    if collector_info:
-                        group = collector_info.get("group", "Unknown")
-                        if group not in collector_groups:
-                            collector_groups[group] = []
-                        collector_groups[group].append(collector_id)
-                    else:
-                        # Fallback for collectors not found in config
-                        if "Unknown" not in collector_groups:
-                            collector_groups["Unknown"] = []
-                        collector_groups["Unknown"].append(collector_id)
-
-                # Format collectors by group, one group per line
-                group_lines = []
-                for group in sorted(collector_groups.keys()):
-                    group_collectors = sorted(
-                        collector_groups[group], key=natural_sort_key
-                    )
-                    group_line = f"{group}: {', '.join(group_collectors)}"
-                    group_lines.append(group_line)
-
-                collectors_str = "\n".join(group_lines)
-
-                table.add_row(
-                    dut_id, baseboard, collectors_str, str(len(dut_collectors))
-                )
-
-            # Display the table
-            self.sanitized_console.console.print(table)
-
-            # Also show summary statistics
-            total_unique_collectors = len(all_filtered_collectors)
-            total_duts = len(filtered_collectors_per_dut)
-            avg_collectors_per_dut = (
-                sum(
-                    len(collectors)
-                    for collectors in filtered_collectors_per_dut.values()
-                )
-                / total_duts
-            )
-
-            self.sanitized_console.print_info(
-                f"\nSummary: {total_duts} DUT(s), {total_unique_collectors} unique collectors, "
-                f"{avg_collectors_per_dut:.1f} avg collectors per DUT\n"
-            )
+            (
+                all_filtered_collectors,
+                filtered_collectors_per_dut,
+                skipped_collectors_per_dut,
+            ) = await self._filter_and_display_collectors(processed_cids, dut_ids)
 
             # Step 3: Choose between dry run or actual execution
             if self.tool_config.dry_run:
@@ -1630,12 +1010,6 @@ class CLICollector:
                     "total_collectors": len(all_filtered_collectors),
                 }
             else:
-                # Preflight checks, platform info gathering, and dynamic discovery
-                # are now handled in the new execution flow
-                preflight_results = None
-
-                # Check if this is a multi-DUT operation
-                dut_ids = self.orchestrator.dut_manager.get_all_dut_ids()
                 is_multi_dut = len(dut_ids) > 1
 
                 if is_multi_dut:
@@ -1660,20 +1034,16 @@ class CLICollector:
 
                     if missing_configs:
                         await self.orchestrator.logger.log_runtime(
-                            "ERROR",
+                            "WARNING",
                             "CLICollector",
-                            f"Multi-DUT validation failed: {', '.join(missing_configs)}",
+                            f"Multi-DUT baseboard gaps (auto-detection may have partially failed): {', '.join(missing_configs)}",
                         )
-                        self.sanitized_console.print_error(
-                            "Error: Baseboard must be configured in config files for multi-DUT operations."
+                        self.sanitized_console.print_warning(
+                            f"Warning: Some DUTs are missing baseboard after auto-detection: {', '.join(missing_configs)}"
                         )
-                        self.sanitized_console.print_error(
-                            "Please set baseboard in your DUT configuration files."
+                        self.sanitized_console.print_warning(
+                            "Collection will proceed but collectors may be limited for DUTs without baseboard."
                         )
-                        self.sanitized_console.print_error(
-                            "For multi-DUT operations, detection is disabled to ensure consistency across all DUTs."
-                        )
-                        raise ValueError("Multi-DUT configuration validation failed")
                     else:
                         await self.orchestrator.logger.log_runtime(
                             "INFO",
@@ -1704,10 +1074,6 @@ class CLICollector:
                         "CLICollector",
                         f"Requested collectors: {processed_cids}",
                     )
-                    # self.sanitized_console.print_info(
-                    #     f"Requested collectors: {', '.join(processed_cids)}"
-                    # )
-
                     # Log comprehensive collector selection table
                     await self.orchestrator.log_collector_selection_table(
                         processed_cids
@@ -1719,14 +1085,12 @@ class CLICollector:
                 )
                 self.sanitized_console.print_info("\nExecuting collectors...\n")
 
-                # Use the new execution flow with the already-filtered collectors
-                # Pass original collector list for status tracker initialization
                 results = await self.orchestrator.execute_collectors(
-                    collector_ids=all_filtered_collectors,
+                    filtered_collectors_per_dut=filtered_collectors_per_dut,
+                    skipped_collectors_per_dut=skipped_collectors_per_dut,
                     collection_level=self.tool_config.collection_level,
-                    cli_start_time=start_time,
-                    dry_run=False,
-                    original_collector_ids=processed_cids,
+                    original_collector_ids=requested_cids or processed_cids,
+                    preflight_results=preflight_results,
                 )
 
                 # Get the actual executed collectors from results
@@ -1830,52 +1194,7 @@ class CLICollector:
                         )
 
                     await self.orchestrator.cleanup(total_runtime, processed_cids)
-
-                    # Display final console output after cleanup is complete (including zip creation)
-                    final_console = create_sanitized_console()
-                    final_console.print_success("Collection completed successfully!")
-
-                    # Check if zip archive was created and display its location
-                    if (
-                        hasattr(self.orchestrator, "zip_archive_path")
-                        and self.orchestrator.zip_archive_path
-                    ):
-                        # Handle both single file and split files cases
-                        if isinstance(self.orchestrator.zip_archive_path, list):
-                            # Files were split - display all files
-                            final_console.print_success("Split zip archive created:")
-                            for file_path in self.orchestrator.zip_archive_path:
-                                final_console.print_success(f"  {file_path}")
-
-                            # Show recombine instructions like
-                            base_name = (
-                                os.path.basename(self.orchestrator.zip_archive_path[0])
-                                .replace(".z01", "")
-                                .replace(".zip", "")
-                            )
-                            base_dir = os.path.dirname(
-                                self.orchestrator.zip_archive_path[0]
-                            )
-                            final_console.print_info("\nTo recombine the files:")
-                            final_console.print_info("On Linux/macOS:")
-                            final_console.print_info(
-                                f"  cat {base_name}.z* > {base_name}_combined.zip"
-                            )
-                            final_console.print_info("\nOn Windows (Command Prompt):")
-                            final_console.print_info(
-                                f"  copy /b {base_name}.z* {base_name}_combined.zip"
-                            )
-                            final_console.print_info("\nOn Windows (PowerShell):")
-                            final_console.print_info(
-                                f"  Get-Content {base_name}.z* -Raw -Encoding Byte | Set-Content {base_name}_combined.zip -Encoding Byte"
-                            )
-                        else:
-                            # Single file
-                            final_console.print_success(
-                                f"\nLogs saved to: {self.orchestrator.zip_archive_path}"
-                            )
-                    else:
-                        final_console.print_success(f"\nLogs saved to: {log_dir}")
+                    self._display_final_output(log_dir)
 
                 except Exception as e:
                     # Safely handle console output - create one if not available
@@ -1892,6 +1211,578 @@ class CLICollector:
                     self.sanitized_console.print_warning(
                         f"Warning: Emergency cleanup error: {e}"
                     )
+
+    async def _resolve_collector_selection(self) -> tuple:
+        """Resolve which collectors to run from groups, specific IDs, and include lists.
+
+        Returns (processed_cids, requested_cids) where processed_cids is the
+        deduplicated list of collector IDs to execute and requested_cids is the
+        pre-filter list for summary reporting.
+        """
+        processed_cids = []
+        group_cids = []
+        group_requested_cids = []
+        specific_cids = []
+        requested_cids = []
+        current_level = self.tool_config.collection_level
+        await self.orchestrator.logger.log_runtime(
+            "DEBUG",
+            "CLICollector",
+            f"Collection level from tool config: {current_level}",
+        )
+
+        include_collectors = self.tool_config.include_collectors or []
+
+        # Determine global baseboard info for pre-filtering
+        baseboard_info = None
+        if self.orchestrator.dut_manager:
+            dut_ids = self.orchestrator.dut_manager.get_all_dut_ids()
+            if dut_ids:
+                baseboards = set()
+                for dut_id in dut_ids:
+                    dut = self.orchestrator.dut_manager.get_dut(dut_id)
+                    if dut and dut.config:
+                        bb = dut.config.get("baseboard")
+                        if bb and str(bb).strip():
+                            baseboards.add(str(bb))
+
+                if len(baseboards) == 1:
+                    baseboard_info = list(baseboards)[0]
+                    await self.orchestrator.logger.log_runtime(
+                        "INFO",
+                        "CLICollector",
+                        f"Single baseboard detected: {baseboard_info}",
+                    )
+                elif len(baseboards) > 1:
+                    baseboard_list = sorted(baseboards)
+                    await self.orchestrator.logger.log_runtime(
+                        "INFO",
+                        "CLICollector",
+                        f"Multiple baseboards detected ({', '.join(baseboard_list)}). Per-DUT filtering will apply.",
+                    )
+                    self.sanitized_console.print_info(
+                        f"\n\nMultiple baseboards detected ({', '.join(baseboard_list)}). Each DUT will filter collectors based on its own baseboard during execution."
+                    )
+                    baseboard_info = None
+
+        # Process collector groups
+        if self.tool_config.collector_group:
+            await self.orchestrator.logger.log_runtime(
+                "INFO",
+                "CLICollector",
+                f"Processing collector groups: {self.tool_config.collector_group} for level {current_level}",
+            )
+            self.sanitized_console.print_info(
+                f"Processing collector groups: {', '.join(self.tool_config.collector_group)} for level {current_level}"
+            )
+
+            for group in self.tool_config.collector_group:
+                group_collectors = (
+                    self.orchestrator.config_manager.get_collectors_for_group(group)
+                )
+                if not group_collectors:
+                    await self.orchestrator.logger.log_runtime(
+                        "WARN",
+                        "CLICollector",
+                        f"No collectors found for group '{group}'",
+                    )
+                    self.sanitized_console.print_warning(
+                        f"No collectors found for group '{group}'"
+                    )
+                    continue
+
+                level_filtered = []
+                baseboard_filtered = []
+                for cid, cinfo in group_collectors.items():
+                    clevel = cinfo.get("collection_level", "L1")
+                    if not self.orchestrator._is_collector_level_applicable(
+                        clevel, current_level
+                    ):
+                        continue
+                    level_filtered.append(cid)
+                    if (
+                        baseboard_info is None
+                        or self.orchestrator.is_collector_applicable_for_baseboard(
+                            cinfo, baseboard_info
+                        )
+                    ):
+                        baseboard_filtered.append(cid)
+                    else:
+                        await self.orchestrator.logger.log_runtime(
+                            "WARN",
+                            "CLICollector",
+                            f"Collector {cid} in group '{group}' not applicable for baseboard {baseboard_info} - skipping",
+                        )
+
+                group_requested_cids.extend(level_filtered)
+                group_cids.extend(baseboard_filtered)
+
+                level_out = len(group_collectors) - len(level_filtered)
+                bb_out = len(level_filtered) - len(baseboard_filtered)
+                bb_label = (
+                    f" and baseboard {baseboard_info}"
+                    if baseboard_info
+                    else " (per-DUT baseboard filtering during execution)"
+                )
+                await self.orchestrator.logger.log_runtime(
+                    "INFO",
+                    "CLICollector",
+                    f"Found {len(baseboard_filtered)} collectors in group '{group}' for level {current_level}{bb_label}: {baseboard_filtered}",
+                )
+                self.sanitized_console.print_info(
+                    f"Found {len(baseboard_filtered)} collectors in group '{group}' for level {current_level}{bb_label}: {', '.join(baseboard_filtered)}"
+                )
+                if level_out > 0:
+                    await self.orchestrator.logger.log_runtime(
+                        "INFO",
+                        "CLICollector",
+                        f"Filtered out {level_out} collectors from group '{group}' that don't match level {current_level}",
+                    )
+                    self.sanitized_console.print_info(
+                        f"Filtered out {level_out} collectors from group '{group}' that don't match level {current_level}"
+                    )
+                if bb_out > 0:
+                    msg = (
+                        f"Filtered out {bb_out} collectors from group '{group}' that don't match baseboard {baseboard_info}"
+                        if baseboard_info
+                        else f"Note: {bb_out} collectors from group '{group}' may be filtered out during execution based on individual DUT baseboards"
+                    )
+                    await self.orchestrator.logger.log_runtime(
+                        "INFO", "CLICollector", msg
+                    )
+                    self.sanitized_console.print_info(msg)
+
+        # Process specific collector IDs
+        cids = self.tool_config.collector_id
+        if cids:
+            await self.orchestrator.logger.log_runtime(
+                "INFO",
+                "CLICollector",
+                f"Processing specific collector IDs: {cids}",
+            )
+            self.sanitized_console.print_info(
+                f"\n\nProcessing specific collector IDs: {cids}"
+            )
+            specific_cids = [
+                c.strip() for item in cids.split() for c in item.split(",") if c.strip()
+            ]
+
+        # Combine group and specific collectors
+        if specific_cids and group_cids:
+            processed_cids = group_cids.copy()
+            for cid in specific_cids:
+                if cid in processed_cids:
+                    await self.orchestrator.logger.log_runtime(
+                        "INFO",
+                        "CLICollector",
+                        f"Specific collector ID '{cid}' overrides group selection",
+                    )
+                    self.sanitized_console.print_info(
+                        f"Specific collector ID '{cid}' overrides group selection"
+                    )
+                processed_cids.append(cid)
+            await self.orchestrator.logger.log_runtime(
+                "INFO",
+                "CLICollector",
+                f"Combined group and specific collectors: {processed_cids}",
+            )
+            self.sanitized_console.print_info(
+                f"Combined group and specific collectors: {', '.join(processed_cids)}"
+            )
+        elif specific_cids:
+            processed_cids = specific_cids
+            await self.orchestrator.logger.log_runtime(
+                "INFO",
+                "CLICollector",
+                f"Using specific collector IDs: {specific_cids}",
+            )
+            self.sanitized_console.print_info(
+                f"Using specific collector IDs: {', '.join(specific_cids)}"
+            )
+        elif group_cids:
+            processed_cids = group_cids
+            await self.orchestrator.logger.log_runtime(
+                "INFO",
+                "CLICollector",
+                f"Using collectors from groups for level {current_level}: {group_cids}",
+            )
+            self.sanitized_console.print_info(
+                f"Using collectors from groups for level {current_level}: {', '.join(group_cids)}"
+            )
+        else:
+            if self.tool_config.collector_group:
+                await self.orchestrator.logger.log_runtime(
+                    "INFO",
+                    "CLICollector",
+                    "No applicable collectors found for the requested group(s). No collectors will be executed.",
+                )
+                self.sanitized_console.print_warning(
+                    "No applicable collectors found for the requested group(s). No collectors will be executed."
+                )
+                processed_cids = []
+            else:
+                await self.orchestrator.logger.log_runtime(
+                    "INFO",
+                    "CLICollector",
+                    f"No specific collectors or groups specified - will run all applicable collectors for level {current_level}",
+                )
+                self.sanitized_console.print_info(
+                    f"\nNo specific collectors or groups specified - will run all applicable collectors for level {current_level}\n"
+                )
+                all_collectors = self.orchestrator.get_all_collectors(current_level)
+                processed_cids = list(all_collectors.keys())
+                await self.orchestrator.logger.log_runtime(
+                    "INFO",
+                    "CLICollector",
+                    f"Using all {len(processed_cids)} collectors for level {current_level}",
+                )
+
+        # Build requested_cids for summary reporting (pre-filter)
+        requested_cids = group_requested_cids + specific_cids + include_collectors
+        if requested_cids:
+            seen = set()
+            requested_cids = [
+                c for c in requested_cids if c and not (c in seen or seen.add(c))
+            ]
+
+        # Apply --include-collectors additively
+        if include_collectors:
+            await self.orchestrator.logger.log_runtime(
+                "INFO",
+                "CLICollector",
+                f"Adding collectors from --include-collectors: {include_collectors}",
+            )
+            added_count = 0
+            for cid in include_collectors:
+                if cid not in processed_cids:
+                    collector_info = (
+                        self.orchestrator.config_manager.get_collector_info(cid)
+                    )
+                    if collector_info:
+                        processed_cids.append(cid)
+                        added_count += 1
+                        await self.orchestrator.logger.log_runtime(
+                            "INFO",
+                            "CLICollector",
+                            f"Added collector {cid} from --include-collectors",
+                        )
+            if added_count > 0:
+                self.sanitized_console.print_info(
+                    f"Added {added_count} additional collector(s) from --include-collectors"
+                )
+            else:
+                await self.orchestrator.logger.log_runtime(
+                    "INFO",
+                    "CLICollector",
+                    "All collectors from --include-collectors were already in the selection",
+                )
+
+            # Baseboard compatibility warnings for include_collectors
+            all_baseboards = set()
+            if self.orchestrator.dut_manager:
+                for did in self.orchestrator.dut_manager.get_all_dut_ids():
+                    bb = self.orchestrator.dut_manager.duts[did].config.get(
+                        "baseboard", "Unknown"
+                    )
+                    all_baseboards.add(bb)
+
+            for cid in include_collectors:
+                cinfo = self.orchestrator.config_manager.get_collector_info(cid)
+                if not cinfo:
+                    self.sanitized_console.print_warning(
+                        f"Warning: Collector {cid} in --include-collectors not found in collector catalog"
+                    )
+                    continue
+                supported = cinfo.get("applicable_baseboards", [])
+                if not supported:
+                    continue
+                unsupported = all_baseboards - set(supported)
+                if unsupported:
+                    supported_str = ", ".join(supported)
+                    unsupported_str = ", ".join(sorted(unsupported))
+                    self.sanitized_console.print_warning(
+                        f"Warning: Collector {cid} in --include-collectors is not supported on baseboard(s) '{unsupported_str}'; forcing run due to --include-collectors. Supported baseboards: {supported_str}"
+                    )
+
+        # Deduplicate while preserving order
+        if processed_cids:
+            seen = set()
+            processed_cids = [
+                c for c in processed_cids if not (c in seen or seen.add(c))
+            ]
+            await self.orchestrator.logger.log_runtime(
+                "INFO",
+                "CLICollector",
+                f"Final processed CIDs: {processed_cids}",
+            )
+
+        return processed_cids, requested_cids
+
+    async def _run_autodetection(
+        self, dut_ids: list, preflight_results: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Run platform/baseboard auto-detection for DUTs that lack baseboard info."""
+        duts_needing = [
+            did
+            for did in dut_ids
+            if not (
+                self.orchestrator.dut_manager.get_dut(did).config.get("baseboard")
+                or self.orchestrator.dut_manager.get_dut(did).config.get(
+                    "TargetBaseboard"
+                )
+            )
+        ]
+        if not duts_needing:
+            return
+
+        await self.orchestrator.logger.log_runtime(
+            "INFO",
+            "CLICollector",
+            f"DUTs needing autodetection: {duts_needing} - running autodetection before filtering",
+        )
+
+        for dut_id in duts_needing:
+            await self.orchestrator.logger.log_runtime(
+                "INFO",
+                "CLICollector",
+                f"Running autodetection for DUT: {dut_id}",
+            )
+            dut = self.orchestrator.dut_manager.get_dut(dut_id)
+            non_interactive = dut.config.get("non_interactive", False)
+            t0 = time.time()
+            self.orchestrator.sanitized_console.console.print(
+                f"[bold blue]Auto-detecting platform and baseboard for {dut_id}...[/bold blue]"
+            )
+
+            success, detected_info = (
+                await self.orchestrator.dut_manager.detect_platform_and_baseboard(
+                    dut_id,
+                    preflight_results.get(dut_id, {}) if preflight_results else {},
+                    non_interactive,
+                )
+            )
+
+            elapsed = time.time() - t0
+            self.orchestrator.sanitized_console.console.print(
+                f"[green]Auto-detection completed in {elapsed:.1f}s![/green]"
+            )
+
+            if success:
+                bb = detected_info.get("baseboard")
+                plat = detected_info.get("platform")
+                ntype = detected_info.get("node_type")
+
+                if not bb or not plat:
+                    await self.orchestrator.logger.log_runtime(
+                        "WARNING",
+                        "CLICollector",
+                        f"Autodetection returned success but with invalid values for DUT {dut_id}: Baseboard={bb}, Platform={plat}",
+                    )
+                    success = False
+                else:
+                    await self.orchestrator.logger.log_runtime(
+                        "INFO",
+                        "CLICollector",
+                        f"Autodetection successful for DUT {dut_id}: Baseboard={bb}, Platform={plat}, NodeType={ntype}",
+                    )
+                    dut.config["baseboard"] = bb
+                    dut.config["TargetBaseboard"] = bb
+                    dut.config["platform"] = plat
+                    if ntype:
+                        dut.config["node_type"] = ntype
+                        dut.config["NodeType"] = ntype
+                    await self.orchestrator.logger.create_log_signature(
+                        dut_id, plat, bb
+                    )
+                    try:
+                        tool_config = self.orchestrator.config_manager.get_tool_config()
+                        await self.orchestrator.logger.create_config_files(
+                            dut_id, tool_config, dut.config
+                        )
+                    except Exception as e:
+                        await self.orchestrator.logger.log_runtime(
+                            "WARNING",
+                            "CLICollector",
+                            f"Failed to refresh archived config after autodetection for DUT {dut_id}: {e}",
+                        )
+
+            if not success:
+                await self.orchestrator.logger.log_runtime(
+                    "WARNING",
+                    "CLICollector",
+                    f"Autodetection failed for DUT {dut_id} - will continue with unknown baseboard",
+                )
+
+    async def _filter_and_display_collectors(
+        self, processed_cids: list, dut_ids: list
+    ) -> tuple:
+        """Filter collectors per DUT, display a summary table, and return results.
+
+        Returns (all_filtered_collectors, filtered_collectors_per_dut, skipped_collectors_per_dut).
+        """
+        await self.orchestrator.logger.log_runtime(
+            "INFO",
+            "CLICollector",
+            "Applying all filtering (level, baseboard, skip flags, include/exclude)...",
+        )
+
+        filtering_results = (
+            await self.orchestrator.execution_engine.get_filtered_collectors_per_dut(
+                processed_cids, dut_ids
+            )
+        )
+        filtered_collectors_per_dut = filtering_results["filtered_collectors"]
+        skipped_collectors_per_dut = filtering_results["skipped_collectors"]
+
+        all_filtered = set()
+        for dut_collectors in filtered_collectors_per_dut.values():
+            all_filtered.update(dut_collectors)
+        all_filtered_collectors = list(all_filtered)
+
+        await self.orchestrator.logger.log_runtime(
+            "INFO",
+            "CLICollector",
+            f"Final filtering complete. {len(all_filtered_collectors)} collectors will run.",
+        )
+
+        def _nsort(text):
+            return [
+                int(c) if c.isdigit() else c.lower() for c in re.split(r"(\d+)", text)
+            ]
+
+        table = Table(title="Filtered Collectors by DUT")
+        table.add_column("DUT Name", style="cyan", no_wrap=True)
+        table.add_column("Baseboard", style="magenta", no_wrap=True)
+        table.add_column("Filtered Collectors", style="green", overflow="fold")
+        table.add_column("Count", style="yellow", justify="right")
+
+        for dut_id in sorted(filtered_collectors_per_dut.keys()):
+            dut_collectors = filtered_collectors_per_dut[dut_id]
+            sorted_collectors = sorted(dut_collectors, key=_nsort)
+
+            dut_cfg = self.orchestrator.dut_manager.duts[dut_id].config
+            baseboard = dut_cfg.get("baseboard", "Unknown")
+
+            groups: Dict[str, list] = {}
+            for cid in sorted_collectors:
+                cinfo = self.orchestrator.config_manager.get_collector_info(cid)
+                g = cinfo.get("group", "Unknown") if cinfo else "Unknown"
+                groups.setdefault(g, []).append(cid)
+
+            lines = [
+                f"{g}: {', '.join(sorted(ids, key=_nsort))}"
+                for g, ids in sorted(groups.items())
+            ]
+            table.add_row(dut_id, baseboard, "\n".join(lines), str(len(dut_collectors)))
+
+        self.sanitized_console.console.print(table)
+
+        total_duts = len(filtered_collectors_per_dut)
+        avg = (
+            sum(len(c) for c in filtered_collectors_per_dut.values()) / total_duts
+            if total_duts
+            else 0
+        )
+        self.sanitized_console.print_info(
+            f"\nSummary: {total_duts} DUT(s), {len(all_filtered_collectors)} unique collectors, {avg:.1f} avg collectors per DUT\n"
+        )
+
+        return (
+            all_filtered_collectors,
+            filtered_collectors_per_dut,
+            skipped_collectors_per_dut,
+        )
+
+    def _display_final_output(self, log_dir: Path) -> None:
+        """Display final output after collection (zip location, recombine instructions)."""
+        final_console = create_sanitized_console()
+        final_console.print_success("Collection completed successfully!")
+
+        zip_path = getattr(self.orchestrator, "zip_archive_path", None)
+        if not zip_path:
+            final_console.print_success(f"\nLogs saved to: {log_dir}")
+            return
+
+        if isinstance(zip_path, list):
+            first_part = os.path.basename(zip_path[0])
+            chunked_match = re.search(r"(\.part\d+)$", first_part)
+            standard_split = re.search(r"\.z\d+$", first_part) is not None
+
+            if chunked_match:
+                final_console.print_success("Split archive parts created:")
+            else:
+                final_console.print_success("Split archive output created:")
+            for fp in zip_path:
+                final_console.print_success(f"  {fp}")
+
+            if chunked_match:
+                archive_name = first_part[: -len(chunked_match.group(1))]
+                final_console.print_info("\nTo recombine the archive on Linux:")
+                final_console.print_info(f"  cat {archive_name}.part* > {archive_name}")
+                final_console.print_info("\nThen extract the reconstructed ZIP:")
+                final_console.print_info(f"  unzip {archive_name}")
+            elif standard_split:
+                base_name = re.sub(r"\.z\d+$", "", first_part)
+                final_console.print_info(
+                    "\nLegacy multipart ZIP detected. Keep all parts in the same directory and open:"
+                )
+                final_console.print_info(f"  7z x {base_name}.zip")
+            else:
+                final_console.print_success(f"\nLogs saved to: {zip_path[-1]}")
+        else:
+            final_console.print_success(f"\nLogs saved to: {zip_path}")
+
+    def _archive_config_files(self, log_dir: Path) -> None:
+        """Archive sanitized copies of config files into the run directory (best-effort)."""
+
+        def _copy(src_path: Optional[Path], dest_name: str, label: str) -> None:
+            try:
+                if not src_path:
+                    self.sanitized_console.print_warning(
+                        f"Skipping {label} copy: no source path available"
+                    )
+                    return
+                src = Path(src_path)
+                if not src.exists() or not src.is_file():
+                    self.sanitized_console.print_warning(
+                        f"Skipping {label} copy: source file not found: {src}"
+                    )
+                    return
+                dest = log_dir / dest_name
+                raw_text = src.read_text(encoding="utf-8", errors="replace")
+                sanitized_text = sanitize_config_text(raw_text, replacement="XXXX")
+                dest.write_text(sanitized_text, encoding="utf-8")
+            except Exception as e:
+                self.sanitized_console.print_warning(
+                    f"Failed to copy {label} into run directory: {e}"
+                )
+
+        def _resolve_config_file_to_use(config_path: str) -> Optional[Path]:
+            if not config_path:
+                return None
+            candidate = Path(config_path)
+            if candidate.exists():
+                return candidate
+            if self.source_dut_config:
+                relative_candidate = Path(self.source_dut_config).parent / candidate
+                if relative_candidate.exists():
+                    return relative_candidate
+            return candidate
+
+        _copy(self.source_dut_config, "dut_config.yaml", "DUT config")
+        _copy(self.source_tool_config, "tool_config.yaml", "tool config")
+
+        for dut in self.dut_configs:
+            config_to_use = getattr(dut, "ConfigFileToUse", None)
+            if not config_to_use:
+                continue
+            resolved_path = _resolve_config_file_to_use(config_to_use)
+            safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", dut.name or "") or "dut"
+            _copy(
+                resolved_path,
+                f"tool_config_{safe_name}.yaml",
+                f"tool config for {dut.name}",
+            )
 
     async def _emergency_cleanup(self) -> None:
         """
@@ -2035,7 +1926,9 @@ class BaseCLICommand:
             "SERVICE_GROUPED_SEQUENTIAL_COLLECTORS": True,
             # Global directory and prefix fields
             "TASK_ID_PREFIX": "",  # Empty by default, only used if user specifies
-            "TOOL_TEMP_DIR": "/tmp",
+            "TOOL_TEMP_DIR": getattr(
+                getattr(self, "tool_config", None), "tool_temp_dir", "/tmp"
+            ),
         }
 
         # Merge with values from tool_config.yaml if loaded
@@ -2052,6 +1945,8 @@ class BaseCLICommand:
                 ]
             if "uri_overrides" in tool_config_from_file:
                 tool_config["uri_overrides"] = tool_config_from_file["uri_overrides"]
+            if "i2c_config" in tool_config_from_file:
+                tool_config["i2c_config"] = tool_config_from_file["i2c_config"]
 
         # Add spreadsheet configuration if provided
         if spreadsheet:
@@ -2279,7 +2174,7 @@ class CLIListCollectors(BaseCLICommand):
 
         Args:
             baseboard (Optional[str]): Filter by baseboard name.
-            group (Optional[str]): Filter by collector group.
+            group (Optional[str]): Filter by collector group(s), comma-separated.
             spreadsheet (Optional[Path]): Path to collector definitions spreadsheet.
             json_output (bool): Output in JSON format.
             output_file (Optional[str]): File path for output.
@@ -2307,7 +2202,7 @@ class CLIListCollectors(BaseCLICommand):
 
         Args:
             baseboard (Optional[str]): Filter by baseboard name.
-            group (Optional[str]): Filter by collector group.
+            group (Optional[str]): Filter by collector group(s), comma-separated.
             spreadsheet (Optional[Path]): Path to collector definitions spreadsheet.
             json_output (bool): Output in JSON format.
             output_file (Optional[str]): File path for output.
@@ -2337,7 +2232,7 @@ class CLIListCollectors(BaseCLICommand):
 
         Args:
             baseboard (Optional[str]): Filter by baseboard name.
-            group (Optional[str]): Filter by collector group.
+            group (Optional[str]): Filter by collector group(s), comma-separated.
             spreadsheet (Optional[Path]): Path to collector definitions spreadsheet.
             json_output (bool): Output in JSON format.
             output_file (Optional[str]): File path for output.
@@ -2353,11 +2248,36 @@ class CLIListCollectors(BaseCLICommand):
             tool_config_obj, dut_config, quiet_mode=True
         )
 
+        # Normalize and validate group filters (case-insensitive, comma-separated)
+        normalized_groups: Optional[List[str]] = None
+        if group:
+            group_items = [item.strip() for item in group.split(",")]
+            normalized_groups = [item.lower() for item in group_items if item]
+            if normalized_groups:
+                available_groups = (
+                    orchestrator.config_manager.get_all_collector_groups()
+                )
+                available_groups_normalized = {
+                    item.lower() for item in available_groups
+                }
+                invalid_groups = sorted(
+                    set(normalized_groups) - available_groups_normalized
+                )
+                if invalid_groups:
+                    valid_groups = ", ".join(sorted(available_groups_normalized))
+                    invalid_list = ", ".join(invalid_groups)
+                    raise ValueError(
+                        "Invalid collector group(s): "
+                        f"{invalid_list}. Valid groups: {valid_groups}"
+                    )
+            else:
+                normalized_groups = None
+
         # Get all collectors
         all_collectors = orchestrator.get_all_collectors()
 
         sequential_collectors = orchestrator.get_sequential_collectors()
-        parallel_collectors = orchestrator.get_parallel_collectors()
+        orchestrator.get_parallel_collectors()
 
         # Apply filters
         filtered_collectors = []
@@ -2371,8 +2291,13 @@ class CLIListCollectors(BaseCLICommand):
                 continue
 
             # Group filter
-            if group and collector_info.get("group") != group:
-                continue
+            if normalized_groups:
+                collector_group = collector_info.get("group", "")
+                if (
+                    not collector_group
+                    or collector_group.lower() not in normalized_groups
+                ):
+                    continue
 
             # Default collectors filter (only for default-collectors command)
             if filter_default_only:
@@ -2915,66 +2840,66 @@ class CLIListBaseboards(BaseCLICommand):
             # Create a temporary logger for the baseboard manager
             temp_logger = AsyncSafeLogger(temp_dir)
 
-            baseboard_manager = BaseboardManager(
+            async with BaseboardManager(
                 spreadsheet_path=spreadsheet_path,
                 logger=temp_logger,
-            )
+            ) as baseboard_manager:
+                # Get all baseboards from the manager
+                baseboards = baseboard_manager.get_all_baseboard_names()
 
-            # Get all baseboards from the manager
-            baseboards = baseboard_manager.get_all_baseboard_names()
-
-            if not baseboards:
-                if json_output:
-                    # Output empty JSON
-                    self._handle_output(
-                        {"baseboards": [], "total_baseboards": 0},
-                        json_output=True,
-                        output_file=output_file,
-                        output_type="baseboards",
-                    )
-                else:
-                    if output_file:
-                        # Write empty result to file
+                if not baseboards:
+                    if json_output:
+                        # Output empty JSON
                         self._handle_output(
                             {"baseboards": [], "total_baseboards": 0},
-                            json_output=False,
+                            json_output=True,
                             output_file=output_file,
                             output_type="baseboards",
                         )
                     else:
-                        self.sanitized_console.print_warning("No baseboards found")
-                return
+                        if output_file:
+                            # Write empty result to file
+                            self._handle_output(
+                                {"baseboards": [], "total_baseboards": 0},
+                                json_output=False,
+                                output_file=output_file,
+                                output_type="baseboards",
+                            )
+                        else:
+                            self.sanitized_console.print_warning("No baseboards found")
+                    return
 
-            # Prepare baseboard data with descriptions
-            baseboard_data = []
-            for baseboard in sorted(baseboards):
-                # Get baseboard type and group information
-                baseboard_type = baseboard_manager.get_baseboard_type(baseboard)
-                baseboard_group = baseboard_manager.get_baseboard_group(baseboard)
+                # Prepare baseboard data with descriptions
+                baseboard_data = []
+                for baseboard in sorted(baseboards):
+                    # Get baseboard type and group information
+                    baseboard_type = baseboard_manager.get_baseboard_type(baseboard)
+                    baseboard_group = baseboard_manager.get_baseboard_group(baseboard)
 
-                description = f"Type: {baseboard_type}"
-                if baseboard_group:
-                    description += f", Group: {baseboard_group}"
+                    description = f"Type: {baseboard_type}"
+                    if baseboard_group:
+                        description += f", Group: {baseboard_group}"
 
-                baseboard_data.append(
+                    baseboard_data.append(
+                        {
+                            "name": baseboard,
+                            "type": baseboard_type,
+                            "group": baseboard_group,
+                            "description": description,
+                        }
+                    )
+
+                # Use shared output handling
+                self._handle_output(
                     {
-                        "name": baseboard,
-                        "type": baseboard_type,
-                        "group": baseboard_group,
-                        "description": description,
-                    }
+                        "baseboards": baseboard_data,
+                        "total_baseboards": len(baseboard_data),
+                    },
+                    json_output=json_output,
+                    output_file=output_file,
+                    output_type="baseboards",
                 )
 
-            # Use shared output handling
-            self._handle_output(
-                {
-                    "baseboards": baseboard_data,
-                    "total_baseboards": len(baseboard_data),
-                },
-                json_output=json_output,
-                output_file=output_file,
-                output_type="baseboards",
-            )
 
 
 class CLIPreflight(BaseCLICommand):
@@ -3016,10 +2941,23 @@ class CLIPreflight(BaseCLICommand):
         host_ip: Optional[str] = None,
         host_user: Optional[str] = None,
         host_pass: Optional[str] = None,
-        host_ssh_port: Optional[str] = None,
+        host_ssh_port: Optional[int] = None,
         host_ssh_key_path: Optional[str] = None,
         host_ssh_passwordless: bool = False,
         host_ssh_max_retries: Optional[int] = None,
+        # HMC Configuration
+        hmc_ip: Optional[str] = None,
+        hmc_user: Optional[str] = None,
+        hmc_pass: Optional[str] = None,
+        hmc_ssh_user: Optional[str] = None,
+        hmc_ssh_pass: Optional[str] = None,
+        hmc_ssh_port: Optional[int] = None,
+        hmc_ssh_key_path: Optional[str] = None,
+        hmc_ssh_passwordless: bool = False,
+        hmc_ssh_max_retries: Optional[int] = None,
+        hmc_http_port: Optional[int] = None,
+        hmc_https_port: Optional[int] = None,
+        hmc_use_https: bool = False,
     ) -> None:
         """
         Run the preflight command using the WorkflowOrchestrator.
@@ -3046,10 +2984,22 @@ class CLIPreflight(BaseCLICommand):
             host_ip (Optional[str]): Host IP address.
             host_user (Optional[str]): Host username.
             host_pass (Optional[str]): Host password.
-            host_ssh_port (Optional[str]): Host SSH port.
+            host_ssh_port (Optional[int]): Host SSH port.
             host_ssh_key_path (Optional[str]): Host SSH key path.
             host_ssh_passwordless (bool): Use passwordless SSH for Host.
             host_ssh_max_retries (Optional[int]): Host SSH max retry attempts.
+            hmc_ip (Optional[str]): HMC IP address.
+            hmc_user (Optional[str]): HMC username.
+            hmc_pass (Optional[str]): HMC password.
+            hmc_ssh_user (Optional[str]): HMC SSH username.
+            hmc_ssh_pass (Optional[str]): HMC SSH password.
+            hmc_ssh_port (Optional[int]): HMC SSH port.
+            hmc_ssh_key_path (Optional[str]): HMC SSH key path.
+            hmc_ssh_passwordless (bool): Use passwordless SSH for HMC.
+            hmc_ssh_max_retries (Optional[int]): HMC SSH max retry attempts.
+            hmc_http_port (Optional[int]): HMC HTTP port.
+            hmc_https_port (Optional[int]): HMC HTTPS port.
+            hmc_use_https (bool): Use HTTPS for HMC.
         """
         return await self._run_with_error_handling(
             self._execute_preflight,
@@ -3080,6 +3030,19 @@ class CLIPreflight(BaseCLICommand):
             host_ssh_key_path,
             host_ssh_passwordless,
             host_ssh_max_retries,
+            # HMC Configuration
+            hmc_ip,
+            hmc_user,
+            hmc_pass,
+            hmc_ssh_user,
+            hmc_ssh_pass,
+            hmc_ssh_port,
+            hmc_ssh_key_path,
+            hmc_ssh_passwordless,
+            hmc_ssh_max_retries,
+            hmc_http_port,
+            hmc_https_port,
+            hmc_use_https,
         )
 
     async def _execute_preflight(
@@ -3107,10 +3070,23 @@ class CLIPreflight(BaseCLICommand):
         host_ip: Optional[str] = None,
         host_user: Optional[str] = None,
         host_pass: Optional[str] = None,
-        host_ssh_port: Optional[str] = None,
+        host_ssh_port: Optional[int] = None,
         host_ssh_key_path: Optional[str] = None,
         host_ssh_passwordless: bool = False,
         host_ssh_max_retries: Optional[int] = None,
+        # HMC Configuration
+        hmc_ip: Optional[str] = None,
+        hmc_user: Optional[str] = None,
+        hmc_pass: Optional[str] = None,
+        hmc_ssh_user: Optional[str] = None,
+        hmc_ssh_pass: Optional[str] = None,
+        hmc_ssh_port: Optional[int] = None,
+        hmc_ssh_key_path: Optional[str] = None,
+        hmc_ssh_passwordless: bool = False,
+        hmc_ssh_max_retries: Optional[int] = None,
+        hmc_http_port: Optional[int] = None,
+        hmc_https_port: Optional[int] = None,
+        hmc_use_https: bool = False,
     ) -> None:
         """
         Execute the preflight command logic.
@@ -3155,6 +3131,19 @@ class CLIPreflight(BaseCLICommand):
                     host_ssh_key_path,
                     host_ssh_passwordless,
                     host_ssh_max_retries,
+                    # HMC Configuration
+                    hmc_ip,
+                    hmc_user,
+                    hmc_pass,
+                    hmc_ssh_user,
+                    hmc_ssh_pass,
+                    hmc_ssh_port,
+                    hmc_ssh_key_path,
+                    hmc_ssh_passwordless,
+                    hmc_ssh_max_retries,
+                    hmc_http_port,
+                    hmc_https_port,
+                    hmc_use_https,
                 ]
             )
             and any(
@@ -3166,6 +3155,13 @@ class CLIPreflight(BaseCLICommand):
                     host_ip,
                     host_user,
                     host_pass,
+                    hmc_ip,
+                    hmc_user,
+                    hmc_pass,
+                    hmc_ssh_user,
+                    hmc_ssh_pass,
+                    hmc_ssh_key_path,
+                    hmc_ssh_passwordless,
                 ]
             )
         )
@@ -3211,6 +3207,19 @@ class CLIPreflight(BaseCLICommand):
                 HOST_SSH_KEY_PATH=host_ssh_key_path,
                 HOST_SSH_PASSWORDLESS=host_ssh_passwordless,
                 HOST_SSH_MAX_RETRIES=host_ssh_max_retries,
+                # HMC Configuration - use uppercase field names
+                HMC_IP=hmc_ip,
+                HMC_USERNAME=hmc_user,
+                HMC_PASSWORD=hmc_pass,
+                HMC_SSH_USERNAME=hmc_ssh_user,
+                HMC_SSH_PASSWORD=hmc_ssh_pass,
+                HMC_SSH_PORT=hmc_ssh_port,
+                HMC_SSH_KEY_PATH=hmc_ssh_key_path,
+                HMC_SSH_PASSWORDLESS=hmc_ssh_passwordless,
+                HMC_SSH_MAX_RETRIES=hmc_ssh_max_retries,
+                HMC_HTTP_PORT=hmc_http_port,
+                HMC_HTTPS_PORT=hmc_https_port,
+                HMC_USE_HTTPS=hmc_use_https,
             )
 
             # Convert to dictionary format expected by DUTManager
@@ -3316,8 +3325,7 @@ class CLIPreflight(BaseCLICommand):
 
             # For JSON output, manually initialize DUT manager since quiet mode doesn't do it
             if json_output and not orchestrator.dut_manager:
-                from src.tool.core.dut_manager import DUTManager
-                from src.tool.utils.uri_config_manager import URIConfigManager
+                from .core.dut_manager import DUTManager
 
                 # Create URI config manager
                 uri_config_manager = (
@@ -3364,6 +3372,31 @@ class CLIPreflight(BaseCLICommand):
                 f"Preflight checks failed: {results['error']}"
             )
             return
+
+        # Compute per-DUT filtered collectors so dependency checks are scoped
+        # to each DUT's applicable collectors (baseboard/skip/include/exclude).
+        all_collectors = orchestrator.get_all_collectors()
+        all_collector_ids = list(all_collectors.keys())
+        dut_ids = orchestrator.dut_manager.get_all_dut_ids()
+        filtering_results = (
+            await orchestrator.execution_engine.get_filtered_collectors_per_dut(
+                all_collector_ids, dut_ids
+            )
+        )
+        filtered_collectors_per_dut = filtering_results["filtered_collectors"]
+        filtered_collector_ids = list(
+            {cid for cids in filtered_collectors_per_dut.values() for cid in cids}
+        )
+
+        # Run dependency checks scoped per-DUT with preflight service filtering
+        dependency_results = await orchestrator.run_dependency_checks(
+            collector_ids=filtered_collector_ids,
+            preflight_results=results,
+            filtered_collectors_per_dut=filtered_collectors_per_dut,
+        )
+        await orchestrator.reporting_engine.log_dependency_check_table(
+            dependency_results
+        )
 
         # Handle output - only use CLI output handling for JSON output or file output
         # The orchestrator already displays the table results to console for non-JSON output

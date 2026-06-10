@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 """
 Execution Engine for NVDebug Tool.
 
@@ -20,79 +21,23 @@ Handles collector execution strategies with support for sequential and parallel
 execution, priority-based scheduling, and progress tracking across multiple DUTs.
 """
 
+from __future__ import annotations
+
 import asyncio
-import concurrent.futures
-import contextvars
 import logging
-import os
-import queue
 import sys
-import time
-from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional
 
 from rich.progress import (
-    BarColumn,
     Progress,
-    SpinnerColumn,
-    TaskProgressColumn,
-    TextColumn,
-    TimeElapsedColumn,
 )
 
 from ..services.base_service import BaseService
 from ..utils.enums import CollectorServiceMapping
 from .async_logger import _collector_context
-from .collection_status_tracker import CollectionStatusTracker
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class CollectorBucket:
-    """
-    Represents a bucket of collectors (sequential or parallel).
-
-    Attributes:
-        collectors (List[str]): List of collector IDs.
-        is_sequential (bool): Whether collectors run sequentially.
-        service_name (str): Service name for the bucket.
-    """
-
-    collectors: List[str]
-    is_sequential: bool
-    service_name: str
-
-
-@dataclass
-class CollectorGroup:
-    """
-    Represents a collector group (Redfish, SSH, IPMI, Host) with its buckets.
-
-    Attributes:
-        service_name: Name of the service.
-        sequential_bucket: Sequential execution bucket.
-        parallel_bucket: Parallel execution bucket.
-    """
-
-    service_name: str
-    sequential_bucket: CollectorBucket
-    parallel_bucket: CollectorBucket
-
-
-@dataclass
-class DUTExecutionPlan:
-    """
-    Represents execution plan for a single DUT.
-
-    Attributes:
-        dut_id: DUT ID.
-        collector_groups: List of collector groups to execute.
-    """
-
-    dut_id: str
-    collector_groups: List[CollectorGroup]
 
 
 class ExecutionEngine:
@@ -210,7 +155,7 @@ class ExecutionEngine:
                 return name
             else:
                 return collector_id
-        except Exception as e:
+        except Exception:
             return collector_id
 
     def _get_collector_id_from_path(self, collector_path: str) -> str:
@@ -233,8 +178,89 @@ class ExecutionEngine:
                 return collector_path.split(".")[-1]
             else:
                 return collector_path
-        except Exception as e:
+        except Exception:
             return collector_path
+
+    def _get_tool_include_collectors(self, tool_config: Any = None) -> List[str]:
+        """
+        Retrieve the list of collectors explicitly included via tool configuration.
+
+        Args:
+            tool_config: Optional pre-fetched tool configuration object.
+
+        Returns:
+            List of collector IDs to include, normalized and stripped of empty entries.
+        """
+        if tool_config is None:
+            try:
+                tool_config = self.config_manager.get_tool_config()
+            except Exception:
+                tool_config = {}
+
+        include_collectors: Any = []
+        if isinstance(tool_config, dict):
+            include_collectors = tool_config.get("include_collectors", []) or []
+        else:
+            include_collectors = getattr(tool_config, "include_collectors", []) or []
+
+        if isinstance(include_collectors, str):
+            return [
+                cid.strip()
+                for cid in include_collectors.split(",")
+                if cid and cid.strip()
+            ]
+
+        if isinstance(include_collectors, (list, tuple, set)):
+            return [str(cid).strip() for cid in include_collectors if str(cid).strip()]
+
+        return []
+
+    async def _get_local_mode_skip_decision(
+        self, dut_id: str, dut: Any, service_name: str
+    ) -> Optional[tuple[bool, str]]:
+        if not (dut and dut.config and dut.config.get("local", False)):
+            return None
+
+        await self._log_runtime(
+            "DEBUG",
+            f"Local mode detected for DUT {dut_id}, service {service_name}",
+            dut_id=dut_id,
+        )
+        credentials = getattr(dut, "credentials", None)
+        has_bmc_ip = bool(getattr(credentials, "bmc_ip", None))
+        if has_bmc_ip:
+            await self._log_runtime(
+                "DEBUG",
+                f"BMC IP available in local mode for DUT {dut_id}, service {service_name}",
+                dut_id=dut_id,
+            )
+            return None
+
+        await self._log_runtime(
+            "DEBUG",
+            f"No BMC IP in local mode for DUT {dut_id}, service {service_name}",
+            dut_id=dut_id,
+        )
+        if service_name in ["redfish", "ssh"]:
+            await self._log_runtime(
+                "DEBUG",
+                f"Skipping {service_name} collector in local mode (no BMC IP)",
+                dut_id=dut_id,
+            )
+            return (
+                True,
+                f"Collector not executed due to {service_name} preflight failure: No BMC IP configured (local mode)",
+            )
+
+        if service_name in ["ipmi", "host"]:
+            await self._log_runtime(
+                "DEBUG",
+                f"Allowing {service_name} collector in local mode (no BMC IP)",
+                dut_id=dut_id,
+            )
+            return False, ""
+
+        return None
 
     async def _should_skip_collector(
         self, collector_id: str, dut_id: str
@@ -249,18 +275,28 @@ class ExecutionEngine:
         Returns:
             Tuple of (should_skip, reason).
         """
+        service_name = CollectorServiceMapping.get_service_from_collector_id(
+            collector_id
+        )
 
         # Check baseboard applicability first
         if self.orchestrator and self.orchestrator.dut_manager:
             dut = self.orchestrator.dut_manager.get_dut(dut_id)
             if dut and dut.config:
+                local_skip_decision = await self._get_local_mode_skip_decision(
+                    dut_id, dut, service_name
+                )
                 baseboard_info = dut.config.get("baseboard") or dut.config.get(
                     "TargetBaseboard"
                 )
+                node_type = dut.config.get("NodeType") or dut.config.get("node_type")
 
                 # If no baseboard is configured, this is a critical configuration error
                 # The tool should not run without proper baseboard configuration
                 if not baseboard_info or baseboard_info == "Unknown":
+                    if local_skip_decision is not None:
+                        return local_skip_decision
+
                     reason = f"CRITICAL ERROR: DUT {dut_id} has no baseboard configured ('{baseboard_info}'). Baseboard is required for collector compatibility. Please configure baseboard in DUT config."
                     await self._log_runtime(
                         "ERROR",
@@ -292,16 +328,45 @@ class ExecutionEngine:
                     collector_id
                 )
 
-                if (
-                    collector_def
-                    and not self.orchestrator.is_collector_applicable_for_baseboard(
-                        collector_def, baseboard_info
+                try:
+                    if collector_def and node_type:
+                        is_applicable = self.orchestrator.is_collector_applicable_for_baseboard(
+                            collector_def, baseboard_info, node_type=node_type
+                        )
+                    else:
+                        is_applicable = (
+                            collector_def
+                            and self.orchestrator.is_collector_applicable_for_baseboard(
+                                collector_def, baseboard_info
+                            )
+                        )
+                except ValueError as e:
+                    # Baseboard not found in spreadsheet - this is a critical configuration error
+                    # Log the error and exit
+                    error_msg = str(e)
+                    await self._log_runtime(
+                        "ERROR",
+                        f"CRITICAL: {error_msg}",
+                        dut_id=dut_id,
                     )
-                ):
+                    if hasattr(self.orchestrator, "logger") and hasattr(
+                        self.orchestrator.logger, "console"
+                    ):
+                        console = self.orchestrator.logger.console
+                        console.print_error(error_msg)
+                    else:
+                        print(f"ERROR: {error_msg}")
+                    sys.exit(1)
+
+                if collector_def and not is_applicable:
                     # Check why it's not applicable
                     tags = collector_def.get("tags", {})
-                    include_tags = tags.get("include", [])
-                    exclude_tags = tags.get("exclude", [])
+                    if isinstance(tags, dict):
+                        include_tags = tags.get("include", [])
+                        exclude_tags = tags.get("exclude", [])
+                    else:
+                        include_tags = []
+                        exclude_tags = []
 
                     if exclude_tags:
                         reason = f"Collector not applicable for DUT {dut_id} baseboard '{baseboard_info}' (Tags: {exclude_tags})"
@@ -310,68 +375,24 @@ class ExecutionEngine:
                     else:
                         reason = f"Collector not applicable for DUT {dut_id} baseboard '{baseboard_info}' (BaseboardConstraint)"
 
+                    # If this collector is explicitly included via --include-collectors,
+                    # do not skip it here. Preserve the reason so the caller can emit a warning.
+                    include_collectors = self._get_tool_include_collectors()
+                    if include_collectors and collector_id in include_collectors:
+                        return False, reason
+
                     return True, reason
+
+                if local_skip_decision is not None:
+                    return local_skip_decision
 
         # Check preflight results
         if not self.preflight_results:
             return False, ""
 
-        # Get service name from collector ID prefix
-        service_name = CollectorServiceMapping.get_service_from_collector_id(
-            collector_id
-        )
-
         # Health check collectors don't require preflight checks
         if service_name == "health_check":
             return False, ""
-
-        # In local mode, handle service-specific logic
-        if self.orchestrator and self.orchestrator.dut_manager:
-            dut = self.orchestrator.dut_manager.get_dut(dut_id)
-            if dut and dut.config and dut.config.get("local", False):
-                await self._log_runtime(
-                    "DEBUG",
-                    f"Local mode detected for DUT {dut_id}, service {service_name}",
-                    dut_id=dut_id,
-                )
-                # Check if BMC IP is available
-                has_bmc_ip = dut.credentials and dut.credentials.bmc_ip
-
-                if not has_bmc_ip:
-                    await self._log_runtime(
-                        "DEBUG",
-                        f"No BMC IP in local mode for DUT {dut_id}, service {service_name}",
-                        dut_id=dut_id,
-                    )
-                    # No BMC IP in local mode:
-                    # - Redfish and SSH require BMC IP, so skip them
-                    # - IPMI can work locally via sudo, so don't skip it
-                    # - Host collectors always work locally, so don't skip them
-                    if service_name in ["redfish", "ssh"]:
-                        await self._log_runtime(
-                            "DEBUG",
-                            f"Skipping {service_name} collector in local mode (no BMC IP)",
-                            dut_id=dut_id,
-                        )
-                        return (
-                            True,
-                            f"Collector not executed due to {service_name} preflight failure: No BMC IP configured (local mode)",
-                        )
-                    elif service_name in ["ipmi", "host"]:
-                        await self._log_runtime(
-                            "DEBUG",
-                            f"Allowing {service_name} collector in local mode (no BMC IP)",
-                            dut_id=dut_id,
-                        )
-                        # IPMI and Host can work locally, so don't skip based on preflight
-                        return False, ""
-                else:
-                    await self._log_runtime(
-                        "DEBUG",
-                        f"BMC IP available in local mode for DUT {dut_id}, service {service_name}",
-                        dut_id=dut_id,
-                    )
-                # If BMC IP is provided in local mode, let normal preflight logic handle it
 
         if service_name and dut_id in self.preflight_results:
             # Get DUT-specific preflight results
@@ -402,6 +423,14 @@ class ExecutionEngine:
                 )
 
         return False, ""
+
+    @staticmethod
+    def _is_baseboard_skip_reason(reason: str) -> bool:
+        """Return True when a skip reason came from baseboard applicability."""
+        reason_lower = (reason or "").lower()
+        return (
+            "not applicable for dut" in reason_lower and "baseboard" in reason_lower
+        ) or "baseboardconstraint" in reason_lower
 
     async def get_filtered_collectors_per_dut(
         self, collector_ids: List[str], dut_ids: List[str]
@@ -499,6 +528,55 @@ class ExecutionEngine:
                     dut_id=dut_id,
                 )
 
+                # If this collector was included via --include-collectors, allow it to run
+                # even if baseboard compatibility would normally fail. We'll still record a warning.
+                try:
+                    tool_config = self.config_manager.get_tool_config()
+                except Exception:
+                    tool_config = {}
+                include_collectors = self._get_tool_include_collectors(tool_config)
+                explicitly_requested_list = []
+                explicitly_requested_str = ""
+                if isinstance(tool_config, dict):
+                    explicitly_requested_str = tool_config.get("collector_id", "")
+                else:
+                    explicitly_requested_str = getattr(tool_config, "collector_id", "")
+                if explicitly_requested_str:
+                    explicitly_requested_list = [
+                        cid.strip() for cid in explicitly_requested_str.split(",")
+                    ]
+
+                is_from_include = (
+                    bool(include_collectors) and collector_id in include_collectors
+                )
+                is_from_s_flag = (
+                    bool(explicitly_requested_list)
+                    and collector_id in explicitly_requested_list
+                )
+
+                # Handle baseboard compatibility override for --include-collectors
+                if should_skip_baseboard and is_from_include and not is_from_s_flag:
+                    await self._log_runtime(
+                        "WARNING",
+                        f"{baseboard_reason} - forcing run due to --include-collectors",
+                        dut_id=dut_id,
+                    )
+                    should_skip_baseboard = False
+                    # No need for override_warning_logged flag as we've already logged it
+                elif (
+                    (not should_skip_baseboard)
+                    and is_from_include
+                    and (not is_from_s_flag)
+                    and baseboard_reason
+                ):
+                    # Log warning for incompatible but included collectors
+                    await self._log_runtime(
+                        "WARNING",
+                        f"{baseboard_reason} - forcing run due to --include-collectors",
+                        dut_id=dut_id,
+                    )
+
+                # Skip baseboard-incompatible collectors unless explicitly allowed
                 if should_skip_baseboard:
                     await self._log_runtime(
                         "DEBUG",
@@ -507,60 +585,33 @@ class ExecutionEngine:
                     )
                     skipped_by_baseboard += 1
 
-                    # Track skipped collector with reason for explicitly requested collectors
-                    # Check if this collector was explicitly requested
-                    tool_config = self.config_manager.get_tool_config()
-                    explicitly_requested_str = tool_config.get("collector_id", "")
-                    include_collectors = tool_config.get("include_collectors", [])
-
-                    explicitly_requested = []
-                    if explicitly_requested_str:
-                        explicitly_requested = [
-                            cid.strip() for cid in explicitly_requested_str.split(",")
-                        ]
-
-                    is_explicitly_requested = (
-                        explicitly_requested and collector_id in explicitly_requested
-                    ) or (include_collectors and collector_id in include_collectors)
-
-                    if is_explicitly_requested:
-                        # Log warning for explicitly requested but baseboard-incompatible collectors
-                        await self._log_runtime(
-                            "WARNING",
-                            f"Collector {collector_id} was explicitly requested but skipped: {baseboard_reason}",
-                            dut_id=dut_id,
-                        )
-                        await self._log_runtime(
-                            "DEBUG",
-                            f"Collector {collector_id} is explicitly requested - adding to skipped list for execution summary",
-                            dut_id=dut_id,
-                        )
-
-                        # Track in skipped list so it shows in execution summary with reason
-                        collector_info = self.config_manager.get_collector_info(
-                            collector_id
-                        )
-                        collector_name = (
-                            collector_info.get("name", "Unknown")
-                            if collector_info
-                            else "Unknown"
-                        )
-                        group = (
-                            collector_info.get("group", "Unknown")
-                            if collector_info
-                            else "Unknown"
-                        )
-
-                        dut_skipped.append(
-                            {
-                                "collector_id": collector_id,
-                                "collector_name": collector_name,
-                                "group": group,
-                                "reason": baseboard_reason,
-                                "skip_type": "baseboard",
-                            }
-                        )
+                    # Track skipped collector with reason
+                    collector_info = self.config_manager.get_collector_info(
+                        collector_id
+                    )
+                    collector_name = (
+                        collector_info.get("name", "Unknown")
+                        if collector_info
+                        else "Unknown"
+                    )
+                    group = (
+                        collector_info.get("group", "Unknown")
+                        if collector_info
+                        else "Unknown"
+                    )
+                    dut_skipped.append(
+                        {
+                            "collector_id": collector_id,
+                            "collector_name": collector_name,
+                            "group": group,
+                            "reason": baseboard_reason,
+                            "skip_type": "baseboard",
+                        }
+                    )
                     continue
+
+                # Not skipping due to baseboard. If it was included and had an incompatibility reason,
+                # this warning was already logged earlier, so we skip it here to avoid duplicates.
 
                 # Check if collector should be skipped by config (SKIP flags, skip_collectors list)
                 should_skip_config, skip_reason = (
@@ -609,59 +660,6 @@ class ExecutionEngine:
                     dut_id=dut_id,
                 )
 
-            # Apply --include-collectors as a filter (restrict to only these collectors)
-            # Note: cli_handler.py already handles intersection logic, but we apply it here
-            # per-DUT in case different DUTs have different baseboard compatibility
-            tool_config = self.config_manager.get_tool_config()
-            tool_include_collectors = getattr(tool_config, "include_collectors", [])
-            if tool_include_collectors:
-                await self._log_runtime(
-                    "INFO",
-                    f"Applying --include-collectors filter for DUT {dut_id}: only collectors in {tool_include_collectors} will run",
-                    dut_id=dut_id,
-                )
-
-                # Filter: only keep collectors that are in the include_collectors list
-                original_count = len(dut_filtered)
-                kept_collectors = []
-                filtered_out_collectors = []
-
-                for cid in dut_filtered:
-                    if cid in tool_include_collectors:
-                        kept_collectors.append(cid)
-                    else:
-                        filtered_out_collectors.append(cid)
-
-                dut_filtered = kept_collectors
-
-                if filtered_out_collectors:
-                    await self._log_runtime(
-                        "INFO",
-                        f"Filtered out {len(filtered_out_collectors)} collectors for DUT {dut_id} that were not in --include-collectors list: {filtered_out_collectors}",
-                        dut_id=dut_id,
-                    )
-
-                if kept_collectors:
-                    await self._log_runtime(
-                        "DEBUG",
-                        f"Kept {len(kept_collectors)} collectors for DUT {dut_id} from --include-collectors filter: {kept_collectors}",
-                        dut_id=dut_id,
-                    )
-
-                # Log if any collectors from include_collectors were not in the original filtered list
-                # This helps debug cases where users expect a collector to run but it was filtered earlier
-                missing_from_original = [
-                    cid
-                    for cid in tool_include_collectors
-                    if cid not in dut_filtered and cid not in filtered_out_collectors
-                ]
-                if missing_from_original:
-                    await self._log_runtime(
-                        "DEBUG",
-                        f"Collectors in --include-collectors that were already filtered out (by baseboard/skip/etc.) for DUT {dut_id}: {missing_from_original}",
-                        dut_id=dut_id,
-                    )
-
             await self._log_runtime(
                 "DEBUG",
                 f"DUT {dut_id}: Collector loop complete. Filtered: {dut_filtered}, Skipped: {len(dut_skipped)}",
@@ -670,6 +668,27 @@ class ExecutionEngine:
 
             filtered_collectors_per_dut[dut_id] = dut_filtered
             skipped_collectors_per_dut[dut_id] = dut_skipped
+
+            # Summarize skip reasons compactly
+            if skipped_by_config > 0:
+                skip_reasons = {}
+                for s in dut_skipped:
+                    if s.get("skip_type") == "config":
+                        reason = s.get("reason", "unknown")
+                        flag = (
+                            reason.split("due to ")[-1].split("=")[0]
+                            if "due to " in reason
+                            else reason
+                        )
+                        skip_reasons.setdefault(flag, []).append(s["collector_id"])
+                skip_summary = "; ".join(
+                    f"{flag}: {','.join(ids)}" for flag, ids in skip_reasons.items()
+                )
+                await self._log_runtime(
+                    "INFO",
+                    f"DUT {dut_id} skipped {skipped_by_config} collectors by config ({skip_summary})",
+                    dut_id=dut_id,
+                )
 
             await self._log_runtime(
                 "INFO",
@@ -737,7 +756,7 @@ class ExecutionEngine:
 
             # Get tool-level skip/include collector lists
             tool_skip_collectors = tool_config.get("skip_collectors", [])
-            tool_include_collectors = tool_config.get("include_collectors", [])
+            tool_include_collectors = self._get_tool_include_collectors(tool_config)
 
             await self._log_runtime(
                 "DEBUG",
@@ -799,8 +818,11 @@ class ExecutionEngine:
             # Check if this collector was explicitly requested via -S or --include-collectors
             # If so, skip ALL skip flag checks to allow it to run
             tool_config = self.config_manager.get_tool_config()
-            explicitly_requested_str = tool_config.get("collector_id", "")
-            include_collectors = tool_config.get("include_collectors", [])
+            include_collectors = self._get_tool_include_collectors(tool_config)
+            if isinstance(tool_config, dict):
+                explicitly_requested_str = tool_config.get("collector_id", "")
+            else:
+                explicitly_requested_str = getattr(tool_config, "collector_id", "")
 
             # Parse explicitly_requested_str (comma-separated) into a list
             explicitly_requested = []
@@ -877,6 +899,19 @@ class ExecutionEngine:
                     return (
                         True,
                         f"Collector {collector_id} in DUT {dut_id} COLLECTOR_TO_SKIP list",
+                    )
+
+            # Check streaming_only filter
+            streaming_only = tool_config.get("streaming_only", False)
+            if streaming_only:
+                collector_info_stream = self.config_manager.get_collector_info(
+                    collector_id
+                )
+                is_streaming = collector_info_stream.get("streaming_candidate", False)
+                if not is_streaming:
+                    return (
+                        True,
+                        f"Collector {collector_id} skipped: not a streaming candidate (--streaming-only mode)",
                     )
 
             # Check legacy skip flags based on collector group
@@ -957,7 +992,7 @@ class ExecutionEngine:
                             else "tool config"
                         )
                         await self._log_runtime(
-                            "INFO",
+                            "DEBUG",
                             f"Collector {collector_id} skipped due to {skip_flag}=True in {skip_source}",
                             dut_id=dut_id,
                         )
@@ -1085,9 +1120,6 @@ class ExecutionEngine:
                 )
                 break
 
-            # Get collector name from definitions
-            collector_name = self._get_collector_name(collector_id)
-
             # Update main progress description with overall status
             progress.update(
                 main_task,
@@ -1193,7 +1225,7 @@ class ExecutionEngine:
                     if hasattr(self, "progress_state") and self.progress_state:
                         await self._log_runtime(
                             "DEBUG",
-                            f"progress_state is available, calling start_collector",
+                            "progress_state is available, calling start_collector",
                             dut_id=dut_id,
                         )
                         try:
@@ -1225,7 +1257,7 @@ class ExecutionEngine:
                     else:
                         await self._log_runtime(
                             "DEBUG",
-                            f"progress_state not available or None",
+                            "progress_state not available or None",
                             dut_id=dut_id,
                         )
 
@@ -1298,7 +1330,7 @@ class ExecutionEngine:
                                         "execution_time", 0.0
                                     ),
                                 )
-                            except Exception:
+                            except Exception as e:
                                 # Don't let progress tracking break execution
                                 await self._log_runtime(
                                     "DEBUG",
@@ -1344,7 +1376,7 @@ class ExecutionEngine:
                                     collector_results[dut_id].get("reason", ""),
                                     0.0,
                                 )
-                            except Exception:
+                            except Exception as e:
                                 # Don't let progress tracking break execution
                                 await self._log_runtime(
                                     "DEBUG",
@@ -1487,9 +1519,6 @@ class ExecutionEngine:
             dut_results = {}
 
             for i, collector_id in enumerate(collectors):
-                # Get collector name from definitions
-                collector_name = self._get_collector_name(collector_id)
-
                 # Check if collector should be skipped based on configuration (tool-level and per-DUT)
                 should_skip_config, skip_reason_config = (
                     await self._should_skip_collector_by_config(collector_id, dut_id)
@@ -1642,17 +1671,6 @@ class ExecutionEngine:
         )
 
         return results
-
-    async def execute_parallel_collectors_with_progress(
-        self,
-        collectors: List[str],
-        dut_ids: List[str],
-        collection_level: str,
-        progress: Progress,
-        main_task,
-        concurrency_limit: int = 10,
-        progress_state=None,
-    ) -> Dict[str, Any]:
         """
         Execute collectors in parallel with progress tracking.
 
@@ -1695,8 +1713,6 @@ class ExecutionEngine:
 
         # Track completed collectors for progress display
         completed_collectors = 0
-        total_collectors = len(collectors)
-
         # Track DUT start times for parallel execution
         dut_start_times_set = set()
 
@@ -1737,9 +1753,6 @@ class ExecutionEngine:
                     "DEBUG",
                     f"Semaphore acquired for collector {collector_id} - starting execution",
                 )
-                # Get collector name from definitions
-                collector_name = self._get_collector_name(collector_id)
-
                 # Update main progress description with overall status
                 # The main task total is len(collectors) * len(dut_ids), so we need to track progress accordingly
                 progress.update(
@@ -1811,7 +1824,7 @@ class ExecutionEngine:
                                     skip_reason_config,
                                     0.0,
                                 )
-                            except Exception:
+                            except Exception as e:
                                 await self._log_runtime(
                                     "DEBUG",
                                     f"Error calling progress_state.complete_collector: {e}",
@@ -1900,7 +1913,7 @@ class ExecutionEngine:
                                     "parallel",
                                     "parallel_execution",
                                 )
-                            except Exception:
+                            except Exception as e:
                                 await self._log_runtime(
                                     "DEBUG",
                                     f"Error calling progress_state.start_collector: {e}",
@@ -2029,7 +2042,7 @@ class ExecutionEngine:
                                         collector_results[dut_id].get("reason", ""),
                                         0.0,
                                     )
-                                except Exception:
+                                except Exception as e:
                                     await self._log_runtime(
                                         "DEBUG",
                                         f"Error calling progress_state.complete_collector: {e}",
@@ -2075,7 +2088,7 @@ class ExecutionEngine:
                                     collector_results[dut_id].get("reason", ""),
                                     0.0,
                                 )
-                            except Exception:
+                            except Exception as e:
                                 await self._log_runtime(
                                     "DEBUG",
                                     f"Error calling progress_state.complete_collector: {e}",
@@ -2230,6 +2243,14 @@ class ExecutionEngine:
                 should_skip, skip_reason = filtered_collectors[collector_id][dut_id]
 
                 if should_skip:
+                    if self._is_baseboard_skip_reason(skip_reason):
+                        await self._log_runtime(
+                            "DEBUG",
+                            f"Pre-execution baseboard exclusion for {collector_id} on {dut_id}: {skip_reason}",
+                            dut_id=dut_id,
+                        )
+                        return collector_id, None
+
                     # Update status tracking for skipped collector
                     if self.status_tracker:
                         await self._log_runtime(
@@ -2271,7 +2292,7 @@ class ExecutionEngine:
                                 skip_reason,
                                 0.0,
                             )
-                        except Exception:
+                        except Exception as e:
                             await self._log_runtime(
                                 "DEBUG",
                                 f"Error calling progress_state.complete_collector: {e}",
@@ -2316,7 +2337,7 @@ class ExecutionEngine:
                             await progress_state.start_collector(
                                 dut_id, collector_id, service_name, "parallel"
                             )
-                        except Exception:
+                        except Exception as e:
                             # Don't let progress tracking break execution
                             await self._log_runtime(
                                 "DEBUG",
@@ -2338,6 +2359,12 @@ class ExecutionEngine:
                             "dut_id": dut_id,
                             "collection_level": collection_level,
                         }
+
+                    # Set async-safe per-task context so all logging within this task uses the correct CID.
+                    # This must happen here (in the live parallel path) — the identical call in
+                    # execute_single_collector (line ~1903) is unreachable dead code after the
+                    # return at line 1615 inside execute_sequential_collectors_parallel_duts.
+                    _collector_context.set(collector_id)
 
                     # Set per-collector context with original collector ID for cross-contamination prevention
                     if self.orchestrator and hasattr(
@@ -2453,7 +2480,7 @@ class ExecutionEngine:
                                     collector_result.get("reason", ""),
                                     0.0,
                                 )
-                            except Exception:
+                            except Exception as e:
                                 await self._log_runtime(
                                     "DEBUG",
                                     f"Error calling progress_state.complete_collector: {e}",
@@ -2536,6 +2563,14 @@ class ExecutionEngine:
                     continue
 
                 collector_id, collector_result = result
+                if collector_result is None:
+                    if progress and dut_id in dut_tasks:
+                        try:
+                            progress.advance(dut_tasks[dut_id], advance=1)
+                        except Exception:
+                            pass
+                    continue
+
                 dut_results[collector_id] = collector_result
 
                 # Update per-DUT progress (only if progress is available)
@@ -2554,8 +2589,8 @@ class ExecutionEngine:
             return dut_results
 
         # Execute all DUTs in parallel
-        dut_tasks = [execute_collectors_for_dut(dut_id) for dut_id in dut_ids]
-        dut_results = await asyncio.gather(*dut_tasks, return_exceptions=True)
+        dut_task_coros = [execute_collectors_for_dut(dut_id) for dut_id in dut_ids]
+        dut_results = await asyncio.gather(*dut_task_coros, return_exceptions=True)
 
         # Process results - reorganize by collector_id
         for i, dut_result in enumerate(dut_results):
@@ -2669,15 +2704,25 @@ class ExecutionEngine:
                 service_results = {}
 
                 for i, collector_id in enumerate(service_collectors):
-                    # Get collector name from definitions
-                    collector_name = self._get_collector_name(collector_id)
-
                     # Check if collector should be skipped for this specific DUT due to preflight failure
                     should_skip, skip_reason = await self._should_skip_collector(
                         collector_id, dut_id
                     )
 
                     if should_skip:
+                        if self._is_baseboard_skip_reason(skip_reason):
+                            await self._log_runtime(
+                                "DEBUG",
+                                f"Pre-execution baseboard exclusion for {collector_id} on {dut_id}: {skip_reason}",
+                                dut_id=dut_id,
+                            )
+                            if progress and dut_id in dut_tasks:
+                                try:
+                                    progress.advance(dut_tasks[dut_id], advance=1)
+                                except Exception:
+                                    pass
+                            continue
+
                         # Skip collector execution for this DUT
                         service_results[collector_id] = {
                             "status": "skipped",
@@ -2727,7 +2772,7 @@ class ExecutionEngine:
                     if progress_state:
                         await self._log_runtime(
                             "DEBUG",
-                            f"progress_state is available, calling start_collector",
+                            "progress_state is available, calling start_collector",
                             dut_id=dut_id,
                         )
                         try:
@@ -2739,7 +2784,7 @@ class ExecutionEngine:
                             )
                             await self._log_runtime(
                                 "DEBUG",
-                                f"progress_state.start_collector called successfully",
+                                "progress_state.start_collector called successfully",
                                 dut_id=dut_id,
                             )
                         except Exception as e:
@@ -2753,11 +2798,13 @@ class ExecutionEngine:
                     else:
                         await self._log_runtime(
                             "DEBUG",
-                            f"progress_state not available or None",
+                            "progress_state not available or None",
                             dut_id=dut_id,
                         )
 
                     try:
+                        _collector_context.set(collector_id)
+
                         await self._log_runtime(
                             "INFO",
                             f"Executing {service_name} collector {collector_id} on DUT {dut_id} (sequential within service)",
@@ -2805,7 +2852,7 @@ class ExecutionEngine:
                             if progress_state:
                                 await self._log_runtime(
                                     "DEBUG",
-                                    f"progress_state is available, calling complete_collector",
+                                    "progress_state is available, calling complete_collector",
                                     dut_id=dut_id,
                                 )
                                 try:
@@ -2822,7 +2869,7 @@ class ExecutionEngine:
                                     )
                                     await self._log_runtime(
                                         "DEBUG",
-                                        f"progress_state.complete_collector called successfully",
+                                        "progress_state.complete_collector called successfully",
                                         dut_id=dut_id,
                                     )
                                 except Exception as e:
@@ -2836,7 +2883,7 @@ class ExecutionEngine:
                             else:
                                 await self._log_runtime(
                                     "DEBUG",
-                                    f"progress_state not available or None",
+                                    "progress_state not available or None",
                                     dut_id=dut_id,
                                 )
 
@@ -2932,9 +2979,14 @@ class ExecutionEngine:
 
                 return service_results
 
-            # Execute all services in parallel for this DUT
+            # Execute all services in parallel for this DUT.
+            # Each service gets its own Task so _collector_context is isolated per-service.
             service_tasks = [
-                execute_service_sequential_collectors(service_name, service_collectors)
+                asyncio.create_task(
+                    execute_service_sequential_collectors(
+                        service_name, service_collectors
+                    )
+                )
                 for service_name, service_collectors in service_groups.items()
             ]
             service_results_list = await asyncio.gather(*service_tasks)
@@ -2947,7 +2999,9 @@ class ExecutionEngine:
 
         # Execute sequential collectors for all DUTs in parallel
         dut_tasks_list = [
-            execute_sequential_collectors_for_dut_grouped_by_service(dut_id)
+            asyncio.create_task(
+                execute_sequential_collectors_for_dut_grouped_by_service(dut_id)
+            )
             for dut_id in dut_ids
         ]
         dut_results_list = await asyncio.gather(*dut_tasks_list)
@@ -2967,144 +3021,6 @@ class ExecutionEngine:
                 main_task,
                 description=f"Overall Progress -- Service-grouped sequential collectors ({len(collectors)}/{len(collectors)} completed)",
             )
-
-        return results
-
-    async def execute_parallel_collectors_no_progress(
-        self,
-        collectors: List[str],
-        dut_ids: List[str],
-        collection_level: str,
-        concurrency_limit: int = 10,
-    ) -> Dict[str, Any]:
-        """
-        Execute collectors in parallel without progress bars.
-
-        Args:
-            collectors: List of collector IDs.
-            dut_ids: List of DUT IDs.
-            collection_level: Collection level.
-            concurrency_limit: Maximum concurrent tasks.
-
-        Returns:
-            Dictionary of execution results per DUT and collector.
-        """
-        results = {}
-
-        # Create semaphore for concurrency control
-        semaphore = asyncio.Semaphore(concurrency_limit)
-
-        async def execute_single_collector(collector_id: str) -> tuple:
-            """
-            Execute a single collector on all DUTs.
-
-            Args:
-                collector_id: Collector ID.
-
-            Returns:
-                Tuple of (collector_id, results_dict).
-            """
-            async with semaphore:
-                # Check for shutdown request
-                if (
-                    hasattr(self.orchestrator, "is_shutdown_requested")
-                    and self.orchestrator.is_shutdown_requested()
-                ):
-                    await self._log_runtime(
-                        "WARN", f"Shutdown requested, skipping collector {collector_id}"
-                    )
-                    return collector_id, {}
-
-                collector_results = {}
-                for dut_id in dut_ids:
-                    # Check for shutdown request
-                    if (
-                        hasattr(self.orchestrator, "is_shutdown_requested")
-                        and self.orchestrator.is_shutdown_requested()
-                    ):
-                        await self._log_runtime(
-                            "WARN",
-                            f"Shutdown requested, stopping execution for DUT {dut_id}",
-                        )
-                        break
-                    # Set current collector context for logging
-                    if self.orchestrator and hasattr(
-                        self.orchestrator, "current_collector_id"
-                    ):
-                        self.orchestrator.current_collector_id = collector_id
-                    if self.orchestrator and hasattr(
-                        self.orchestrator, "current_execution_context"
-                    ):
-                        self.orchestrator.current_execution_context = {
-                            "collector_id": collector_id,
-                            "dut_id": dut_id,
-                            "collection_level": collection_level,
-                        }
-
-                    # Set per-collector context with original collector ID for cross-contamination prevention
-                    if self.orchestrator and hasattr(
-                        self.orchestrator, "set_collector_execution_context"
-                    ):
-                        context = {
-                            "collector_id": collector_id,
-                            "dut_id": dut_id,
-                            "collection_level": collection_level,
-                            "original_collector_id": collector_id,  # Store the original collector ID
-                        }
-                        await self.orchestrator.set_collector_execution_context(
-                            dut_id, collector_id, context
-                        )
-
-                    # Check for shutdown before executing collector
-                    if (
-                        hasattr(self.orchestrator, "is_shutdown_requested")
-                        and self.orchestrator.is_shutdown_requested()
-                    ):
-                        await self._log_runtime(
-                            "WARN",
-                            f"Shutdown requested, skipping collector {collector_id} on DUT {dut_id}",
-                        )
-                        collector_results[dut_id] = {
-                            "status": "interrupted",
-                            "reason": "Shutdown requested",
-                            "execution_time": 0.0,
-                        }
-                        break
-
-                    try:
-                        service = await self._get_service_for_collector(collector_id)
-                        if service:
-                            result = await service.execute_collector(
-                                dut_id, collector_id, collection_level
-                            )
-                            collector_results[dut_id] = self._normalize_result(result)
-                        else:
-                            collector_results[dut_id] = {
-                                "status": "error",
-                                "reason": f"No service found for collector {collector_id}",
-                            }
-                    except Exception as e:
-                        collector_results[dut_id] = {
-                            "status": "error",
-                            "reason": f"Execution failed: {str(e)}",
-                        }
-
-                return collector_id, collector_results
-
-        # Execute all collectors in parallel
-        tasks = [execute_single_collector(collector_id) for collector_id in collectors]
-        collector_results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Process results
-        for result in collector_results:
-            if isinstance(result, Exception):
-                await self._log_runtime(
-                    "error", f"Collector execution failed: {result}"
-                )
-                continue
-
-            collector_id, results_dict = result
-            results[collector_id] = results_dict
 
         return results
 
@@ -3218,61 +3134,6 @@ class ExecutionEngine:
 
         return filtered_collectors_by_dut
 
-    def _categorize_collectors_by_group_and_bucket(
-        self, collectors: List[str]
-    ) -> Dict[str, CollectorGroup]:
-        """
-        Categorize collectors into groups and buckets.
-
-        Args:
-            collectors: List of collector IDs.
-
-        Returns:
-            Dictionary mapping service names to CollectorGroup instances.
-        """
-        groups = {}
-
-        # Get sequential/parallel categorization
-        sequential_collectors = self.config_manager.get_sequential_collectors()
-        parallel_collectors = self.config_manager.get_parallel_collectors()
-
-        # Group collectors by service
-        for collector_id in collectors:
-            service_name = self._get_service_name_for_collector(collector_id)
-            if not service_name:
-                continue
-
-            if service_name not in groups:
-                groups[service_name] = {"sequential": [], "parallel": []}
-
-            # Categorize as sequential or parallel
-            if collector_id in sequential_collectors:
-                groups[service_name]["sequential"].append(collector_id)
-            else:
-                groups[service_name]["parallel"].append(collector_id)
-
-        # Convert to CollectorGroup objects
-        collector_groups = {}
-        for service_name, buckets in groups.items():
-            sequential_bucket = CollectorBucket(
-                collectors=buckets["sequential"],
-                is_sequential=True,
-                service_name=service_name,
-            )
-            parallel_bucket = CollectorBucket(
-                collectors=buckets["parallel"],
-                is_sequential=False,
-                service_name=service_name,
-            )
-
-            collector_groups[service_name] = CollectorGroup(
-                service_name=service_name,
-                sequential_bucket=sequential_bucket,
-                parallel_bucket=parallel_bucket,
-            )
-
-        return collector_groups
-
     def _get_service_name_for_collector(self, collector_id: str) -> Optional[str]:
         """
         Get service name for a collector.
@@ -3283,6 +3144,10 @@ class ExecutionEngine:
         Returns:
             Service name or None if not found.
         """
+        # Check if collector_id is valid (non-empty)
+        if not collector_id:
+            return None
+
         # Map collector prefixes to service names
         service_mapping = {
             "R": "redfish",

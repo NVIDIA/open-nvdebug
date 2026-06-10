@@ -25,7 +25,7 @@ import gc
 import logging
 import signal
 import sys
-import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
@@ -42,10 +42,12 @@ from rich.progress import (
 )
 from rich.table import Table
 
+from ..services.dynamic_discovery_service import DiscoveryConfig
 from ..services.html_report_service import HTMLReportService
 from ..utils.console_output import create_sanitized_console
 from ..utils.dependency_checker import DependencyChecker
 from ..utils.enums import CollectorServiceMapping
+from ..utils.json_utils import safe_json_dump
 from ..utils.timing_manager import TimingManager
 from .async_logger import AsyncSafeLogger
 from .cleanup_manager import CleanupManager
@@ -59,6 +61,21 @@ from .progress_state_manager import ProgressStateManager
 from .reporting_engine import ReportingEngine
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class CollectorClassification:
+    normal_sequential: List[str]
+    normal_parallel: List[str]
+    tail: List[str]
+
+
+@dataclass(frozen=True)
+class DutExecutionPlan:
+    dut_id: str
+    normal_sequential: List[str]
+    normal_parallel: List[str]
+    tail: List[str]
 
 
 class WorkflowOrchestrator:
@@ -167,6 +184,8 @@ class WorkflowOrchestrator:
         self.execution_summary_manager = ExecutionSummaryManager(self.log_dir)
         # Set logger reference for execution summary manager
         self.execution_summary_manager.logger = self.logger
+        self._execution_order_counters: Dict[str, int] = {}
+        self._execution_order_entries: Dict[str, List[Dict[str, str]]] = {}
 
         # Sanitizer will be set by CLI handler if sanitization is enabled
         self.sanitizer = None
@@ -300,7 +319,8 @@ class WorkflowOrchestrator:
 
         # Set orchestrator reference in reporting engine, logger, and execution engine
         self.reporting_engine.orchestrator = self
-        self.logger.orchestrator = self
+        if self.logger:
+            self.logger.orchestrator = self
         self.execution_engine.orchestrator = self
 
     async def async_init(self) -> None:
@@ -365,7 +385,7 @@ class WorkflowOrchestrator:
         Returns:
             Dictionary of all collector definitions.
         """
-        return self.config_manager.get_all_collectors()
+        return self.config_manager.get_all_collectors()  # pragma: no cover
 
     def get_sequential_collectors(self) -> Set[str]:
         """
@@ -498,7 +518,12 @@ class WorkflowOrchestrator:
                 for dut_id in dut_ids:
                     dut = self.dut_manager.get_dut(dut_id)
                     if dut and dut.config:
-                        baseboard = dut.config.get("baseboard", "Unknown")
+                        baseboard = dut.config.get("baseboard")
+                        # Normalize None/empty baseboard to "Unknown" to keep logging/join safe
+                        if not baseboard:
+                            baseboard = "Unknown"
+                        else:
+                            baseboard = str(baseboard)
                         baseboards.add(baseboard)
 
                 if len(baseboards) == 1:
@@ -559,7 +584,25 @@ class WorkflowOrchestrator:
                 # Check if collector is in the requested list
                 if collector_id in collector_ids:
                     # Check baseboard applicability
-                    if self._is_collector_applicable(collector_info, baseboard_info):
+                    try:
+                        is_applicable = self._is_collector_applicable(
+                            collector_info, baseboard_info
+                        )
+                    except ValueError as e:
+                        # Baseboard not found in spreadsheet - this is a critical configuration error
+                        # Log the error and exit
+                        error_msg = str(e)
+                        await self.logger.log_runtime(
+                            "ERROR",
+                            f"CRITICAL: {error_msg}",
+                        )
+                        if hasattr(self, "logger") and hasattr(self.logger, "console"):
+                            self.logger.console.print_error(error_msg)
+                        else:
+                            print(f"ERROR: {error_msg}")
+                        sys.exit(1)
+
+                    if is_applicable:
                         # Check collection level
                         collector_level = collector_info.get("collection_level", "L3")
                         if self._is_collector_level_applicable(
@@ -582,8 +625,12 @@ class WorkflowOrchestrator:
                     else:
                         # Check why it's not applicable
                         tags = collector_info.get("tags", {})
-                        include_tags = tags.get("include", [])
-                        exclude_tags = tags.get("exclude", [])
+                        if isinstance(tags, dict):
+                            include_tags = tags.get("include", [])
+                            exclude_tags = tags.get("exclude", [])
+                        else:
+                            include_tags = []
+                            exclude_tags = []
 
                         if exclude_tags:
                             status = "Not applicable"
@@ -607,7 +654,25 @@ class WorkflowOrchestrator:
                         not_applicable_collectors += 1
                 else:
                     # Collector not requested
-                    if self._is_collector_applicable(collector_info, baseboard_info):
+                    try:
+                        is_applicable = self._is_collector_applicable(
+                            collector_info, baseboard_info
+                        )
+                    except ValueError as e:
+                        # Baseboard not found in spreadsheet - this is a critical configuration error
+                        # Log the error and exit
+                        error_msg = str(e)
+                        await self.logger.log_runtime(
+                            "ERROR",
+                            f"CRITICAL: {error_msg}",
+                        )
+                        if hasattr(self, "logger") and hasattr(self.logger, "console"):
+                            self.logger.console.print_error(error_msg)
+                        else:
+                            print(f"ERROR: {error_msg}")
+                        sys.exit(1)
+
+                    if is_applicable:
                         status = "Not selected"
                         reason = "Collector not included in current selection"
                         not_applicable_collectors += 1
@@ -646,8 +711,11 @@ class WorkflowOrchestrator:
                             f"{truncated_collector_name:<30} {collector_level:<6} {status:<15} {truncated_dut_reason:<80}"
                         )
 
+                        log_level = (
+                            "INFO" if status in ("Included", "Excluded") else "DEBUG"
+                        )
                         await self.logger.write_to_dut_runtime_log(
-                            dut_id, "INFO", "CollectorSelection", table_row
+                            dut_id, log_level, "CollectorSelection", table_row
                         )
                 else:
                     # Single DUT or no DUT manager - use global reason
@@ -657,8 +725,11 @@ class WorkflowOrchestrator:
                         f"{truncated_collector_name:<30} {collector_level:<6} {status:<15} {truncated_reason:<80}"
                     )
 
+                    log_level = (
+                        "INFO" if status in ("Included", "Excluded") else "DEBUG"
+                    )
                     await self.logger.log_runtime(
-                        "INFO", "CollectorSelection", table_row
+                        log_level, "CollectorSelection", table_row
                     )
 
                     # Add row to Rich table
@@ -671,11 +742,10 @@ class WorkflowOrchestrator:
                         truncated_reason,
                     )
 
-                    # Also write to each DUT's runtime log
                     if self.dut_manager:
                         for dut_id in self.dut_manager.get_all_dut_ids():
                             await self.logger.write_to_dut_runtime_log(
-                                dut_id, "INFO", "CollectorSelection", table_row
+                                dut_id, log_level, "CollectorSelection", table_row
                             )
 
                 total_collectors += 1
@@ -740,6 +810,88 @@ class WorkflowOrchestrator:
             custom_reason,
             collector_id,
         )
+
+    async def record_execution_order_entry(
+        self, dut_id: str, collector_id: str
+    ) -> None:
+        if not dut_id:
+            return
+        if dut_id not in self._execution_order_counters:
+            self._execution_order_counters[dut_id] = 0
+        self._execution_order_counters[dut_id] += 1
+        collector_info = self.get_collector_info(collector_id) or {}
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if dut_id not in self._execution_order_entries:
+            self._execution_order_entries[dut_id] = []
+        self._execution_order_entries[dut_id].append(
+            {
+                "order": str(self._execution_order_counters[dut_id]),
+                "timestamp": timestamp,
+                "id": str(collector_id),
+                "name": str(collector_info.get("name", "Unknown")),
+                "group": str(collector_info.get("group", "Unknown")),
+            }
+        )
+
+    def _build_execution_order_table(self, dut_id: str) -> str:
+        rows = self._execution_order_entries.get(dut_id, [])
+        if not rows:
+            return ""
+        header = "Order  | Timestamp           | ID    | Name                          | Group\n"
+        separator = "------ | ------------------- | ----- | ----------------------------- | -----\n"
+        lines = [header, separator]
+        for row in rows:
+            lines.append(
+                f"{row['order'].ljust(5)} | "
+                f"{row['timestamp']} | "
+                f"{row['id'].ljust(5)} | "
+                f"{row['name'].ljust(29)} | "
+                f"{row['group']}\n"
+            )
+        return "".join(lines)
+
+    def _append_execution_order_table_to_runtime_log(self) -> None:
+        if not self.dut_manager:
+            return
+        for dut_id in self.dut_manager.get_all_dut_ids():
+            table_text = self._build_execution_order_table(dut_id)
+            if not table_text:
+                continue
+            runtime_log_path = self.log_dir / dut_id / "nvdebug_runtime_output.txt"
+            runtime_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(runtime_log_path, "a", encoding="utf-8") as file_handle:
+                file_handle.write("\n")
+                file_handle.write(table_text)
+
+    def _write_execution_order_metadata(self) -> None:
+        if not self.dut_manager:
+            return
+        for dut_id in self.dut_manager.get_all_dut_ids():
+            entries = self._execution_order_entries.get(dut_id, [])
+            if not entries:
+                continue
+            metadata_dir = None
+            if self.logger:
+                try:
+                    metadata_dir = self.logger.get_dut_metadata_dir(dut_id)
+                except Exception:
+                    metadata_dir = None
+            if not metadata_dir:
+                metadata_dir = self.log_dir / dut_id / ".metadata"
+            metadata_dir.mkdir(parents=True, exist_ok=True)
+
+            payload = {
+                "metadata": {
+                    "created_at": datetime.now().isoformat() + "Z",
+                    "last_updated": datetime.now().isoformat() + "Z",
+                },
+                "payload": {
+                    "execution_order": entries,
+                },
+            }
+            output_path = metadata_dir / "execution_order.json"
+            with open(output_path, "w", encoding="utf-8") as file_handle:
+                safe_json_dump(payload, file_handle, indent=4)
 
     async def initialize(self) -> None:
         """
@@ -816,7 +968,7 @@ class WorkflowOrchestrator:
 
             # In quiet mode, initialize only BaseboardManager for collector filtering
             if self.quiet_mode:
-                if not self.quiet_mode:
+                if not self.quiet_mode:  # pragma: no cover
                     progress.update(
                         init_task,
                         description="Quiet mode - initializing BaseboardManager...",
@@ -847,6 +999,7 @@ class WorkflowOrchestrator:
                         redfish_session_config=tool_config.get(
                             "redfish_session_config", {}
                         ),
+                        logger=self.logger,
                     )
 
                     # Initialize only the BaseboardManager, skip DUT connections
@@ -894,6 +1047,7 @@ class WorkflowOrchestrator:
                     redfish_session_config=tool_config.get(
                         "redfish_session_config", {}
                     ),
+                    logger=self.logger,
                 )
 
                 # Step 4: Initialize DUT manager (create DUTs and setup logging)
@@ -973,7 +1127,7 @@ class WorkflowOrchestrator:
                             dut_id, platform, baseboard
                         )
 
-                        # Initialize all collector metadata upfront
+                        # Initialize all collector metadata upfront (like legacy code)
                         await self.logger.initialize_all_collector_metadata(dut_id)
 
                     except Exception as e:
@@ -1054,6 +1208,7 @@ class WorkflowOrchestrator:
                         redfish_session_config=tool_config.get(
                             "redfish_session_config", {}
                         ),
+                        logger=self.logger,
                     )
 
                     # Initialize only the BaseboardManager, skip DUT connections
@@ -1088,6 +1243,7 @@ class WorkflowOrchestrator:
                     redfish_session_config=tool_config.get(
                         "redfish_session_config", {}
                     ),
+                    logger=self.logger,
                 )
 
                 # Initialize DUT manager (create DUTs and setup logging)
@@ -1155,7 +1311,7 @@ class WorkflowOrchestrator:
                             dut_id, platform, baseboard
                         )
 
-                        # Initialize all collector metadata upfront
+                        # Initialize all collector metadata upfront (like legacy code)
                         await self.logger.initialize_all_collector_metadata(dut_id)
 
                     except Exception as e:
@@ -1179,22 +1335,6 @@ class WorkflowOrchestrator:
                     "WorkflowOrchestrator",
                     f"Skipping dependency checking for {len(self.dut_manager.duts)} DUT(s) during initialization (will be done during preflight if needed)",
                 )
-
-    async def get_execution_stats(self) -> Dict[str, Any]:
-        """
-        Get execution statistics.
-
-        Returns:
-            Dictionary of execution statistics.
-        """
-        return {
-            "total_collectors": len(self.get_all_collectors()),
-            "sequential_collectors": len(self.get_sequential_collectors()),
-            "parallel_collectors": len(self.get_parallel_collectors()),
-            "duts_configured": (
-                len(self.dut_manager.get_all_dut_ids()) if self.dut_manager else 0
-            ),
-        }
 
     async def run_preflight_checks(
         self,
@@ -1227,8 +1367,12 @@ class WorkflowOrchestrator:
             f"Starting preflight checks for collector groups: {required_collector_groups or 'all'}",
         )
 
+        collector_definitions = self.config_manager.get_collector_definitions()
+
         preflight_results = await self.dut_manager.run_preflight_checks(
-            required_collector_groups, show_progress=show_progress
+            required_collector_groups,
+            show_progress=show_progress,
+            collector_definitions=collector_definitions,
         )
 
         # End timing for preflight checks
@@ -1257,6 +1401,302 @@ class WorkflowOrchestrator:
         )
 
         return preflight_results
+
+    async def run_dependency_checks(
+        self,
+        collector_ids: Optional[List[str]] = None,
+        preflight_results: Optional[Dict[str, Any]] = None,
+        filtered_collectors_per_dut: Optional[Dict[str, List[str]]] = None,
+    ) -> Dict[str, List[Dict[str, str]]]:
+        """
+        Run dependency checks for all collectors on all DUTs.
+
+        Args:
+            collector_ids: Optional list of collector IDs to check dependencies for.
+                          If None, checks all collectors.
+            preflight_results: Optional preflight results to filter collectors.
+                              Skips dependency checks for collectors whose service failed.
+            filtered_collectors_per_dut: Optional per-DUT mapping of collector IDs.
+                          When provided, each DUT only checks dependencies for its own
+                          collectors (after baseboard/skip/include/exclude filtering)
+                          instead of the union across all DUTs.
+
+        Returns:
+            Dictionary mapping DUT ID to list of dicts with keys:
+            'dependency', 'type', 'collector_id', 'collector_name', 'target'.
+        """
+        if not self.dut_manager:
+            await self.logger.log_runtime(
+                "WARNING",
+                "WorkflowOrchestrator",
+                "DUT manager not initialized, skipping dependency checks",
+            )
+            return {}
+
+        collector_definitions = self.config_manager.get_collector_definitions()
+        if not collector_definitions:
+            await self.logger.log_runtime(
+                "WARNING",
+                "WorkflowOrchestrator",
+                "No collector definitions found, skipping dependency checks",
+            )
+            return {}
+
+        collectors = collector_definitions.get("collectors", {})
+        dut_ids = self.dut_manager.get_all_dut_ids()
+
+        # Filter collectors if specific IDs provided
+        if collector_ids:
+            collectors = {
+                cid: cinfo for cid, cinfo in collectors.items() if cid in collector_ids
+            }
+
+        # Build per-DUT filtered collector lists based on preflight results
+        # Skip collectors whose service failed: S=ssh, I=ipmi, H=host, R=redfish
+        dut_collectors_map = {}
+        total_deps = 0
+
+        for dut_id in dut_ids:
+            if filtered_collectors_per_dut and dut_id in filtered_collectors_per_dut:
+                dut_allowed = set(filtered_collectors_per_dut[dut_id])
+                dut_collectors = {
+                    cid: cinfo
+                    for cid, cinfo in collectors.items()
+                    if cid in dut_allowed
+                }
+            else:
+                dut_collectors = collectors.copy()
+
+            # Filter collectors for this specific DUT based on its preflight results
+            if preflight_results:
+                dut_preflight = preflight_results.get(dut_id, {})
+                services = dut_preflight.get("services", {})
+                prefixes_to_skip = set()
+
+                # Check which services failed for THIS DUT and map to prefixes
+                if services.get("ssh", {}).get("status") != "pass":
+                    prefixes_to_skip.add("S")
+                if services.get("ipmi", {}).get("status") != "pass":
+                    prefixes_to_skip.add("I")
+                if services.get("host", {}).get("status") != "pass":
+                    prefixes_to_skip.add("H")
+                if services.get("redfish", {}).get("status") != "pass":
+                    prefixes_to_skip.add("R")
+
+                # Filter out collectors with failed prefixes for THIS DUT
+                if prefixes_to_skip:
+                    dut_collectors = {
+                        cid: cinfo
+                        for cid, cinfo in dut_collectors.items()
+                        if cid and cid[0].upper() not in prefixes_to_skip
+                    }
+
+            # Store filtered collectors for this DUT
+            dut_collectors_map[dut_id] = dut_collectors
+
+            # Calculate per-DUT and total dependencies for progress bars
+            dut_deps = 0
+            for collector_info in dut_collectors.values():
+                dependencies = collector_info.get("dependencies", {})
+                required_deps = dependencies.get("required", [])
+                dut_deps += len(required_deps)
+            total_deps += dut_deps
+
+        # Set up console for progress display
+        if hasattr(self.logger, "original_stdout") and self.logger.original_stdout:
+            console = Console(file=self.logger.original_stdout, force_terminal=True)
+        else:
+            console = Console(force_terminal=True)
+
+        # Collect missing dependencies per DUT with progress bar
+        dependency_results: Dict[str, List[Dict[str, str]]] = {}
+
+        dep_progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeElapsedColumn(),
+            console=console,
+            refresh_per_second=10,
+        )
+
+        async def _check_deps_for_dut(
+            dut_id: str,
+            overall_task,
+        ) -> tuple:
+            """Check all dependencies for a single DUT."""
+            missing_deps = []
+            seen = set()
+            dut = self.dut_manager.get_dut(dut_id)
+            is_local_mode = False
+            if dut and dut.config:
+                is_local_mode = bool(dut.config.get("local", False))
+
+            if dut_id not in dut_collectors_map:
+                await self.logger.log_runtime(
+                    "WARNING",
+                    "WorkflowOrchestrator",
+                    f"DUT '{dut_id}' not found in dependency collectors map; "
+                    f"skipping dependency checks for this DUT",
+                )
+            dut_collectors = dut_collectors_map.get(dut_id, {})
+
+            for collector_id, collector_info in dut_collectors.items():
+                dependencies = collector_info.get("dependencies", {})
+                required_deps = dependencies.get("required", [])
+                collector_name = collector_info.get("name", "unknown")
+
+                if not required_deps:
+                    continue
+
+                for dep in required_deps:
+                    if isinstance(dep, str):
+                        dep_name = dep
+                        dep_type = "command"
+                    else:
+                        dep_name = dep.get("name", "unknown")
+                        dep_type = dep.get("type", "command")
+
+                    # Determine check target
+                    if is_local_mode or collector_id.startswith("I"):
+                        target = "local"
+                    elif collector_id.startswith("S"):
+                        target = "BMC"
+                    elif collector_id.startswith("H"):
+                        target = "Host"
+                    else:
+                        target = "local"
+
+                    try:
+                        if dep_type == "command":
+                            check_local = (
+                                dep.get("check_local", False)
+                                if isinstance(dep, dict)
+                                else False
+                            )
+                            if (
+                                check_local
+                                or collector_id.startswith("I")
+                                or is_local_mode
+                            ):
+                                result = self.dependency_checker.check_command(
+                                    dep_name, check_local=True
+                                )
+                            elif (
+                                dut_id
+                                and self.dependency_checker.dut_manager
+                                and not is_local_mode
+                            ):
+                                use_bmc = collector_id.startswith("S")
+                                result = (
+                                    await self.dependency_checker._check_command_on_dut(
+                                        dut_id, dep_name, use_bmc=use_bmc
+                                    )
+                                )
+                            else:
+                                result = self.dependency_checker.check_command(dep_name)
+                        elif dep_type == "service":
+                            if is_local_mode:
+                                result = self.dependency_checker.check_service(dep_name)
+                            elif dut_id and self.dependency_checker.dut_manager:
+                                use_bmc = collector_id.startswith("S")
+                                result = (
+                                    await self.dependency_checker._check_service_on_dut(
+                                        dut_id, dep_name, use_bmc=use_bmc
+                                    )
+                                )
+                            else:
+                                result = self.dependency_checker.check_service(dep_name)
+                        elif dep_type == "file":
+                            if (
+                                dut_id
+                                and self.dependency_checker.dut_manager
+                                and not is_local_mode
+                            ):
+                                use_bmc = collector_id.startswith("S")
+                                result = (
+                                    await self.dependency_checker._check_file_on_dut(
+                                        dut_id, dep_name, use_bmc=use_bmc
+                                    )
+                                )
+                            else:
+                                result = self.dependency_checker.check_file(dep_name)
+                        elif dep_type == "platform_service":
+                            dep_config = (
+                                dep if isinstance(dep, dict) else {"name": dep_name}
+                            )
+                            result = (
+                                await self.dependency_checker.check_platform_service(
+                                    dep_config, "default", dut_id
+                                )
+                            )
+                        else:
+                            continue
+
+                        if not result.available:
+                            dedup_key = (dep_name, dep_type, collector_id)
+                            if dedup_key not in seen:
+                                seen.add(dedup_key)
+                                missing_deps.append(
+                                    {
+                                        "dependency": dep_name,
+                                        "type": dep_type,
+                                        "collector_id": collector_id,
+                                        "collector_name": collector_name,
+                                        "target": target,
+                                    }
+                                )
+
+                    except Exception as e:
+                        await self.logger.log_runtime(
+                            "DEBUG",
+                            "WorkflowOrchestrator",
+                            f"Error checking dependency {dep_name} on {dut_id}: {e}",
+                        )
+                        dedup_key = (dep_name, dep_type, collector_id)
+                        if dedup_key not in seen:
+                            seen.add(dedup_key)
+                            missing_deps.append(
+                                {
+                                    "dependency": dep_name,
+                                    "type": dep_type,
+                                    "collector_id": collector_id,
+                                    "collector_name": collector_name,
+                                    "target": target,
+                                }
+                            )
+
+                    finally:
+                        dep_progress.advance(overall_task)
+
+            missing_deps.sort(
+                key=lambda d: (d["target"], d["dependency"], d["collector_id"])
+            )
+            return dut_id, missing_deps
+
+        with dep_progress:
+            overall_task = dep_progress.add_task(
+                f"[cyan]Dependency Checks ({len(dut_ids)} DUTs, {total_deps} dependencies)",
+                total=total_deps,
+            )
+
+            all_coros = [
+                _check_deps_for_dut(dut_id, overall_task) for dut_id in dut_ids
+            ]
+            all_results = await asyncio.gather(*all_coros, return_exceptions=True)
+            for result in all_results:
+                if isinstance(result, Exception):
+                    await self.logger.log_runtime(
+                        "ERROR",
+                        "WorkflowOrchestrator",
+                        f"Dependency check failed: {result}",
+                    )
+                else:
+                    dut_id, missing = result
+                    dependency_results[dut_id] = missing
+
+        return dependency_results
 
     async def generate_html_reports(
         self,
@@ -1288,7 +1728,11 @@ class WorkflowOrchestrator:
 
             # Check if HTML reports are enabled in configuration
             tool_config = self.config_manager.get_tool_config()
-            generate_html = getattr(tool_config, "GENERATE_HTML_REPORTS", True)
+            generate_html = (
+                tool_config.get("GENERATE_HTML_REPORTS", True)
+                if isinstance(tool_config, dict)
+                else getattr(tool_config, "GENERATE_HTML_REPORTS", True)
+            )
 
             if not generate_html:
                 await self.logger.log_runtime(
@@ -1384,6 +1828,52 @@ class WorkflowOrchestrator:
             self.sanitized_console.print_error(
                 f"HTML report generation error: {str(e)}"
             )
+            return False
+
+    async def _generate_spa_report(self) -> bool:
+        """Generate SPA report using ManifestService."""
+        try:
+            from ..services.manifest_service import ManifestService
+
+            await self.logger.log_runtime(
+                "INFO",
+                "WorkflowOrchestrator",
+                "Starting SPA report generation...",
+            )
+            self.sanitized_console.print_info("Starting SPA report generation...")
+
+            # Locate the pre-built SPA dist assets
+            spa_dist_dir = Path(__file__).parent.parent / "report_app_dist"
+            if not spa_dist_dir.exists():
+                await self.logger.log_runtime(
+                    "WARNING",
+                    "WorkflowOrchestrator",
+                    f"SPA dist not found at {spa_dist_dir}. Run 'make build-report-app' first.",
+                )
+                self.sanitized_console.print_warning(
+                    "SPA dist not found. Run 'make build-report-app' first."
+                )
+                return False
+
+            report_dir = self.log_dir / "reports"
+            service = ManifestService(self.log_dir, spa_dist_dir)
+            result = await service.generate_report(report_dir)
+
+            await self.logger.log_runtime(
+                "INFO",
+                "WorkflowOrchestrator",
+                f"SPA report generated at {result}",
+            )
+            self.sanitized_console.print_success(f"SPA report generated at {result}")
+            return True
+
+        except Exception as e:
+            await self.logger.log_runtime(
+                "ERROR",
+                "WorkflowOrchestrator",
+                f"SPA report generation error: {str(e)}",
+            )
+            self.sanitized_console.print_error(f"SPA report generation error: {str(e)}")
             return False
 
     def _get_collector_groups_from_ids(
@@ -1552,53 +2042,39 @@ class WorkflowOrchestrator:
         with progress:
             task = progress.add_task("Gathering platform information", total=total_duts)
 
-            # Run platform info gathering in batches to balance speed and system load
-            batch_size = 5  # Process 5 DUTs concurrently at a time
+            # Run platform info gathering concurrently for all DUTs
+            all_tasks = [
+                gather_platform_info_for_dut(dut_id, task) for dut_id in dut_ids
+            ]
+            all_results = await asyncio.gather(*all_tasks, return_exceptions=True)
+
             results = []
-
-            for i in range(0, len(dut_ids), batch_size):
-                batch = dut_ids[i : i + batch_size]
-                await self.logger.log_runtime(
-                    "DEBUG",
-                    "WorkflowOrchestrator",
-                    f"Processing platform info batch {i//batch_size + 1}/{(len(dut_ids) + batch_size - 1)//batch_size} ({len(batch)} DUTs)",
-                )
-
-                # Process this batch concurrently
-                batch_tasks = [
-                    gather_platform_info_for_dut(dut_id, task) for dut_id in batch
-                ]
-                batch_results = await asyncio.gather(
-                    *batch_tasks, return_exceptions=True
-                )
-
-                # Process batch results
-                for j, result in enumerate(batch_results):
-                    if isinstance(result, Exception):
-                        dut_id = batch[j]
-                        await self.logger.log_runtime(
-                            "ERROR",
-                            "WorkflowOrchestrator",
-                            f"Failed to gather platform info for DUT {dut_id}: {str(result)}",
+            for j, result in enumerate(all_results):
+                if isinstance(result, Exception):
+                    dut_id = dut_ids[j]
+                    await self.logger.log_runtime(
+                        "ERROR",
+                        "WorkflowOrchestrator",
+                        f"Failed to gather platform info for DUT {dut_id}: {str(result)}",
+                    )
+                    results.append(
+                        (
+                            dut_id,
+                            {
+                                "model": "Unknown",
+                                "partnumber": "Unknown",
+                                "serialnumber": "Unknown",
+                            },
                         )
-                        results.append(
-                            (
-                                dut_id,
-                                {
-                                    "model": "Unknown",
-                                    "partnumber": "Unknown",
-                                    "serialnumber": "Unknown",
-                                },
-                            )
-                        )
-                    else:
-                        results.append(result)
+                    )
+                else:
+                    results.append(result)
 
-                    progress.update(task, advance=1)
+                progress.update(task, advance=1)
 
             # Process results and update progress
             for i, result in enumerate(results):
-                if isinstance(result, Exception):
+                if isinstance(result, Exception):  # pragma: no cover
                     # Handle any exceptions that weren't caught
                     dut_id = dut_ids[i]
                     await self.logger.log_runtime(
@@ -1625,6 +2101,76 @@ class WorkflowOrchestrator:
         )
 
         return platform_results
+
+    async def _check_firmware_inventory_needed(
+        self, collector_ids: List[str], dut_ids: List[str]
+    ) -> bool:
+        """
+        Check if any filtered collectors require firmware inventory discovery.
+
+        Analyzes collector definitions to see if they have use_firmware_inventory
+        parameters and if any target DUT's baseboard requires firmware inventory.
+
+        Args:
+            collector_ids: List of collector IDs to check
+            dut_ids: List of DUT IDs to check baseboards for
+
+        Returns:
+            True if firmware inventory discovery should be enabled
+        """
+        await self.logger.log_runtime(
+            "DEBUG",
+            "WorkflowOrchestrator",
+            f"Checking if firmware inventory is needed for collectors: {collector_ids}",
+        )
+
+        for collector_id in collector_ids:
+            collector_info = self.get_collector_info(collector_id)
+            if not collector_info:
+                continue
+
+            # Check validation stage hooks for use_firmware_inventory parameter
+            stages = collector_info.get("stages", {})
+            validation_hooks = stages.get("validation", {}).get("hooks", [])
+
+            for hook in validation_hooks:
+                params = hook.get("params", {})
+                use_firmware_inventory = params.get("use_firmware_inventory")
+
+                if use_firmware_inventory:
+                    # Check if any DUT's baseboard requires firmware inventory
+                    for dut_id in dut_ids:
+                        dut = self.dut_manager.get_dut(dut_id)
+                        baseboard = dut.config.get("baseboard")
+
+                        if baseboard:
+                            # Check if this baseboard needs firmware inventory
+                            if isinstance(use_firmware_inventory, dict):
+                                needs_it = use_firmware_inventory.get(
+                                    baseboard
+                                ) or use_firmware_inventory.get("default", False)
+                                if needs_it:
+                                    await self.logger.log_runtime(
+                                        "INFO",
+                                        "WorkflowOrchestrator",
+                                        f"Collector {collector_id} requires firmware inventory for baseboard {baseboard}",
+                                    )
+                                    return True
+                            elif use_firmware_inventory is True:
+                                # Simple boolean True means always needed
+                                await self.logger.log_runtime(
+                                    "INFO",
+                                    "WorkflowOrchestrator",
+                                    f"Collector {collector_id} requires firmware inventory (always enabled)",
+                                )
+                                return True
+
+        await self.logger.log_runtime(
+            "DEBUG",
+            "WorkflowOrchestrator",
+            "No collectors require firmware inventory discovery",
+        )
+        return False
 
     async def run_dynamic_discovery(
         self,
@@ -1825,44 +2371,29 @@ class WorkflowOrchestrator:
                 "Running Redfish dynamic discovery", total=total_duts
             )
 
-            # Run dynamic discovery in batches to balance speed and system load
-            batch_size = 5  # Process 5 DUTs concurrently at a time
-            results = []
+            # Run dynamic discovery concurrently for all DUTs
+            all_tasks = [
+                run_dynamic_discovery_for_dut(dut_id, task) for dut_id in dut_ids
+            ]
+            all_results = await asyncio.gather(*all_tasks, return_exceptions=True)
 
-            for i in range(0, len(dut_ids), batch_size):
-                batch = dut_ids[i : i + batch_size]
-                await self.logger.log_runtime(
-                    "DEBUG",
-                    "WorkflowOrchestrator",
-                    f"Processing dynamic discovery batch {i//batch_size + 1}/{(len(dut_ids) + batch_size - 1)//batch_size} ({len(batch)} DUTs)",
-                )
+            for j, result in enumerate(all_results):
+                if isinstance(result, Exception):
+                    dut_id = dut_ids[j]
+                    await self.logger.log_runtime(
+                        "ERROR",
+                        "WorkflowOrchestrator",
+                        f"Failed to run dynamic discovery for DUT {dut_id}: {str(result)}",
+                    )
+                    discovery_results[dut_id] = {
+                        "success": False,
+                        "error": str(result),
+                    }
+                else:
+                    dut_id, discovery_result = result
+                    discovery_results[dut_id] = discovery_result
 
-                # Process this batch concurrently
-                batch_tasks = [
-                    run_dynamic_discovery_for_dut(dut_id, task) for dut_id in batch
-                ]
-                batch_results = await asyncio.gather(
-                    *batch_tasks, return_exceptions=True
-                )
-
-                # Process batch results
-                for j, result in enumerate(batch_results):
-                    if isinstance(result, Exception):
-                        dut_id = batch[j]
-                        await self.logger.log_runtime(
-                            "ERROR",
-                            "WorkflowOrchestrator",
-                            f"Failed to run dynamic discovery for DUT {dut_id}: {str(result)}",
-                        )
-                        discovery_results[dut_id] = {
-                            "success": False,
-                            "error": str(result),
-                        }
-                    else:
-                        dut_id, discovery_result = result
-                        discovery_results[dut_id] = discovery_result
-
-                    progress.advance(task)
+                progress.advance(task)
 
         await self.logger.log_runtime(
             "INFO",
@@ -1874,21 +2405,23 @@ class WorkflowOrchestrator:
 
     async def execute_collectors(
         self,
+        filtered_collectors_per_dut: Optional[Dict[str, List[str]]] = None,
+        skipped_collectors_per_dut: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+        collection_level: str = "L1",
+        original_collector_ids: Optional[List[str]] = None,
+        preflight_results: Optional[Dict[str, Any]] = None,
+        # Legacy parameters for test compatibility
         collector_ids: Optional[List[str]] = None,
         dut_ids: Optional[List[str]] = None,
-        collection_level: str = "L1",
-        cli_start_time: Optional[float] = None,
-        dry_run: bool = False,
-        original_collector_ids: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
-        New execution flow:
-        1. Per-DUT filtering (baseboard + skip + include/exclude)
-        2. Preflight checks on filtered collectors
-        3. Platform info gathering and dynamic discovery
-        4. Collector execution
+        Execute the collection workflow:
+        1. Preflight checks on filtered collectors
+        2. Platform info gathering and dynamic discovery
+        3. Collector execution
+
+        Filtering and autodetection are handled upstream by run_collection.
         """
-        # Start timing for collector execution
         if hasattr(self, "timing_manager") and self.timing_manager:
             self.timing_manager.start_component("collector_execution")
 
@@ -1898,155 +2431,86 @@ class WorkflowOrchestrator:
             )
             return {"error": "DUT manager not initialized"}
 
-        await self.logger.log_runtime(
-            "INFO",
-            "WorkflowOrchestrator",
-            "Starting collector execution with new flow...",
-        )
-        await self.logger.log_runtime(
-            "INFO", "WorkflowOrchestrator", f"Input collector IDs: {collector_ids}"
-        )
-        await self.logger.log_runtime(
-            "INFO", "WorkflowOrchestrator", f"DUT IDs: {dut_ids}"
-        )
-
-        # Get all DUTs if none specified
+        # Resolve DUT IDs
         if not dut_ids:
             dut_ids = self.dut_manager.get_all_dut_ids()
 
-        # Preserve original collector IDs for status tracker initialization
-        if original_collector_ids is None:
-            original_collector_ids = collector_ids.copy() if collector_ids else []
-
-        # Get all collectors if none specified
-        # But only if no specific collectors were originally requested
-        if not collector_ids:
-            # Check if specific collectors were originally requested via CLI
-            tool_config = self.config_manager.get_tool_config()
-            explicitly_requested_str = tool_config.get("collector_id", "")
-            include_collectors = tool_config.get("include_collectors", [])
-
-            # Parse explicitly_requested_str (comma-separated) into a list
-            explicitly_requested = []
-            if explicitly_requested_str:
-                explicitly_requested = [
-                    cid.strip() for cid in explicitly_requested_str.split(",")
-                ]
-
-            has_explicit_requests = explicitly_requested or include_collectors
-
-            if has_explicit_requests:
-                # Specific collectors were requested but all were filtered out
-                await self.logger.log_runtime(
-                    "WARNING",
-                    "WorkflowOrchestrator",
-                    "All explicitly requested collectors were filtered out. No collectors will be executed.",
-                )
-                collector_ids = []  # Don't fall back to all collectors
-            else:
-                # No specific collectors were requested, so run all applicable collectors
+        # If caller passed pre-filtered per-DUT dicts (normal production path),
+        # use them directly. Otherwise fall back to filtering here (test callers).
+        if filtered_collectors_per_dut is None:
+            if collector_ids is None:
                 all_collectors = self.get_all_collectors()
                 collector_ids = list(all_collectors.keys())
-                original_collector_ids = collector_ids.copy()
-
-        # Initialize collection status tracker with original collector IDs and DUT IDs
-        if (
-            original_collector_ids
-            and dut_ids
-            and hasattr(self, "status_tracker")
-            and self.status_tracker
-        ):
-            await self.logger.log_runtime(
-                "DEBUG",
-                "WorkflowOrchestrator",
-                f"Initializing status tracker with collector_ids: {original_collector_ids}, dut_ids: {dut_ids}",
-            )
-            await self.status_tracker.initialize_collection(
-                dut_ids=dut_ids,
-                collector_ids=original_collector_ids,
-                config_manager=self.config_manager,
-            )
-
-        # Step 1: Per-DUT filtering using ExecutionEngine (prioritize pre-filtered results)
-        if hasattr(self, "_pre_filtered_results"):
-            # Use pre-filtered results from CLI handler (these are more accurate)
-            await self.logger.log_runtime(
-                "INFO",
-                "WorkflowOrchestrator",
-                "Step 1: Using pre-filtered results from CLI handler (more accurate than union)...",
-            )
-            filtered_collectors_per_dut = self._pre_filtered_results[
-                "filtered_collectors"
-            ]
-            skipped_collectors_per_dut = self._pre_filtered_results[
-                "skipped_collectors"
-            ]
-            # Clear the pre-filtered results to avoid confusion
-            delattr(self, "_pre_filtered_results")
-        else:
-            # No pre-filtered results available, perform filtering now
-            await self.logger.log_runtime(
-                "INFO",
-                "WorkflowOrchestrator",
-                "Step 1: Performing per-DUT filtering...",
-            )
 
             filtering_results = (
                 await self.execution_engine.get_filtered_collectors_per_dut(
                     collector_ids, dut_ids
                 )
             )
-
             filtered_collectors_per_dut = filtering_results["filtered_collectors"]
             skipped_collectors_per_dut = filtering_results["skipped_collectors"]
 
-        # Get union of all filtered collectors for preflight/discovery
-        all_filtered_collectors = set()
-        for dut_collectors in filtered_collectors_per_dut.values():
-            all_filtered_collectors.update(dut_collectors)
-        all_filtered_collectors = list(all_filtered_collectors)
+        if skipped_collectors_per_dut is None:
+            skipped_collectors_per_dut = {did: [] for did in dut_ids}
 
-        # Get union of all skipped collectors for tracking
-        all_skipped_collectors = set()
-        for dut_skipped in skipped_collectors_per_dut.values():
-            for skipped_info in dut_skipped:
-                all_skipped_collectors.add(skipped_info["collector_id"])
-        all_skipped_collectors = list(all_skipped_collectors)
+        # Compute union sets
+        all_filtered_collectors = list(
+            {
+                cid
+                for dut_cids in filtered_collectors_per_dut.values()
+                for cid in dut_cids
+            }
+        )
+        all_skipped_collectors = list(
+            {
+                s["collector_id"]
+                for dut_skipped in skipped_collectors_per_dut.values()
+                for s in dut_skipped
+            }
+        )
+
+        if original_collector_ids is None:
+            original_collector_ids = all_filtered_collectors.copy()
 
         await self.logger.log_runtime(
             "INFO",
             "WorkflowOrchestrator",
-            f"Per-DUT filtering complete. {len(all_filtered_collectors)} unique collectors will run across all DUTs.",
+            f"Starting execution: {len(all_filtered_collectors)} collectors across {len(dut_ids)} DUT(s)",
         )
 
-        # Print final filtered collectors to console
-        # if self.sanitized_console:
-        #     self.sanitized_console.print_info(
-        #         f"Final filtered collectors that will run: {', '.join(all_filtered_collectors)}"
-        #     )
-
-        # Handle dry run mode
-        if dry_run:
-            await self.logger.log_runtime(
-                "INFO", "WorkflowOrchestrator", "DRY RUN MODE - simulation complete"
+        # Initialize status tracker
+        if (
+            original_collector_ids
+            and dut_ids
+            and hasattr(self, "status_tracker")
+            and self.status_tracker
+        ):
+            await self.status_tracker.initialize_collection(
+                dut_ids=dut_ids,
+                collector_ids=original_collector_ids,
+                config_manager=self.config_manager,
             )
-            return {
-                "dry_run": True,
-                "filtered_collectors_per_dut": filtered_collectors_per_dut,
-                "all_filtered_collectors": all_filtered_collectors,
-                "total_collectors": len(all_filtered_collectors),
-            }
 
-        # Step 2: Preflight checks on filtered collectors
-        if all_filtered_collectors:
+        # Step 1: Preflight checks on filtered collectors
+        if preflight_results is not None:
             await self.logger.log_runtime(
                 "INFO",
                 "WorkflowOrchestrator",
-                "Step 2: Running preflight checks on filtered collectors...",
+                "Step 1: Reusing preflight results gathered before autodetection",
+            )
+        elif all_filtered_collectors:
+            await self.logger.log_runtime(
+                "INFO",
+                "WorkflowOrchestrator",
+                "Step 1: Running preflight checks on filtered collectors...",
             )
 
             tool_config = self.config_manager.get_tool_config()
-            skip_preflight = getattr(tool_config, "skip_preflight", False)
+            skip_preflight = (
+                tool_config.get("skip_preflight", False)
+                if isinstance(tool_config, dict)
+                else getattr(tool_config, "skip_preflight", False)
+            )
             if not skip_preflight:
                 preflight_results = await self.run_preflight_checks(
                     all_filtered_collectors
@@ -2060,9 +2524,29 @@ class WorkflowOrchestrator:
             await self.logger.log_runtime(
                 "INFO",
                 "WorkflowOrchestrator",
-                "Step 2: No collectors to execute - skipping preflight checks",
+                "Step 1: No collectors to execute - skipping preflight checks",
             )
             preflight_results = None
+
+        # Step 2: Dependency checks (software prerequisites)
+        if all_filtered_collectors:
+            await self.logger.log_runtime(
+                "INFO",
+                "WorkflowOrchestrator",
+                "Step 2: Running dependency checks on filtered collectors...",
+            )
+            dependency_results = await self.run_dependency_checks(
+                all_filtered_collectors,
+                preflight_results,
+                filtered_collectors_per_dut=filtered_collectors_per_dut,
+            )
+            await self.reporting_engine.log_dependency_check_table(dependency_results)
+        else:
+            await self.logger.log_runtime(
+                "INFO",
+                "WorkflowOrchestrator",
+                "Step 2: No collectors to execute - skipping dependency checks",
+            )
 
         # Step 3: Platform info gathering and dynamic discovery
         if all_filtered_collectors:
@@ -2071,6 +2555,23 @@ class WorkflowOrchestrator:
                 "WorkflowOrchestrator",
                 "Step 3: Gathering platform info and running dynamic discovery...",
             )
+
+            # Step 3a: Analyze filtered collectors to determine discovery requirements
+            firmware_inventory_needed = await self._check_firmware_inventory_needed(
+                all_filtered_collectors, dut_ids
+            )
+
+            # Configure discovery service based on collector requirements
+            if firmware_inventory_needed:
+                await self.logger.log_runtime(
+                    "INFO",
+                    "WorkflowOrchestrator",
+                    "Firmware inventory discovery enabled (required by one or more collectors)",
+                )
+                discovery_service = self.dut_manager._get_discovery_service()
+                config = DiscoveryConfig()
+                config.discover_firmware_inventory = True
+                discovery_service.set_config(config)
 
             platform_results = await self.gather_platform_info(
                 dut_ids=dut_ids, preflight_results=preflight_results
@@ -2088,174 +2589,62 @@ class WorkflowOrchestrator:
             platform_results = {}
             discovery_results = {}
 
-        # Step 3.5: Baseboard auto-detection (after preflight and discovery)
-        await self.logger.log_runtime(
-            "INFO",
-            "WorkflowOrchestrator",
-            "Step 3.5: Running baseboard auto-detection...",
-        )
-
-        # Run auto-detection for DUTs that don't have baseboard configured
-        for dut_id in dut_ids:
-            dut = self.dut_manager.get_dut(dut_id)
-            dut_baseboard = dut.config.get("baseboard") or dut.config.get(
-                "TargetBaseboard"
-            )
-
-            if not dut_baseboard:
-                # Get non_interactive flag from the DUT config
-                non_interactive = dut.config.get("non_interactive", False)
-
-                await self.logger.log_runtime(
-                    "INFO",
-                    "WorkflowOrchestrator",
-                    f"Auto-detecting baseboard for DUT: {dut_id}",
-                )
-
-                # Run baseboard auto-detection
-                success, detected_info = (
-                    await self.dut_manager.detect_platform_and_baseboard(
-                        dut_id,
-                        (
-                            preflight_results.get(dut_id, {}).get("services", {})
-                            if preflight_results
-                            else {}
-                        ),
-                        non_interactive,
-                    )
-                )
-
-                if success:
-                    detected_baseboard = detected_info.get("baseboard", "Unknown")
-                    detected_platform = detected_info.get("platform", "Unknown")
-                    detected_node_type = detected_info.get("node_type", "Unknown")
-
-                    await self.logger.log_runtime(
-                        "INFO",
-                        "WorkflowOrchestrator",
-                        f"Auto-detected for DUT {dut_id}: Baseboard={detected_baseboard}, Platform={detected_platform}, NodeType={detected_node_type}",
-                    )
-
-                    # Update the DUT config with detected information
-                    if not dut.config.get("baseboard"):
-                        dut.config["baseboard"] = detected_baseboard
-
-                        # Load and merge the full baseboard configuration
-                        baseboard_manager = self.dut_manager._get_baseboard_manager()
-                        if baseboard_manager:
-                            baseboard_config = baseboard_manager.get_baseboard_config(
-                                detected_baseboard
-                            )
-                            if baseboard_config:
-                                # Merge baseboard config into DUT config
-                                dut.config = {**dut.config, **baseboard_config}
-                                await self.logger.write_to_dut_runtime_log(
-                                    dut_id,
-                                    "INFO",
-                                    "WorkflowOrchestrator",
-                                    f"Loaded and merged baseboard configuration for '{detected_baseboard}' into DUT {dut_id}",
-                                )
-
-                    # Update platform and node_type if not already set
-                    if not dut.config.get("platform"):
-                        dut.config["platform"] = detected_platform
-                    if not dut.config.get("node_type"):
-                        dut.config["node_type"] = detected_node_type
-
-                    await self.logger.log_runtime(
-                        "INFO",
-                        "WorkflowOrchestrator",
-                        f"Updated DUT {dut_id} config with detected values: Platform={detected_platform}, Baseboard={detected_baseboard}, NodeType={detected_node_type}",
-                    )
-                else:
-                    # Auto-detection failed - handle based on interactive mode
-                    error_msg = detected_info.get("error", "Unknown error")
-                    await self.logger.log_runtime(
-                        "WARN",
-                        "WorkflowOrchestrator",
-                        f"Auto-detection failed for DUT {dut_id}: {error_msg}",
-                    )
-
-                    if non_interactive:
-                        # Non-interactive mode: exit with error
-                        await self.logger.log_runtime(
-                            "ERROR",
-                            "WorkflowOrchestrator",
-                            f"Auto-detection failed in non-interactive mode for DUT {dut_id}: {error_msg}",
-                        )
-                        raise ValueError(
-                            f"Auto-detection failed in non-interactive mode: {error_msg}"
-                        )
-                    else:
-                        # Interactive mode: show warning and continue
-                        await self.logger.log_runtime(
-                            "WARN",
-                            "WorkflowOrchestrator",
-                            f"Auto-detection failed for DUT {dut_id}: {error_msg} - continuing without baseboard",
-                        )
-
-        # Step 3.6: Validate baseboard configuration after auto-detection
-        await self.logger.log_runtime(
-            "INFO",
-            "WorkflowOrchestrator",
-            "Step 3.6: Validating baseboard configuration after auto-detection...",
-        )
-
-        # Check all DUTs have baseboard configured after auto-detection
-        for dut_id in dut_ids:
-            dut = self.dut_manager.get_dut(dut_id)
-            dut_baseboard = dut.config.get("baseboard") or dut.config.get(
-                "TargetBaseboard"
-            )
-
-            if not dut_baseboard or dut_baseboard == "Unknown":
-                error_msg = (
-                    f"DUT '{dut_id}' has no baseboard configured after auto-detection."
-                )
-                await self.logger.log_runtime(
-                    "ERROR",
-                    "WorkflowOrchestrator",
-                    f"CRITICAL: {error_msg}",
-                )
-
-                # Use the same pattern as main.py validation errors
-                if hasattr(self.logger, "console"):
-                    console = self.logger.console
-                    console.print_error(f"CRITICAL ERROR: {error_msg}")
-                    console.print_error(
-                        "Baseboard is required for collector compatibility."
-                    )
-                    console.print_error(
-                        "Please configure baseboard in DUT config file."
-                    )
-                else:
-                    # Fallback to basic error message if console not available
-                    print(f"ERROR: {error_msg}")
-                    print("ERROR: Baseboard is required for collector compatibility.")
-                    print("ERROR: Please configure baseboard in DUT config file.")
-                sys.exit(1)
-
-        # Step 4: Mark skipped collectors in status tracker and create error logs
+        # Step 3: Mark skipped collectors in status tracker and create error logs
         if hasattr(self, "status_tracker") and self.status_tracker:
+            total_skipped = sum(len(v) for v in skipped_collectors_per_dut.values())
+            num_duts_with_skipped = len(skipped_collectors_per_dut)
+
             await self.logger.log_runtime(
-                "DEBUG",
+                "INFO",
                 "WorkflowOrchestrator",
-                "Marking skipped collectors in status tracker...",
+                f"Step 4: Processing {total_skipped} skipped collector entries across {num_duts_with_skipped} DUTs...",
             )
-            for dut_id, dut_skipped in skipped_collectors_per_dut.items():
+
+            async def _process_skipped_for_dut(
+                dut_id: str,
+                dut_skipped: list,
+            ) -> None:
+                """Process all skipped collector entries for a single DUT."""
                 for skipped_info in dut_skipped:
                     collector_id = skipped_info["collector_id"]
                     reason = skipped_info["reason"]
+                    skip_type = skipped_info.get("skip_type", "config")
+
                     await self.logger.log_runtime(
                         "DEBUG",
                         "WorkflowOrchestrator",
                         f"Marking collector {collector_id} as skipped for DUT {dut_id}: {reason}",
                     )
                     await self.status_tracker.complete_collector(
-                        dut_id, collector_id, "skipped", reason
+                        dut_id,
+                        collector_id,
+                        "skipped",
+                        reason,
+                        skip_status_update=True,
                     )
 
-                    # Create error log file for skipped collector
+                    # Track pre-execution exclusion type for the footer summary
+                    if skip_type == "baseboard":
+                        await self.status_tracker.increment_baseboard_excluded(
+                            skip_status_update=True
+                        )
+                    elif skip_type == "config":
+                        await self.status_tracker.increment_config_excluded(
+                            skip_status_update=True
+                        )
+
+                    # Baseboard-non-applicable collectors are silently excluded:
+                    # no error log and no execution summary entry.  They are
+                    # consistent with how collectors pre-filtered by -g behave
+                    # (they never enter the selected list at all).
+                    if skip_type == "baseboard":
+                        await self.logger.log_runtime(
+                            "DEBUG",
+                            "WorkflowOrchestrator",
+                            f"Collector {collector_id} not applicable for DUT {dut_id} baseboard - silently excluded (no error log, no summary entry)",
+                        )
+                        continue
+
                     try:
                         skip_context = {
                             "operation_name": "collector_skip",
@@ -2270,7 +2659,6 @@ class WorkflowOrchestrator:
                             f"Created error log for skipped collector {collector_id}: {error_log_path}",
                         )
 
-                        # Add skipped collector to execution summary
                         await self.add_execution_summary_entry(
                             dut_id,
                             collector_id,
@@ -2285,6 +2673,21 @@ class WorkflowOrchestrator:
                             f"Failed to create error log for skipped collector {collector_id}: {e}",
                         )
 
+            all_coros = [
+                _process_skipped_for_dut(dut_id, dut_skipped)
+                for dut_id, dut_skipped in skipped_collectors_per_dut.items()
+            ]
+            await asyncio.gather(*all_coros, return_exceptions=True)
+
+            # Single bulk status update after all skipped entries are marked
+            await self.status_tracker._update_status()
+
+            await self.logger.log_runtime(
+                "INFO",
+                "WorkflowOrchestrator",
+                f"Step 4 complete: processed {total_skipped} skipped entries across {num_duts_with_skipped} DUTs",
+            )
+
         # Step 5: Execute collectors using the filtered collectors per DUT
         await self.logger.log_runtime(
             "INFO", "WorkflowOrchestrator", "Step 5: Executing filtered collectors..."
@@ -2297,12 +2700,358 @@ class WorkflowOrchestrator:
             dut_ids,
             collection_level,
             preflight_results,
-            cli_start_time,
+            original_collector_ids,
         )
 
         # End timing for collector execution
         if hasattr(self, "timing_manager") and self.timing_manager:
             self.timing_manager.end_component("collector_execution")
+
+        return results
+
+    def _get_execution_scheduler_mode(self) -> str:
+        """Return the collector scheduler mode, defaulting to per-DUT execution."""
+        tool_config = self.config_manager.get_tool_config()
+        if isinstance(tool_config, dict):
+            mode = tool_config.get(
+                "execution_scheduler",
+                tool_config.get("scheduler_mode", "per_dut"),
+            )
+        else:
+            mode = getattr(
+                tool_config,
+                "execution_scheduler",
+                getattr(tool_config, "scheduler_mode", "per_dut"),
+            )
+
+        mode = str(mode or "per_dut").strip().lower()
+        if mode not in {"per_dut", "legacy_global"}:
+            raise ValueError(
+                "Invalid execution_scheduler value "
+                f"{mode!r}; expected 'per_dut' or 'legacy_global'"
+            )
+        return mode
+
+    def _get_unique_collectors(
+        self, collectors_per_dut: Dict[str, List[str]]
+    ) -> List[str]:
+        """Return a stable unique collector list from per-DUT collector lists."""
+        seen = set()
+        ordered = []
+        for collector_ids in collectors_per_dut.values():
+            for collector_id in collector_ids:
+                if collector_id not in seen:
+                    seen.add(collector_id)
+                    ordered.append(collector_id)
+        return ordered
+
+    def _classify_collectors_for_dut(
+        self, collector_ids: List[str]
+    ) -> CollectorClassification:
+        """Split one DUT's collectors into normal sequential, normal parallel, and tail."""
+        collector_positions = {cid: idx for idx, cid in enumerate(collector_ids)}
+        tail_candidates = []
+        normal_collectors = []
+
+        for collector_id in collector_ids:
+            collector_info = self.config_manager.get_collector_info(collector_id) or {}
+            execution_phase = (
+                str(collector_info.get("execution_phase", "")).strip().lower()
+            )
+            if execution_phase == "tail":
+                tail_candidates.append((collector_id, collector_info))
+            else:
+                normal_collectors.append(collector_id)
+
+        def _tail_sort_key(item):
+            collector_id, collector_info = item
+            order_value = collector_info.get("execution_order")
+            try:
+                order = int(order_value)
+            except (TypeError, ValueError):
+                order = None
+            if order is None:
+                return (1, collector_positions.get(collector_id, 0))
+            return (0, order)
+
+        sequential_collectors = self.get_sequential_collectors()
+        parallel_collectors = self.get_parallel_collectors()
+
+        return CollectorClassification(
+            normal_sequential=[
+                cid for cid in normal_collectors if cid in sequential_collectors
+            ],
+            normal_parallel=[
+                cid for cid in normal_collectors if cid in parallel_collectors
+            ],
+            tail=[cid for cid, _ in sorted(tail_candidates, key=_tail_sort_key)],
+        )
+
+    def _build_dut_execution_plan(
+        self, dut_id: str, collector_ids: List[str]
+    ) -> DutExecutionPlan:
+        classification = self._classify_collectors_for_dut(collector_ids)
+        return DutExecutionPlan(
+            dut_id=dut_id,
+            normal_sequential=classification.normal_sequential,
+            normal_parallel=classification.normal_parallel,
+            tail=classification.tail,
+        )
+
+    def _merge_collector_results(
+        self, target: Dict[str, Any], source: Optional[Dict[str, Any]]
+    ) -> None:
+        """Merge collector-major execution results without dropping DUT entries."""
+        if not source:
+            return
+        for collector_id, collector_result in source.items():
+            if not isinstance(collector_result, dict):
+                target[collector_id] = collector_result
+                continue
+            target.setdefault(collector_id, {})
+            target[collector_id].update(collector_result)
+
+    def _build_error_results(
+        self, collector_ids: List[str], dut_id: str, error: BaseException
+    ) -> Dict[str, Dict[str, Dict[str, Any]]]:
+        return {
+            collector_id: {
+                dut_id: {
+                    "status": "error",
+                    "error": str(error),
+                    "execution_time": 0.0,
+                }
+            }
+            for collector_id in collector_ids
+        }
+
+    async def _execute_one_dut_plan(
+        self, plan: DutExecutionPlan, collection_level: str
+    ) -> Dict[str, Dict[str, Any]]:
+        """Execute one DUT's normal collectors, then that same DUT's tail collectors."""
+        results = {"sequential_results": {}, "parallel_results": {}}
+        normal_tasks = []
+
+        if plan.normal_parallel:
+            normal_tasks.append(
+                (
+                    "parallel_results",
+                    plan.normal_parallel,
+                    asyncio.create_task(
+                        self._execute_parallel_collectors_unified(
+                            plan.normal_parallel,
+                            [plan.dut_id],
+                            collection_level,
+                            None,
+                            self.progress_state,
+                        )
+                    ),
+                )
+            )
+
+        if plan.normal_sequential:
+            normal_tasks.append(
+                (
+                    "sequential_results",
+                    plan.normal_sequential,
+                    asyncio.create_task(
+                        self._execute_sequential_collectors_unified(
+                            plan.normal_sequential,
+                            [plan.dut_id],
+                            collection_level,
+                            None,
+                        )
+                    ),
+                )
+            )
+
+        if normal_tasks:
+            normal_results = await asyncio.gather(
+                *(task for _, _, task in normal_tasks), return_exceptions=True
+            )
+            for (result_key, collector_ids, _), result in zip(
+                normal_tasks, normal_results
+            ):
+                if isinstance(result, BaseException):
+                    await self.logger.log_runtime(
+                        "ERROR",
+                        "WorkflowOrchestrator",
+                        f"{result_key} failed for DUT {plan.dut_id}: {result}",
+                    )
+                    self._merge_collector_results(
+                        results[result_key],
+                        self._build_error_results(collector_ids, plan.dut_id, result),
+                    )
+                else:
+                    self._merge_collector_results(results[result_key], result)
+
+        if plan.tail:
+            try:
+                tail_results = await self._execute_sequential_collectors_unified(
+                    plan.tail,
+                    [plan.dut_id],
+                    collection_level,
+                    None,
+                )
+                self._merge_collector_results(
+                    results["sequential_results"], tail_results
+                )
+            except Exception as exc:
+                await self.logger.log_runtime(
+                    "ERROR",
+                    "WorkflowOrchestrator",
+                    f"Tail collector execution failed for DUT {plan.dut_id}: {exc}",
+                )
+                self._merge_collector_results(
+                    results["sequential_results"],
+                    self._build_error_results(plan.tail, plan.dut_id, exc),
+                )
+
+        return results
+
+    async def _execute_filtered_collectors_per_dut_scheduler(
+        self,
+        filtered_collectors_per_dut: Dict[str, List[str]],
+        skipped_collectors_per_dut: Dict[str, List[Dict[str, Any]]],
+        dut_ids: List[str],
+        collection_level: str,
+        preflight_results: Optional[Dict[str, Any]],
+        original_collector_ids: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Execute collector pipelines independently per DUT."""
+        all_filtered_collectors = self._get_unique_collectors(
+            filtered_collectors_per_dut
+        )
+
+        all_skipped_collectors = set()
+        for dut_skipped in skipped_collectors_per_dut.values():
+            for skipped_info in dut_skipped:
+                all_skipped_collectors.add(skipped_info["collector_id"])
+
+        plans = [
+            self._build_dut_execution_plan(
+                dut_id, filtered_collectors_per_dut.get(dut_id, [])
+            )
+            for dut_id in dut_ids
+        ]
+        total_sequential = sum(
+            len(plan.normal_sequential) + len(plan.tail) for plan in plans
+        )
+        total_parallel = sum(len(plan.normal_parallel) for plan in plans)
+
+        await self._log_to_all(
+            "INFO",
+            "WorkflowOrchestrator",
+            f"Starting per-DUT execution of {len(all_filtered_collectors)} collectors: {', '.join(all_filtered_collectors)}",
+            dut_ids,
+        )
+
+        results = {
+            "sequential_results": {},
+            "parallel_results": {},
+            "skipped_results": skipped_collectors_per_dut,
+            "summary": {
+                "total_collectors": len(all_filtered_collectors),
+                "skipped_collectors": len(all_skipped_collectors),
+                "sequential_collectors": total_sequential,
+                "parallel_collectors": total_parallel,
+                "duts_processed": len(dut_ids),
+            },
+        }
+
+        if preflight_results:
+            self.execution_engine.set_preflight_results(preflight_results)
+
+        await self._setup_progress_display(
+            dut_ids,
+            all_filtered_collectors,
+            len(all_filtered_collectors),
+        )
+
+        try:
+            plan_results = await asyncio.gather(
+                *[self._execute_one_dut_plan(plan, collection_level) for plan in plans],
+                return_exceptions=True,
+            )
+
+            for plan, plan_result in zip(plans, plan_results):
+                if isinstance(plan_result, BaseException):
+                    await self.logger.log_runtime(
+                        "ERROR",
+                        "WorkflowOrchestrator",
+                        f"Per-DUT execution failed for DUT {plan.dut_id}: {plan_result}",
+                    )
+                    failed_collectors = (
+                        plan.normal_parallel + plan.normal_sequential + plan.tail
+                    )
+                    self._merge_collector_results(
+                        results["sequential_results"],
+                        self._build_error_results(
+                            failed_collectors, plan.dut_id, plan_result
+                        ),
+                    )
+                    continue
+                self._merge_collector_results(
+                    results["parallel_results"],
+                    plan_result.get("parallel_results", {}),
+                )
+                self._merge_collector_results(
+                    results["sequential_results"],
+                    plan_result.get("sequential_results", {}),
+                )
+        finally:
+            await self._teardown_progress_display()
+
+        await self.reporting_engine.log_all_results(results, dut_ids)
+
+        total_executed = len(results.get("sequential_results", {})) + len(
+            results.get("parallel_results", {})
+        )
+        await self.logger.log_runtime(
+            "INFO",
+            "WorkflowOrchestrator",
+            f"Collector execution completed: {total_executed} collector groups executed",
+        )
+
+        await self._ensure_all_collectors_in_summary(
+            collector_ids=all_filtered_collectors,
+            dut_ids=dut_ids,
+            results=results,
+            preflight_results=preflight_results,
+            original_collector_ids=original_collector_ids,
+        )
+
+        await self.reporting_engine.log_collector_status_table(
+            results, dut_ids, all_filtered_collectors
+        )
+        await self.reporting_engine.log_execution_results_table(
+            results, dut_ids, all_filtered_collectors
+        )
+        await self.reporting_engine.display_console_collector_summary(
+            results, dut_ids, all_filtered_collectors
+        )
+
+        await self._log_to_all(
+            "INFO",
+            "WorkflowOrchestrator",
+            f"Completed execution of {len(all_filtered_collectors)} collectors",
+            dut_ids,
+        )
+
+        if hasattr(self, "status_tracker") and self.status_tracker:
+            await self.status_tracker.finalize()
+
+        self._write_execution_order_metadata()
+
+        for dut_id in dut_ids:
+            try:
+                await self.logger.create_structured_log(dut_id)
+            except Exception as e:
+                await self.logger.log_runtime(
+                    "WARN",
+                    "WorkflowOrchestrator",
+                    f"Failed to create structured log for DUT {dut_id}: {e}",
+                )
 
         return results
 
@@ -2313,7 +3062,7 @@ class WorkflowOrchestrator:
         dut_ids: List[str],
         collection_level: str,
         preflight_results: Optional[Dict[str, Any]],
-        cli_start_time: Optional[float],
+        original_collector_ids: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Execute collectors using the filtered collectors per DUT.
@@ -2324,8 +3073,18 @@ class WorkflowOrchestrator:
             dut_ids: List of DUT IDs.
             collection_level: Collection level.
             preflight_results: Dictionary of preflight results.
-            cli_start_time: CLI start time.
+            original_collector_ids: Original collector IDs for summary reconciliation.
         """
+        scheduler_mode = self._get_execution_scheduler_mode()
+        if scheduler_mode == "per_dut":
+            return await self._execute_filtered_collectors_per_dut_scheduler(
+                filtered_collectors_per_dut,
+                skipped_collectors_per_dut,
+                dut_ids,
+                collection_level,
+                preflight_results,
+                original_collector_ids,
+            )
 
         # Get union of all filtered collectors for execution
         all_filtered_collectors = set()
@@ -2340,80 +3099,64 @@ class WorkflowOrchestrator:
                 all_skipped_collectors.add(skipped_info["collector_id"])
         all_skipped_collectors = list(all_skipped_collectors)
 
-        await self.logger.log_runtime(
+        await self._log_to_all(
             "INFO",
             "WorkflowOrchestrator",
-            f"Executing {len(all_filtered_collectors)} filtered collectors on {len(dut_ids)} DUT(s)",
-        )
-
-        # Log execution start to all DUT runtime logs
-        for dut_id in dut_ids:
-            await self.logger.write_to_dut_runtime_log(
-                dut_id,
-                "INFO",
-                "WorkflowOrchestrator",
-                f"Starting execution of {len(all_filtered_collectors)} collectors",
-            )
-            await self.logger.write_to_dut_runtime_log(
-                dut_id,
-                "INFO",
-                "WorkflowOrchestrator",
-                f"Collectors to execute: {', '.join(all_filtered_collectors)}",
-            )
-
-        # Debug: Log what collectors we have
-        await self.logger.log_runtime(
-            "DEBUG",
-            "WorkflowOrchestrator",
-            f"Requested collector_ids: {all_filtered_collectors}",
-        )
-        await self.logger.log_runtime(
-            "DEBUG",
-            "WorkflowOrchestrator",
-            f"Available sequential collectors: {list(self.get_sequential_collectors())}",
-        )
-        await self.logger.log_runtime(
-            "DEBUG",
-            "WorkflowOrchestrator",
-            f"Available parallel collectors: {list(self.get_parallel_collectors())}",
+            f"Starting execution of {len(all_filtered_collectors)} collectors: {', '.join(all_filtered_collectors)}",
+            dut_ids,
         )
 
         # Separate sequential and parallel collectors
+        # Ensure tail collectors run last based on collector definitions.
+        collector_positions = {
+            cid: idx for idx, cid in enumerate(all_filtered_collectors)
+        }
+        tail_candidates = []
+        normal_collectors = []
+        for collector_id in all_filtered_collectors:
+            collector_info = self.config_manager.get_collector_info(collector_id) or {}
+            execution_phase = (
+                str(collector_info.get("execution_phase", "")).strip().lower()
+            )
+            if execution_phase == "tail":
+                tail_candidates.append((collector_id, collector_info))
+            else:
+                normal_collectors.append(collector_id)
+
+        def _tail_sort_key(item):
+            collector_id, collector_info = item
+            order_value = collector_info.get("execution_order")
+            try:
+                order = int(order_value)
+            except (TypeError, ValueError):
+                order = None
+            if order is None:
+                return (1, collector_positions.get(collector_id, 0))
+            return (0, order)
+
+        tail_collectors_to_run = [
+            collector_id
+            for collector_id, _ in sorted(tail_candidates, key=_tail_sort_key)
+        ]
         sequential_to_run = [
-            cid
-            for cid in all_filtered_collectors
-            if cid in self.get_sequential_collectors()
+            cid for cid in normal_collectors if cid in self.get_sequential_collectors()
         ]
         parallel_to_run = [
-            cid
-            for cid in all_filtered_collectors
-            if cid in self.get_parallel_collectors()
+            cid for cid in normal_collectors if cid in self.get_parallel_collectors()
         ]
 
-        await self.logger.log_runtime(
+        await self._log_to_all(
             "INFO",
             "WorkflowOrchestrator",
-            f"Sequential collectors: {len(sequential_to_run)}",
+            f"Sequential collectors: {len(sequential_to_run) + len(tail_collectors_to_run)}, Parallel collectors: {len(parallel_to_run)}",
+            dut_ids,
         )
-        await self.logger.log_runtime(
-            "INFO",
-            "WorkflowOrchestrator",
-            f"Parallel collectors: {len(parallel_to_run)}",
-        )
-
-        # Log collector breakdown to all DUT runtime logs
-        for dut_id in dut_ids:
-            await self.logger.write_to_dut_runtime_log(
-                dut_id,
+        if tail_collectors_to_run:
+            await self._log_to_all(
                 "INFO",
                 "WorkflowOrchestrator",
-                f"Sequential collectors: {len(sequential_to_run)}",
-            )
-            await self.logger.write_to_dut_runtime_log(
-                dut_id,
-                "INFO",
-                "WorkflowOrchestrator",
-                f"Parallel collectors: {len(parallel_to_run)}",
+                f"Forced tail collectors (run last): {tail_collectors_to_run}",
+                dut_ids,
             )
 
         # Execute collectors with progress bars
@@ -2424,145 +3167,126 @@ class WorkflowOrchestrator:
             "summary": {
                 "total_collectors": len(all_filtered_collectors),
                 "skipped_collectors": len(all_skipped_collectors),
-                "sequential_collectors": len(sequential_to_run),
+                "sequential_collectors": len(sequential_to_run)
+                + len(tail_collectors_to_run),
                 "parallel_collectors": len(parallel_to_run),
                 "duts_processed": len(dut_ids),
             },
         }
 
-        # Execute parallel and sequential collectors concurrently for optimal performance
-        # Set preflight results in execution engine for collector skipping logic
         if preflight_results:
             self.execution_engine.set_preflight_results(preflight_results)
 
-        # Progress state manager is now passed directly to execution methods
-        # No need to set it as an attribute on the execution engine
+        total_collectors = (
+            len(parallel_to_run) + len(sequential_to_run) + len(tail_collectors_to_run)
+        )
+        await self._setup_progress_display(
+            dut_ids, all_filtered_collectors, total_collectors
+        )
 
-        # Initialize progress state manager (passive observer - doesn't interfere with execution)
-        try:
-            progress_state = ProgressStateManager(
-                dut_ids, all_filtered_collectors, self.logger, self.console
-            )
-            # Store reference for execution engine to use
-            self.progress_state = progress_state
-
-            # Initialize progress display
-            self.progress_display = ProgressDisplay(self.console, self.logger)
-            self.progress_display.set_progress_state(progress_state)
-
-            # Initialize progress state manager
-            await progress_state.initialize()
-
-            # Progress display will be started after total_collectors is defined
-
-        except ImportError:
-            # If progress state manager isn't available, continue without it
-            progress_state = None
-            self.progress_state = None
-            self.progress_display = None
-
-        # Create unified progress bar for all collectors
-        unified_progress = None
         parallel_task = None
         sequential_task = None
 
-        total_collectors = len(parallel_to_run) + len(sequential_to_run)
-        if total_collectors > 0:
-            await self.logger.log_runtime(
-                "INFO",
-                "WorkflowOrchestrator",
-                f"Starting {len(parallel_to_run)} parallel and {len(sequential_to_run)} sequential collectors...",
-            )
-
-            self.console.print(
-                f"\n[bold blue]Executing {total_collectors} Collectors[/bold blue]"
-            )
-
-            # Start progress display now that total_collectors is defined
-            if hasattr(self, "progress_display") and self.progress_display:
-                await self.logger.log_runtime(
-                    "DEBUG",
-                    "WorkflowOrchestrator",
-                    f"Starting progress display with {total_collectors} collectors and {len(dut_ids)} DUTs",
-                )
-                self.progress_display.start(dut_ids, total_collectors)
-
-                # Start background progress update task
-                await self.logger.log_runtime(
-                    "DEBUG",
-                    "WorkflowOrchestrator",
-                    "Creating progress update task",
-                )
-                self.progress_update_task = asyncio.create_task(
-                    self._update_progress_periodically()
-                )
-            else:
-                await self.logger.log_runtime(
-                    "DEBUG",
-                    "WorkflowOrchestrator",
-                    "No progress display available",
-                )
-
-            # Progress display is already started above, no need for additional progress bars
-            unified_progress = None
-
         if parallel_to_run:
-            # Start parallel execution as a task
             parallel_task = asyncio.create_task(
                 self._execute_parallel_collectors_unified(
                     parallel_to_run,
                     dut_ids,
                     collection_level,
-                    unified_progress,
+                    None,
                     self.progress_state,
                 )
             )
 
         if sequential_to_run:
-            # Start sequential execution as a task
             sequential_task = asyncio.create_task(
                 self._execute_sequential_collectors_unified(
                     sequential_to_run,
                     dut_ids,
                     collection_level,
-                    unified_progress,
+                    None,
                 )
             )
 
-        # Wait for both tasks to complete
+        # Wait for both tasks to complete (normal collectors only).
+        # Use return_exceptions=True so both groups finish even if one fails —
+        # we want to collect whatever logs are available and run all post-execution work.
         if parallel_task and sequential_task:
-            parallel_results, sequential_results = await asyncio.gather(
-                parallel_task, sequential_task
+            parallel_result, sequential_result = await asyncio.gather(
+                parallel_task, sequential_task, return_exceptions=True
             )
-            results["parallel_results"] = parallel_results
-            results["sequential_results"] = sequential_results
+
+            if isinstance(parallel_result, BaseException):
+                await self.logger.log_runtime(
+                    "ERROR",
+                    "WorkflowOrchestrator",
+                    f"Parallel collector execution failed: {parallel_result}",
+                )
+                results["parallel_results"] = {}
+            else:
+                results["parallel_results"] = parallel_result
+
+            if isinstance(sequential_result, BaseException):
+                await self.logger.log_runtime(
+                    "ERROR",
+                    "WorkflowOrchestrator",
+                    f"Sequential collector execution failed: {sequential_result}",
+                )
+                results["sequential_results"] = {}
+            else:
+                results["sequential_results"] = sequential_result
+
         elif parallel_task:
-            results["parallel_results"] = await parallel_task
+            try:
+                results["parallel_results"] = await parallel_task
+            except Exception as e:
+                await self.logger.log_runtime(
+                    "ERROR",
+                    "WorkflowOrchestrator",
+                    f"Parallel collector execution failed: {e}",
+                )
+                results["parallel_results"] = {}
             results["sequential_results"] = {}
+
         elif sequential_task:
-            results["sequential_results"] = await sequential_task
+            try:
+                results["sequential_results"] = await sequential_task
+            except Exception as e:
+                await self.logger.log_runtime(
+                    "ERROR",
+                    "WorkflowOrchestrator",
+                    f"Sequential collector execution failed: {e}",
+                )
+                results["sequential_results"] = {}
             results["parallel_results"] = {}
+
         else:
             results["parallel_results"] = {}
             results["sequential_results"] = {}
 
-        # Final progress update before stopping
-        if hasattr(self, "progress_display") and self.progress_display:
+        # Execute forced tail collectors last, in fixed order.
+        if tail_collectors_to_run:
             await self.logger.log_runtime(
-                "DEBUG",
+                "INFO",
                 "WorkflowOrchestrator",
-                "Final progress update before stopping",
+                f"Executing forced tail collectors last: {tail_collectors_to_run}",
             )
-            await self.progress_display.update()
-            self.progress_display.stop()
-
-        # Stop the background progress update task if it exists
-        if hasattr(self, "progress_update_task") and self.progress_update_task:
-            self.progress_update_task.cancel()
             try:
-                await self.progress_update_task
-            except asyncio.CancelledError:
-                pass
+                tail_results = await self._execute_sequential_collectors_unified(
+                    tail_collectors_to_run,
+                    dut_ids,
+                    collection_level,
+                    None,
+                )
+                results["sequential_results"].update(tail_results)
+            except Exception as exc:
+                await self.logger.log_runtime(
+                    "ERROR",
+                    "WorkflowOrchestrator",
+                    f"Tail collector execution failed: {exc}",
+                )
+
+        await self._teardown_progress_display()
 
         # Log all results to metadata
         await self.reporting_engine.log_all_results(results, dut_ids)
@@ -2577,6 +3301,15 @@ class WorkflowOrchestrator:
             f"Collector execution completed: {total_executed} collector groups executed",
         )
 
+        # Ensure requested collectors are represented in the execution summary
+        await self._ensure_all_collectors_in_summary(
+            collector_ids=all_filtered_collectors,
+            dut_ids=dut_ids,
+            results=results,
+            preflight_results=preflight_results,
+            original_collector_ids=original_collector_ids,
+        )
+
         # Log collector status and execution results to DUT-specific logs (no console output)
         await self.reporting_engine.log_collector_status_table(
             results, dut_ids, all_filtered_collectors
@@ -2586,30 +3319,25 @@ class WorkflowOrchestrator:
         )
 
         # Display summary on console with proper formatting
-        # Include both filtered and skipped collectors in the summary
-        all_collectors_for_summary = all_filtered_collectors + all_skipped_collectors
+        # Only collectors that reached the execution stage are shown; pre-execution
+        # skips (baseboard constraints, config options) are excluded entirely.
         await self.reporting_engine.display_console_collector_summary(
-            results, dut_ids, all_collectors_for_summary
+            results, dut_ids, all_filtered_collectors
         )
 
-        # Log execution completion to all DUT runtime logs
-        for dut_id in dut_ids:
-            await self.logger.write_to_dut_runtime_log(
-                dut_id,
-                "INFO",
-                "WorkflowOrchestrator",
-                f"Completed execution of {len(all_filtered_collectors)} collectors",
-            )
-            await self.logger.write_to_dut_runtime_log(
-                dut_id,
-                "INFO",
-                "WorkflowOrchestrator",
-                "All collectors finished",
-            )
+        await self._log_to_all(
+            "INFO",
+            "WorkflowOrchestrator",
+            f"Completed execution of {len(all_filtered_collectors)} collectors",
+            dut_ids,
+        )
 
         # Finalize status tracker
         if hasattr(self, "status_tracker") and self.status_tracker:
             await self.status_tracker.finalize()
+
+        # Write execution order metadata before structured log generation
+        self._write_execution_order_metadata()
 
         # Create structured log files for each DUT
         for dut_id in dut_ids:
@@ -2834,11 +3562,15 @@ class WorkflowOrchestrator:
 
             # Check execution strategy configuration
             tool_config = self.config_manager.get_tool_config()
-            parallel_duts_enabled = getattr(
-                tool_config, "PARALLEL_DUT_SEQUENTIAL_COLLECTORS", True
+            parallel_duts_enabled = (
+                tool_config.get("parallel_dut_sequential_collectors", True)
+                if isinstance(tool_config, dict)
+                else getattr(tool_config, "parallel_dut_sequential_collectors", True)
             )
-            service_grouping_enabled = getattr(
-                tool_config, "SERVICE_GROUPED_SEQUENTIAL_COLLECTORS", True
+            service_grouping_enabled = (
+                tool_config.get("service_grouped_sequential_collectors", True)
+                if isinstance(tool_config, dict)
+                else getattr(tool_config, "service_grouped_sequential_collectors", True)
             )
 
             await self.logger.log_runtime(
@@ -2929,28 +3661,39 @@ class WorkflowOrchestrator:
             preflight_results: Dictionary of preflight results.
             original_collector_ids: List of original collector IDs.
         """
-        # Get all executed collectors
-        executed_collectors = set()
+        # Track execution per DUT/collector pair. A collector running on one DUT
+        # does not imply it ran on every DUT in a heterogeneous rack.
+        executed_pairs = set()
         sequential_results = results.get("sequential_results", {})
         parallel_results = results.get("parallel_results", {})
 
-        for collector_id in sequential_results:
-            executed_collectors.add(collector_id)
-        for collector_id in parallel_results:
-            executed_collectors.add(collector_id)
+        for collector_id, collector_results in sequential_results.items():
+            if isinstance(collector_results, dict):
+                for dut_id in collector_results:
+                    executed_pairs.add((dut_id, collector_id))
+        for collector_id, collector_results in parallel_results.items():
+            if isinstance(collector_results, dict):
+                for dut_id in collector_results:
+                    executed_pairs.add((dut_id, collector_id))
 
-        # Use current collector_ids (post-filtered) as the eligible collectors
-        # This ensures that baseboard-filtered collectors don't appear in the summary
-        eligible_collectors = set(collector_ids)
+        # Use original collector IDs if provided so requested collectors appear in summary
+        if original_collector_ids:
+            eligible_collectors = set(original_collector_ids)
+            filtered_out_collectors = eligible_collectors - set(collector_ids)
+        else:
+            eligible_collectors = set(collector_ids)
+            filtered_out_collectors = set()
 
-        # Find collectors that were eligible to run but didn't execute
-        not_executed = eligible_collectors - executed_collectors
-
-        # Add entries for collectors that didn't run
-        for collector_id in not_executed:
+        # Add entries for DUT/collector pairs that didn't run.
+        for collector_id in eligible_collectors:
             for dut_id in dut_ids:
+                if (dut_id, collector_id) in executed_pairs:
+                    continue
                 # Get specific preflight failure reason if available
-                reason = "Collector not executed (likely due to preflight failure)"
+                if collector_id in filtered_out_collectors:
+                    reason = "Collector not executed (filtered out before execution)"
+                else:
+                    reason = "Collector not executed (likely due to preflight failure)"
                 if preflight_results and dut_id in preflight_results:
                     # Get service name from collector ID prefix
                     service_name = (
@@ -3163,27 +3906,51 @@ class WorkflowOrchestrator:
                     self._tool_config_obj, "skip_html_reports", False
                 )
         else:
-            # Fallback to config manager tool config
             tool_config = self.config_manager.get_tool_config()
-            skip_html_reports = getattr(tool_config, "skip_html_reports", False)
+            skip_html_reports = (
+                tool_config.get("skip_html_reports", False)
+                if isinstance(tool_config, dict)
+                else getattr(tool_config, "skip_html_reports", False)
+            )
 
-        # Also get tool_config for other values
         tool_config = self.config_manager.get_tool_config()
-        skip_zip = getattr(tool_config, "skip_zip", False)
+        skip_zip = (
+            tool_config.get("skip_zip", False)
+            if isinstance(tool_config, dict)
+            else getattr(tool_config, "skip_zip", False)
+        )
 
-        # Generate HTML reports if enabled (after metadata creation but before logger finalization)
-        # Check new structured format first, fall back to legacy format for backward compatibility
-        # Handle nested config access for HTML reports
-        try:
-            output_config = getattr(tool_config, "output", {})
-            if hasattr(output_config, "generate_html"):
-                generate_html = output_config.generate_html
-            else:
-                generate_html = getattr(tool_config, "GENERATE_HTML_REPORTS", True)
-        except:
+        self._append_execution_order_table_to_runtime_log()
+
+        if isinstance(tool_config, dict):
+            output_config = tool_config.get("output", {})
+            generate_html = (
+                output_config.get("generate_html", True)
+                if isinstance(output_config, dict)
+                else tool_config.get("GENERATE_HTML_REPORTS", True)
+            )
+        else:
             generate_html = getattr(tool_config, "GENERATE_HTML_REPORTS", True)
+        # Determine report format
+        report_format = (
+            tool_config.get("report_format", "spa")
+            if isinstance(tool_config, dict)
+            else getattr(tool_config, "report_format", "spa")
+        )
+
         if not skip_html_reports and generate_html:
-            await self.generate_html_reports(total_runtime, collector_ids)
+            # Generate legacy HTML reports
+            if report_format in ("legacy", "both"):
+                await self.generate_html_reports(total_runtime, collector_ids)
+
+            # Generate SPA report
+            if report_format in ("spa", "both"):
+                await self._generate_spa_report()
+
+        # Append execution order table at the end of the DUT runtime log
+        self._append_execution_order_table_to_runtime_log()
+        # Write execution order metadata json for each DUT
+        self._write_execution_order_metadata()
 
         # Finalize logger (this will close file handles and restore stdout/stderr)
         if hasattr(self, "cleanup_manager") and self.cleanup_manager:
@@ -3328,7 +4095,10 @@ class WorkflowOrchestrator:
         return self._shutdown_requested
 
     def is_collector_applicable_for_baseboard(
-        self, collector: Dict[str, Any], baseboard_info: Optional[str]
+        self,
+        collector: Dict[str, Any],
+        baseboard_info: Optional[str],
+        node_type: Optional[str] = None,
     ) -> bool:
         """
         Check if a collector is applicable for a specific baseboard.
@@ -3340,8 +4110,20 @@ class WorkflowOrchestrator:
 
         Returns:
             True if collector is applicable for baseboard, False otherwise.
+
+        Raises:
+            ValueError: If baseboard is not defined in spreadsheet (configuration error)
         """
-        return self._is_collector_applicable(collector, baseboard_info)
+        try:
+            if node_type:
+                return self._is_collector_applicable(
+                    collector, baseboard_info, node_type
+                )
+            return self._is_collector_applicable(collector, baseboard_info)
+        except ValueError:
+            # Re-raise ValueError as-is - it's a critical configuration error
+            # that should stop execution. The error message is already formatted.
+            raise
 
     def _generate_dut_specific_reason(
         self,
@@ -3367,8 +4149,12 @@ class WorkflowOrchestrator:
         elif status == "Not applicable":
             # Check if it's due to tags or baseboard constraints
             tags = collector_info.get("tags", {})
-            include_tags = tags.get("include", [])
-            exclude_tags = tags.get("exclude", [])
+            if isinstance(tags, dict):
+                include_tags = tags.get("include", [])
+                exclude_tags = tags.get("exclude", [])
+            else:
+                include_tags = []
+                exclude_tags = []
 
             if exclude_tags:
                 return f"Not applicable for baseboard '{dut_baseboard}' (Tags: {exclude_tags})"
@@ -3381,7 +4167,10 @@ class WorkflowOrchestrator:
             return original_reason
 
     def _is_collector_applicable(
-        self, collector: Dict[str, Any], baseboard_info: Optional[str]
+        self,
+        collector: Dict[str, Any],
+        baseboard_info: Optional[str],
+        node_type: Optional[str] = None,
     ) -> bool:
         """
         Check if a collector is applicable for the current baseboard.
@@ -3420,6 +4209,82 @@ class WorkflowOrchestrator:
                 print("ERROR: Please configure baseboard in DUT config file.")
             sys.exit(1)
 
+        baseboard_manager = None
+        baseboard_type = None
+        if hasattr(self, "dut_manager") and self.dut_manager:
+            baseboard_manager = self.dut_manager._get_baseboard_manager()
+            if baseboard_manager:
+                baseboard_type = baseboard_manager.get_baseboard_type(baseboard_info)
+                if not isinstance(baseboard_type, str):
+                    baseboard_type = None
+        effective_baseboard_names = [baseboard_info]
+        effective_baseboard_uppers = [
+            member.upper() for member in effective_baseboard_names
+        ]
+
+        def _normalize_constraint_values(value):
+            normalized = []
+
+            def _flatten(item):
+                if item is None:
+                    return
+                if isinstance(item, str):
+                    trimmed = item.strip()
+                    if trimmed:
+                        normalized.append(trimmed)
+                    return
+                if isinstance(item, list):
+                    for child in item:
+                        _flatten(child)
+                    return
+                if isinstance(item, dict):
+                    for key, flag in item.items():
+                        include = True
+                        if isinstance(flag, bool):
+                            include = flag
+                        elif isinstance(flag, str):
+                            include = flag.strip().lower() not in (
+                                "false",
+                                "0",
+                                "no",
+                                "off",
+                            )
+                        elif isinstance(flag, (int, float)):
+                            include = bool(flag)
+                        if include:
+                            normalized.append(str(key).strip())
+                    return
+                normalized.append(str(item).strip())
+
+            _flatten(value)
+            return [item for item in normalized if item]
+
+        def _constraint_matches(spec: str) -> bool:
+            spec_upper = spec.upper()
+            if spec_upper in {"ALL", "*"}:
+                return True
+            if spec_upper in effective_baseboard_uppers:
+                return True
+            if baseboard_type and baseboard_type.upper() == spec_upper:
+                return True
+            if node_type and node_type.upper() == spec_upper:
+                return True
+            if baseboard_manager:
+                group_members = baseboard_manager.get_baseboards_in_group(spec)
+                group_members_upper = [member.upper() for member in group_members]
+                if group_members and any(
+                    effective in group_members_upper
+                    for effective in effective_baseboard_uppers
+                ):
+                    return True
+            return False
+
+        exclude_baseboards = _normalize_constraint_values(
+            collector.get("exclude_baseboards")
+        )
+        if any(_constraint_matches(spec) for spec in exclude_baseboards):
+            return False
+
         # Check applicable_baseboards field (YAML-based method)
         applicable_baseboards = collector.get("applicable_baseboards", "all")
 
@@ -3433,22 +4298,51 @@ class WorkflowOrchestrator:
         elif isinstance(applicable_baseboards, list):
             # Use BaseboardManager for proper baseboard type matching
             if hasattr(self, "dut_manager") and self.dut_manager:
-                baseboard_manager = self.dut_manager._get_baseboard_manager()
                 if baseboard_manager:
-                    # Get the baseboard type for the current baseboard
-                    baseboard_type = baseboard_manager.get_baseboard_type(
-                        baseboard_info
-                    )
+                    # If baseboard_type is None, check if baseboard_info is a group name
+                    # This handles cases where platform detection returns a group name like "NVL"
+                    # instead of a specific baseboard name like "GB200 NVL"
+                    if baseboard_type is None:
+                        all_groups = baseboard_manager.get_all_baseboard_types()
+                        if baseboard_info.upper() in [g.upper() for g in all_groups]:
+                            # baseboard_info is a valid group name, use it as the type
+                            baseboard_type = baseboard_info
+                        else:
+                            # Baseboard not found in spreadsheet and not a valid group name
+                            # This is a configuration error - the spreadsheet needs to be updated
+                            try:
+                                available_baseboards = sorted(
+                                    baseboard_manager.baseboards.keys()
+                                )
+                            except (AttributeError, TypeError):
+                                available_baseboards = []
+
+                            available_str = (
+                                f"Available baseboards: {available_baseboards}"
+                                if available_baseboards
+                                else "No baseboards found in spreadsheet"
+                            )
+
+                            error_msg = (
+                                f"Baseboard '{baseboard_info}' is not defined in the spreadsheet. "
+                                f"This is a configuration error. Please ensure the spreadsheet includes "
+                                f"the baseboard. {available_str}"
+                            )
+                            if hasattr(self, "logger") and hasattr(
+                                self.logger, "console"
+                            ):
+                                self.logger.console.print_error(error_msg)
+                            else:
+                                print(f"ERROR: {error_msg}")
+                            raise ValueError(error_msg)
 
                     # Check if the baseboard name or type matches any in the applicable list
                     baseboard_found = False
-                    baseboard_upper = baseboard_info.upper()
-
                     for applicable_bb in applicable_baseboards:
                         applicable_bb_upper = applicable_bb.upper()
 
                         # Check for exact baseboard name match
-                        if applicable_bb_upper == baseboard_upper:
+                        if applicable_bb_upper in effective_baseboard_uppers:
                             baseboard_found = True
                             break
 
@@ -3459,15 +4353,22 @@ class WorkflowOrchestrator:
                         ):
                             baseboard_found = True
                             break
+                        if node_type and applicable_bb_upper == node_type.upper():
+                            baseboard_found = True
+                            break
 
                     if not baseboard_found:
                         return False
                 else:
                     # Fallback to exact string matching if BaseboardManager not available
                     baseboard = baseboard_info.upper()
+                    node = node_type.upper() if node_type else None
                     baseboard_found = False
                     for applicable_bb in applicable_baseboards:
-                        if applicable_bb.upper() == baseboard:
+                        applicable_upper = applicable_bb.upper()
+                        if applicable_upper == baseboard or (
+                            node and applicable_upper == node
+                        ):
                             baseboard_found = True
                             break
                     if not baseboard_found:
@@ -3475,9 +4376,13 @@ class WorkflowOrchestrator:
             else:
                 # Fallback to exact string matching if DUT manager not available
                 baseboard = baseboard_info.upper()
+                node = node_type.upper() if node_type else None
                 baseboard_found = False
                 for applicable_bb in applicable_baseboards:
-                    if applicable_bb.upper() == baseboard:
+                    applicable_upper = applicable_bb.upper()
+                    if applicable_upper == baseboard or (
+                        node and applicable_upper == node
+                    ):
                         baseboard_found = True
                         break
                 if not baseboard_found:
@@ -3487,11 +4392,46 @@ class WorkflowOrchestrator:
             if applicable_baseboards.upper() != "ALL":
                 # Use BaseboardManager for proper baseboard type matching
                 if hasattr(self, "dut_manager") and self.dut_manager:
-                    baseboard_manager = self.dut_manager._get_baseboard_manager()
                     if baseboard_manager:
-                        baseboard_type = baseboard_manager.get_baseboard_type(
-                            baseboard_info
-                        )
+                        # If baseboard_type is None, check if baseboard_info is a group name
+                        # This handles cases where platform detection returns a group name like "NVL"
+                        # instead of a specific baseboard name like "GB200 NVL"
+                        if baseboard_type is None:
+                            all_groups = baseboard_manager.get_all_baseboard_types()
+                            if baseboard_info.upper() in [
+                                g.upper() for g in all_groups
+                            ]:
+                                # baseboard_info is a valid group name, use it as the type
+                                baseboard_type = baseboard_info
+                            else:
+                                # Baseboard not found in spreadsheet and not a valid group name
+                                # This is a configuration error - the spreadsheet needs to be updated
+                                try:
+                                    available_baseboards = sorted(
+                                        baseboard_manager.baseboards.keys()
+                                    )
+                                except (AttributeError, TypeError):
+                                    available_baseboards = []
+
+                                available_str = (
+                                    f"Available baseboards: {available_baseboards}"
+                                    if available_baseboards
+                                    else "No baseboards found in spreadsheet"
+                                )
+
+                                error_msg = (
+                                    f"Baseboard '{baseboard_info}' is not defined in the spreadsheet. "
+                                    f"This is a configuration error. Please ensure the spreadsheet includes "
+                                    f"the baseboard. {available_str}"
+                                )
+                                if hasattr(self, "logger") and hasattr(
+                                    self.logger, "console"
+                                ):
+                                    self.logger.console.print_error(error_msg)
+                                else:
+                                    print(f"ERROR: {error_msg}")
+                                raise ValueError(error_msg)
+
                         # Check if it's a group match (baseboard type matches)
                         if (
                             baseboard_type
@@ -3499,33 +4439,51 @@ class WorkflowOrchestrator:
                         ):
                             return True
                         # Check if it's an individual baseboard match (baseboard name matches)
-                        if baseboard_info.upper() == applicable_baseboards.upper():
+                        if applicable_baseboards.upper() in effective_baseboard_uppers:
+                            return True
+                        if node_type and node_type.upper() == applicable_baseboards.upper():
                             return True
                         # If neither matches, it's not applicable
                         return False
                     else:
                         # Fallback to exact string matching
-                        if baseboard_info.upper() != applicable_baseboards.upper():
+                        applicable_upper = applicable_baseboards.upper()
+                        if applicable_upper != baseboard_info.upper() and (
+                            not node_type or applicable_upper != node_type.upper()
+                        ):
                             return False
                 else:
                     # Fallback to exact string matching
-                    if baseboard_info.upper() != applicable_baseboards.upper():
+                    applicable_upper = applicable_baseboards.upper()
+                    if applicable_upper != baseboard_info.upper() and (
+                        not node_type or applicable_upper != node_type.upper()
+                    ):
                         return False
 
         # Also check legacy tags format for backward compatibility
         tags = collector.get("tags", {})
-        include_tags = tags.get("include", [])
-        exclude_tags = tags.get("exclude", [])
+        if isinstance(tags, dict):
+            include_tags = tags.get("include", [])
+            exclude_tags = tags.get("exclude", [])
+        else:
+            include_tags = []
+            exclude_tags = []
+
+        context_for_tags = " ".join(
+            part
+            for part in [baseboard_info, baseboard_type, node_type]
+            if part
+        ).upper()
 
         # Check exclude tags first
         for exclude_tag in exclude_tags:
-            if exclude_tag.upper() in baseboard_info.upper():
+            if exclude_tag.upper() in context_for_tags:
                 return False
 
         # Check include tags
         if include_tags:
             for include_tag in include_tags:
-                if include_tag.upper() in baseboard_info.upper():
+                if include_tag.upper() in context_for_tags:
                     return True
             return False  # No include tags matched
 
@@ -3537,6 +4495,9 @@ class WorkflowOrchestrator:
         """
         Check if a collector level is applicable for the current collection level.
 
+        L0 collectors are special - they only run when explicitly specified via CLI
+        (--collector-id or --include-collectors) and never run by default in any level.
+
         Args:
             collector_level: Collector's required level
             current_level: Current collection level
@@ -3544,7 +4505,12 @@ class WorkflowOrchestrator:
         Returns:
             bool: True if collector level is applicable
         """
-        level_mapping = {"L1": 1, "L2": 2, "L3": 3}
+        # L0 collectors never run by default - they must be explicitly specified
+        # They are filtered at the CLI level when specific collector IDs are provided
+        if collector_level == "L0":
+            return False
+
+        level_mapping = {"L0": 0, "L1": 1, "L2": 2, "L3": 3}
 
         collector_level_num = level_mapping.get(collector_level, 3)
         current_level_num = level_mapping.get(current_level, 3)
@@ -3590,7 +4556,6 @@ class WorkflowOrchestrator:
             progress: Progress bar.
             session_task: Session task.
         """
-        batch_size = 5  # Process 5 DUTs concurrently at a time
 
         async def create_session_for_dut(dut_id: str) -> tuple:
             """
@@ -3628,56 +4593,102 @@ class WorkflowOrchestrator:
                 )
                 return dut_id, "failed"
 
-        # Process DUTs in batches
-        for i in range(0, len(dut_ids), batch_size):
-            # Check if shutdown was requested
-            if hasattr(self, "_shutdown_requested") and self._shutdown_requested:
-                await self.logger.log_runtime(
-                    "WARN",
-                    "WorkflowOrchestrator",
-                    "Shutdown requested, stopping Redfish session creation",
-                )
-                break
-
-            batch = dut_ids[i : i + batch_size]
+        # Check if shutdown was requested
+        if hasattr(self, "_shutdown_requested") and self._shutdown_requested:
             await self.logger.log_runtime(
-                "DEBUG",
+                "WARN",
                 "WorkflowOrchestrator",
-                f"Processing session creation batch {i//batch_size + 1}/{(len(dut_ids) + batch_size - 1)//batch_size} ({len(batch)} DUTs)",
+                "Shutdown requested, stopping Redfish session creation",
             )
+            return
 
-            # Process this batch concurrently
-            batch_tasks = [create_session_for_dut(dut_id) for dut_id in batch]
-            batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+        # Process all DUTs concurrently
+        all_tasks = [create_session_for_dut(dut_id) for dut_id in dut_ids]
+        all_results = await asyncio.gather(*all_tasks, return_exceptions=True)
 
-            # Process batch results
-            for j, result in enumerate(batch_results):
-                if isinstance(result, Exception):
-                    dut_id = batch[j]
-                    await self.logger.log_runtime(
-                        "ERROR",
-                        "WorkflowOrchestrator",
-                        f"Unexpected error creating session for DUT {dut_id}: {str(result)}",
+        for j, result in enumerate(all_results):
+            if isinstance(result, Exception):
+                dut_id = dut_ids[j]
+                await self.logger.log_runtime(
+                    "ERROR",
+                    "WorkflowOrchestrator",
+                    f"Unexpected error creating session for DUT {dut_id}: {str(result)}",
+                )
+                progress.update(session_task, description=f"Error {dut_id}")
+            else:
+                dut_id, status = result
+                if status == "success":
+                    progress.update(
+                        session_task,
+                        description=f"Created session for {dut_id}",
                     )
-                    progress.update(session_task, description=f"Error {dut_id}")
-                else:
-                    dut_id, status = result
-                    if status == "success":
-                        progress.update(
-                            session_task,
-                            description=f"Created session for {dut_id}",
-                        )
-                    elif status == "skipped":
-                        progress.update(
-                            session_task,
-                            description=f"Skipped {dut_id} (no Redfish)",
-                        )
-                    elif status == "timeout":
-                        progress.update(session_task, description=f"Timeout {dut_id}")
-                    else:  # failed
-                        progress.update(session_task, description=f"Failed {dut_id}")
+                elif status == "skipped":
+                    progress.update(
+                        session_task,
+                        description=f"Skipped {dut_id} (no Redfish)",
+                    )
+                elif status == "timeout":
+                    progress.update(session_task, description=f"Timeout {dut_id}")
+                else:  # failed
+                    progress.update(session_task, description=f"Failed {dut_id}")
 
-                progress.advance(session_task)
+            progress.advance(session_task)
+
+    async def _setup_progress_display(
+        self,
+        dut_ids: List[str],
+        all_filtered_collectors: list,
+        total_collectors: int,
+    ) -> None:
+        """Initialize progress state manager and display for collector execution."""
+        try:
+            progress_state = ProgressStateManager(
+                dut_ids, all_filtered_collectors, self.logger, self.console
+            )
+            self.progress_state = progress_state
+            self.progress_display = ProgressDisplay(self.console, self.logger)
+            self.progress_display.set_progress_state(progress_state)
+            await progress_state.initialize()
+        except ImportError:
+            self.progress_state = None
+            self.progress_display = None
+
+        if total_collectors > 0:
+            self.console.print(
+                f"\n[bold blue]Executing {total_collectors} Collectors[/bold blue]"
+            )
+            if self.progress_display:
+                self.progress_display.start(dut_ids, total_collectors)
+                self.progress_update_task = asyncio.create_task(
+                    self._update_progress_periodically()
+                )
+
+    async def _teardown_progress_display(self) -> None:
+        """Stop progress display and cancel the background update task."""
+        if hasattr(self, "progress_display") and self.progress_display:
+            await self.progress_display.update()
+            self.progress_display.stop()
+
+        if hasattr(self, "progress_update_task") and self.progress_update_task:
+            self.progress_update_task.cancel()
+            try:
+                await self.progress_update_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _log_to_all(
+        self,
+        level: str,
+        component: str,
+        message: str,
+        dut_ids: List[str],
+    ) -> None:
+        """Log a message to both the runtime log and every DUT's runtime log."""
+        await self.logger.log_runtime(level, component, message)
+        for dut_id in dut_ids:
+            await self.logger.write_to_dut_runtime_log(
+                dut_id, level, component, message
+            )
 
     async def _update_progress_periodically(self):
         """

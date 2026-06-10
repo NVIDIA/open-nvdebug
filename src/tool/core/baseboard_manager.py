@@ -28,7 +28,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-import pandas as pd
+from ..utils import excel_reader
 
 from .async_logger import AsyncSafeLogger
 
@@ -57,32 +57,54 @@ class BaseboardManager:
         self.baseboard_groups: Dict[str, List[str]] = (
             {}
         )  # group_name -> [baseboard_names]
+        self.baseboard_name_lookup: Dict[str, str] = {}
+        self.baseboard_type_lookup: Dict[str, str] = {}
+        self.ansible_mappings: List[Dict[str, Any]] = []
+        self.redfish_entity_defaults: Dict[str, Dict[str, List[str]]] = {}
         self.logger = logger
+        self._pending_log_tasks: List[asyncio.Task] = []
 
         if spreadsheet_path:
             if self._has_spreadsheet_baseboard_definitions(spreadsheet_path):
                 self._load_from_spreadsheet(spreadsheet_path)
             else:
                 if self.logger:
-                    asyncio.create_task(
-                        self.logger.log_runtime(
-                            "WARNING",
-                            "BaseboardManager",
-                            f"No baseboard definitions found in spreadsheet: {spreadsheet_path}",
+                    self._pending_log_tasks.append(
+                        asyncio.create_task(
+                            self.logger.log_runtime(
+                                "WARNING",
+                                "BaseboardManager",
+                                f"No baseboard definitions found in spreadsheet: {spreadsheet_path}",
+                            )
                         )
                     )
                 # Initialize with empty baseboards if no definitions found
                 self.baseboards = {}
         else:
             if self.logger:
-                asyncio.create_task(
-                    self.logger.log_runtime(
-                        "WARNING",
-                        "BaseboardManager",
-                        "No spreadsheet path provided - initializing with empty baseboards",
+                self._pending_log_tasks.append(
+                    asyncio.create_task(
+                        self.logger.log_runtime(
+                            "WARNING",
+                            "BaseboardManager",
+                            "No spreadsheet path provided - initializing with empty baseboards",
+                        )
                     )
                 )
             self.baseboards = {}
+
+    async def drain_pending_logs(self) -> None:
+        """Await all pending log tasks to prevent resource leaks."""
+        if self._pending_log_tasks:
+            await asyncio.gather(*self._pending_log_tasks, return_exceptions=True)
+            self._pending_log_tasks.clear()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.drain_pending_logs()
+        return False
 
     def _has_spreadsheet_baseboard_definitions(
         self, spreadsheet_path: Union[str, Path]
@@ -99,7 +121,7 @@ class BaseboardManager:
                 return False
 
             # Try to read the configuration sheet
-            df = pd.read_excel(
+            df = excel_reader.read_excel(
                 spreadsheet_path, sheet_name="Log Collection Configuration"
             )
 
@@ -122,17 +144,19 @@ class BaseboardManager:
             spreadsheet_path = Path(spreadsheet_path)
             if not spreadsheet_path.exists():
                 if self.logger:
-                    asyncio.create_task(
-                        self.logger.log_runtime(
-                            "ERROR",
-                            "BaseboardManager",
-                            f"Spreadsheet file not found: {spreadsheet_path}",
+                    self._pending_log_tasks.append(
+                        asyncio.create_task(
+                            self.logger.log_runtime(
+                                "ERROR",
+                                "BaseboardManager",
+                                f"Spreadsheet file not found: {spreadsheet_path}",
+                            )
                         )
                     )
                 return
 
             # Read the configuration sheet
-            df = pd.read_excel(
+            df = excel_reader.read_excel(
                 spreadsheet_path, sheet_name="Log Collection Configuration"
             )
 
@@ -142,11 +166,44 @@ class BaseboardManager:
             for _, row in global_rows.iterrows():
                 config_item = row.get("Configuration Item", "")
                 value = row.get("Value", "")
-                global_constants[config_item] = value
+                if config_item == "redfish_entity_defaults":
+                    if excel_reader.notna(value) and value:
+                        try:
+                            self.redfish_entity_defaults = json.loads(str(value))
+                        except json.JSONDecodeError:
+                            self.redfish_entity_defaults = {}
+                else:
+                    global_constants[config_item] = value
 
             # Extract baseboard definitions
             baseboards = {}
             baseboard_rows = df[df["Section"] == "Baseboard Definitions"]
+            ansible_rows = df[df["Section"] == "Ansible Mappings"]
+
+            self.ansible_mappings = []
+            for _, row in ansible_rows.iterrows():
+                field_name = row.get("Configuration Item", "")
+                if str(field_name).strip().lower() != "ansible_mappings":
+                    continue
+                value = row.get("Value", "")
+                if excel_reader.notna(value) and value:
+                    try:
+                        self.ansible_mappings = json.loads(str(value))
+                    except json.JSONDecodeError:
+                        self.ansible_mappings = []
+                else:
+                    self.ansible_mappings = []
+
+            if self.logger:
+                self._pending_log_tasks.append(
+                    asyncio.create_task(
+                        self.logger.log_runtime(
+                            "INFO",
+                            "BaseboardManager",
+                            f"Parsed {len(self.ansible_mappings)} ansible baseboard mappings from spreadsheet {spreadsheet_path}",
+                        )
+                    )
+                )
 
             # Get all baseboard columns (skip Section, Configuration Item, Value, Description)
             baseboard_columns = [
@@ -175,7 +232,7 @@ class BaseboardManager:
                     # Handle different field types
                     if field_name in ["type", "platform", "description"]:
                         baseboards[baseboard_name][field_name] = (
-                            str(value) if pd.notna(value) else ""
+                            str(value) if excel_reader.notna(value) else ""
                         )
                     elif field_name in [
                         "supports_redfish",
@@ -184,11 +241,11 @@ class BaseboardManager:
                         "supports_hmc",
                     ]:
                         baseboards[baseboard_name][field_name] = (
-                            bool(value) if pd.notna(value) else False
+                            bool(value) if excel_reader.notna(value) else False
                         )
                     elif field_name == "i2c_config":
                         try:
-                            if pd.notna(value) and value:
+                            if excel_reader.notna(value) and value:
                                 baseboards[baseboard_name][field_name] = json.loads(
                                     str(value)
                                 )
@@ -198,7 +255,7 @@ class BaseboardManager:
                             baseboards[baseboard_name][field_name] = {}
                     elif field_name == "platform_detection":
                         try:
-                            if pd.notna(value) and value:
+                            if excel_reader.notna(value) and value:
                                 platform_detection = json.loads(str(value))
                                 # Resolve YAML anchors for HMC IP
                                 if isinstance(platform_detection.get("hmc_ip"), str):
@@ -215,11 +272,13 @@ class BaseboardManager:
 
                                         # Log the resolution for debugging
                                         if self.logger:
-                                            asyncio.create_task(
-                                                self.logger.log_runtime(
-                                                    "DEBUG",
-                                                    "BaseboardManager",
-                                                    f"Resolved YAML anchor {hmc_ip_value} -> {resolved_value} for baseboard {baseboard_name}",
+                                            self._pending_log_tasks.append(
+                                                asyncio.create_task(
+                                                    self.logger.log_runtime(
+                                                        "DEBUG",
+                                                        "BaseboardManager",
+                                                        f"Resolved YAML anchor {hmc_ip_value} -> {resolved_value} for baseboard {baseboard_name}",
+                                                    )
                                                 )
                                             )
                                         else:
@@ -230,11 +289,13 @@ class BaseboardManager:
                                     else:
                                         # Log when no anchor resolution is needed
                                         if self.logger:
-                                            asyncio.create_task(
-                                                self.logger.log_runtime(
-                                                    "DEBUG",
-                                                    "BaseboardManager",
-                                                    f"No YAML anchor resolution needed for {baseboard_name}.hmc_ip = {hmc_ip_value}",
+                                            self._pending_log_tasks.append(
+                                                asyncio.create_task(
+                                                    self.logger.log_runtime(
+                                                        "DEBUG",
+                                                        "BaseboardManager",
+                                                        f"No YAML anchor resolution needed for {baseboard_name}.hmc_ip = {hmc_ip_value}",
+                                                    )
                                                 )
                                             )
                                 baseboards[baseboard_name][
@@ -244,6 +305,10 @@ class BaseboardManager:
                                 baseboards[baseboard_name][field_name] = {}
                         except json.JSONDecodeError:
                             baseboards[baseboard_name][field_name] = {}
+                    else:
+                        # Preserve any additional metadata fields as strings
+                        if excel_reader.notna(value) and value != "":
+                            baseboards[baseboard_name][field_name] = str(value)
 
             # Add global constants to each baseboard
             for baseboard_name in baseboards:
@@ -253,21 +318,25 @@ class BaseboardManager:
             self._build_lookup_tables()
 
             if self.logger:
-                asyncio.create_task(
-                    self.logger.log_runtime(
-                        "INFO",
-                        "BaseboardManager",
-                        f"Loaded {len(baseboards)} baseboards from spreadsheet: {spreadsheet_path}",
+                self._pending_log_tasks.append(
+                    asyncio.create_task(
+                        self.logger.log_runtime(
+                            "INFO",
+                            "BaseboardManager",
+                            f"Loaded {len(baseboards)} baseboards from spreadsheet: {spreadsheet_path}",
+                        )
                     )
                 )
 
         except Exception as e:
             if self.logger:
-                asyncio.create_task(
-                    self.logger.log_runtime(
-                        "ERROR",
-                        "BaseboardManager",
-                        f"Failed to load baseboards from spreadsheet: {e}",
+                self._pending_log_tasks.append(
+                    asyncio.create_task(
+                        self.logger.log_runtime(
+                            "ERROR",
+                            "BaseboardManager",
+                            f"Failed to load baseboards from spreadsheet: {e}",
+                        )
                     )
                 )
             # Initialize with empty baseboards if loading fails
@@ -282,16 +351,39 @@ class BaseboardManager:
         """
         self.baseboard_types.clear()
         self.baseboard_groups.clear()
+        self.baseboard_name_lookup.clear()
+        self.baseboard_type_lookup.clear()
 
         # Build baseboard_name -> type mapping
         for baseboard_name, baseboard_config in self.baseboards.items():
+            self.baseboard_name_lookup[baseboard_name.lower()] = baseboard_name
             baseboard_type = baseboard_config.get("type", "unknown")
             self.baseboard_types[baseboard_name] = baseboard_type
+            if baseboard_type:
+                self.baseboard_type_lookup.setdefault(
+                    baseboard_type.lower(), baseboard_type
+                )
 
             # Build group -> baseboard_names mapping
             if baseboard_type not in self.baseboard_groups:
                 self.baseboard_groups[baseboard_type] = []
             self.baseboard_groups[baseboard_type].append(baseboard_name)
+
+    def _normalize_baseboard_name(self, baseboard_name: Optional[str]) -> Optional[str]:
+        if not baseboard_name:
+            return baseboard_name
+        if baseboard_name in self.baseboards:
+            return baseboard_name
+        key = baseboard_name.strip().lower()
+        return self.baseboard_name_lookup.get(key, baseboard_name)
+
+    def _normalize_group_name(self, group_name: Optional[str]) -> Optional[str]:
+        if not group_name:
+            return group_name
+        if group_name in self.baseboard_groups:
+            return group_name
+        key = group_name.strip().lower()
+        return self.baseboard_type_lookup.get(key, group_name)
 
     def get_baseboard_type(self, baseboard_name: str) -> Optional[str]:
         """
@@ -303,7 +395,8 @@ class BaseboardManager:
         Returns:
             Baseboard type (e.g., "NVL", "HGX", "GH200") or None if not found
         """
-        baseboard_type = self.baseboard_types.get(baseboard_name)
+        normalized_name = self._normalize_baseboard_name(baseboard_name)
+        baseboard_type = self.baseboard_types.get(normalized_name)
         return baseboard_type
 
     async def log_baseboard_info(self, dut_id: str) -> None:
@@ -346,20 +439,6 @@ class BaseboardManager:
         """
         return self.get_baseboard_type(baseboard_name)
 
-    def is_baseboard_in_group(self, baseboard_name: str, group_name: str) -> bool:
-        """
-        Check if a baseboard belongs to a specific group.
-
-        Args:
-            baseboard_name: Name of the baseboard (e.g., "GB200 NVL")
-            group_name: Name of the group (e.g., "NVL", "HGX")
-
-        Returns:
-            True if baseboard belongs to the group, False otherwise
-        """
-        baseboard_type = self.get_baseboard_type(baseboard_name)
-        return baseboard_type == group_name
-
     def get_baseboards_in_group(self, group_name: str) -> List[str]:
         """
         Get all baseboards that belong to a specific group.
@@ -370,7 +449,8 @@ class BaseboardManager:
         Returns:
             List of baseboard names in the group
         """
-        return self.baseboard_groups.get(group_name, [])
+        normalized_group = self._normalize_group_name(group_name)
+        return self.baseboard_groups.get(normalized_group, [])
 
     def get_all_baseboard_names(self) -> List[str]:
         """
@@ -400,40 +480,55 @@ class BaseboardManager:
         Returns:
             Baseboard configuration dictionary or None if not found
         """
-        return self.baseboards.get(baseboard_name)
+        normalized_name = self._normalize_baseboard_name(baseboard_name)
+        return self.baseboards.get(normalized_name)
 
-    def validate_baseboard_filtering_rules(
-        self, filtering_rules: Dict[str, str]
-    ) -> Dict[str, List[str]]:
+    def get_entity_patterns(
+        self, baseboard_name: str, entity_type: str
+    ) -> Optional[List[str]]:
         """
-        Validate baseboard filtering rules against known baseboards.
+        Get the default Redfish entity ID patterns for a baseboard and entity type.
+
+        Resolution order: exact baseboard name > baseboard group/type > "default".
 
         Args:
-            filtering_rules: Dictionary of baseboard/group -> filter_mode mappings
+            baseboard_name: Name of the baseboard (e.g., "HGX B300", "GB200 NVL")
+            entity_type: Redfish entity type — "Systems", "Managers", or "Chassis"
 
         Returns:
-            Dictionary of valid and invalid rules
+            List of ID patterns (e.g., ["HGX_Baseboard_*"]) or None if not configured
         """
-        valid_rules = {}
-        invalid_rules = []
+        if not self.redfish_entity_defaults:
+            return None
 
-        all_baseboard_names = self.get_all_baseboard_names()
-        all_baseboard_types = self.get_all_baseboard_types()
+        pattern_key = {
+            "Systems": "systems",
+            "Managers": "managers",
+            "Chassis": "chassis",
+        }.get(entity_type)
+        if not pattern_key:
+            return None
 
-        for rule_key, filter_mode in filtering_rules.items():
-            # Check if rule_key is a specific baseboard name
-            if rule_key in all_baseboard_names:
-                valid_rules[rule_key] = filter_mode
-            # Check if rule_key is a baseboard type/group
-            elif rule_key in all_baseboard_types:
-                valid_rules[rule_key] = filter_mode
-            # Check if rule_key is "default"
-            elif rule_key == "default":
-                valid_rules[rule_key] = filter_mode
-            else:
-                invalid_rules.append(rule_key)
+        normalized_name = (
+            self._normalize_baseboard_name(baseboard_name) or baseboard_name
+        )
 
-        return {"valid": valid_rules, "invalid": invalid_rules}
+        # 1. Exact baseboard name match
+        if normalized_name in self.redfish_entity_defaults:
+            patterns = self.redfish_entity_defaults[normalized_name].get(pattern_key)
+            if patterns:
+                return patterns
+
+        # 2. Baseboard group/type match
+        baseboard_type = self.get_baseboard_type(baseboard_name)
+        if baseboard_type and baseboard_type in self.redfish_entity_defaults:
+            patterns = self.redfish_entity_defaults[baseboard_type].get(pattern_key)
+            if patterns:
+                return patterns
+
+        # 3. "default" fallback
+        default_entry = self.redfish_entity_defaults.get("default", {})
+        return default_entry.get(pattern_key)
 
     async def apply_baseboard_filtering(
         self,
@@ -464,29 +559,43 @@ class BaseboardManager:
             return default_filter_mode
 
         # Priority order: exact baseboard match > group match > default
+        normalized_dut_baseboard = self._normalize_baseboard_name(dut_baseboard)
         dut_type = self.get_baseboard_type(dut_baseboard)
+        normalized_rules: Dict[str, str] = {}
+        for rule_key, filter_mode in filtering_rules.items():
+            if rule_key == "default":
+                normalized_rules[rule_key] = filter_mode
+                continue
+            normalized_baseboard = self._normalize_baseboard_name(rule_key)
+            normalized_group = self._normalize_group_name(rule_key)
+            if normalized_baseboard in self.baseboards:
+                normalized_rules[normalized_baseboard] = filter_mode
+            elif normalized_group in self.baseboard_groups:
+                normalized_rules[normalized_group] = filter_mode
+            else:
+                normalized_rules[rule_key] = filter_mode
 
         await self.logger.write_to_dut_runtime_log(
             dut_id,
             "DEBUG",
             "BaseboardManager",
-            f"Applying baseboard filtering: dut_baseboard='{dut_baseboard}', dut_type='{dut_type}', rules={filtering_rules}",
+            f"Applying baseboard filtering: dut_baseboard='{normalized_dut_baseboard}', dut_type='{dut_type}', rules={normalized_rules}",
         )
 
         # 1. Check for exact baseboard match (highest priority)
-        if dut_baseboard in filtering_rules:
-            effective_filter = filtering_rules[dut_baseboard]
+        if normalized_dut_baseboard in normalized_rules:
+            effective_filter = normalized_rules[normalized_dut_baseboard]
             await self.logger.write_to_dut_runtime_log(
                 dut_id,
                 "DEBUG",
                 "BaseboardManager",
-                f"Exact baseboard match '{dut_baseboard}' -> filter_mode='{effective_filter}'",
+                f"Exact baseboard match '{normalized_dut_baseboard}' -> filter_mode='{effective_filter}'",
             )
             return effective_filter
 
         # 2. Check for group/type match (medium priority)
-        if dut_type and dut_type in filtering_rules:
-            effective_filter = filtering_rules[dut_type]
+        if dut_type and dut_type in normalized_rules:
+            effective_filter = normalized_rules[dut_type]
             await self.logger.write_to_dut_runtime_log(
                 dut_id,
                 "DEBUG",
@@ -496,8 +605,8 @@ class BaseboardManager:
             return effective_filter
 
         # 3. Check for "default" rule (lowest priority)
-        if "default" in filtering_rules:
-            effective_filter = filtering_rules["default"]
+        if "default" in normalized_rules:
+            effective_filter = normalized_rules["default"]
             await self.logger.write_to_dut_runtime_log(
                 dut_id,
                 "DEBUG",

@@ -10,7 +10,7 @@
 # The collection level can be set to L1, L2, or L3 either here or via the CLI --level
 # collection_level: "L1"  # L1, L2, L3
 
-# The execution mode can be set to Local or RemoteClient either here or within the DUT config file 
+# The execution mode can be set to Local or RemoteClient either here or within the DUT config file
 # itself in DUTDefaults anchor or within a DUT object.
 # --------------------------------------------------------------
 # execution_mode: "RemoteClient"  # Local, RemoteClient
@@ -39,7 +39,7 @@
 #   create_zip: true
 #   create_split_zip: true
 #   zip_split_threshold: 200.0  # MB
-#   generate_html: true 
+#   generate_html: true
 
 # Log sanitization
 #   enabled: Whether to enable log sanitization, default is true, you can set via cli --skip-sanitization to disable as well
@@ -51,15 +51,28 @@
 #   enabled: true # default is true, you can set via cli --skip-sanitization to disable as well
 
 # Redfish URI Configuration
-#   prefix_override: Global prefix override for Redfish URIs (optional)
+#   prefix_override: Global prefix override for all BMC Redfish URIs (optional)
+#   hmc_prefix_override: Prefix override applied only to HMC-targeted Redfish URIs
+#     (URIs containing HGX_* resource IDs, e.g. /Systems/HGX_Baseboard_0/...).
+#     Use this on arm64 / aggregation platforms where the Customer BMC exposes HMC
+#     resources under a different Redfish root path.  A DUT-level RF_HMC_DEFAULT_PREFIX
+#     always takes precedence over this tool-level setting.
+#   hmc_resource_prefix: Path segment prefix used to identify HMC-owned resources
+#     (default: "HGX_"). Override only if your platform uses a non-standard prefix.
 #   default_uris: Default URI mappings for Redfish endpoints
 # --------------------------------------------------------------
 # * Be sure to uncomment the entire uri_overrides block to use it.
 # --------------------------------------------------------------
 # uri_overrides:
-#   # Global prefix override (optional)
+#   # Global BMC prefix override (optional)
 #   # prefix_override: "/custom/redfish/v1"
-#   
+#   #
+#   # HMC-specific prefix override (arm64 / aggregation platforms only)
+#   # hmc_prefix_override: "/custom/redfish/v1"
+#   #
+#   # HMC resource path prefix used to detect HMC URIs (default: "HGX_")
+#   # hmc_resource_prefix: "HGX_"
+#   #
 #   # Default URI mappings (proper case from ResourceType enum)
 #   default_uris:
 #     Systems: "/redfish/v1/Systems"
@@ -78,7 +91,7 @@
 #   connection_pool_limit_per_host: Connections per host (BMC-friendly)
 #   session_timeout: Session timeout in seconds
 #   keepalive_timeout: Keep connections alive for this duration
-#   ssl: SSL verification (false for BMC self-signed certs)
+#   ssl_verify: SSL certificate verification (false for BMC self-signed certs)
 #   ttl_dns_cache: DNS cache TTL in seconds
 #   use_dns_cache: Enable DNS caching
 #   force_close: Keep connections alive (false recommended)
@@ -98,7 +111,7 @@
 #   keepalive_timeout: 300             # Keep connections alive for this duration
 #
 #   # TCP Connector settings
-#   ssl: false                         # Disable SSL verification (BMC self-signed certs)
+#   ssl_verify: false                   # SSL certificate verification (false for BMC self-signed certs)
 #   ttl_dns_cache: 300                 # DNS cache TTL in seconds
 #   use_dns_cache: true                # Enable DNS caching
 #   force_close: false                 # Keep connections alive
@@ -142,7 +155,7 @@
 # These flags control which collector groups to skip globally
 # --------------------------------------------------------------
 SKIP_PORT_FW: false
-SKIP_BMC_SSH_LOGS: true
+SKIP_BMC_SSH_LOGS: false
 SKIP_HOST_LOGS: false
 SKIP_IPMI_LOGS: false
 SKIP_REDFISH_OOB_LOGS: false
@@ -187,29 +200,140 @@ EXPAND_QUERY_SYSTEM_LEVEL: 1
 
 # I2C Configuration
 # --------------------------------------------------------------
-# This is the default i2c config for the BMC, it will override the baseboard definition in the 
-# Telemetry Catalog spreadsheet.
+# I2C configuration overrides. Values defined here take precedence over baseboard
+# defaults (from baseboards.yaml) but are overridden by DUT-specific settings
+# (from dut_config.yaml).
+#
+# Priority order (highest to lowest):
+#   1. DUT config (dut_config.yaml i2c_config)
+#   2. Tool config (this file's i2c_config)
+#   3. Baseboard defaults (baseboards.yaml i2c_config)
+#
+# This is also supported in DUT-specific tool configs (via ConfigFileToUse).
 # --------------------------------------------------------------
 # * Be sure to uncomment the entire block to use it.
+# * Only uncomment the specific keys you want to override.
 # --------------------------------------------------------------
 # i2c_config:
 #   # I2C Bus Numbers
 #   HGX_I2C1_BUS_ADDRESS: "11"
 #   HGX_I2C2_BUS_ADDRESS: "12"
-#   # FPGA Register Table Addresses (Bus 11)
+#   # I2C Transfer Command
+#   HGX_I2CTRANSFER_COMMAND: "i2ctransfer"
+#   # FPGA Register Table Addresses (Bus 1)
 #   FPGA_REGISTER_TABLE_ADDRESS: "0x0b"
 #   FPGA_SECONDARY_REGISTER_TABLE_ADDRESS: "0x31"
-#   # FPGA AER Table Address (Bus 12)
+#   # FPGA AER Table Address (Bus 2)
 #   FPGA_AER_TABLE_ADDRESS: "0x0a"
-#   # HMC Device Address (Bus 11) - This is the actual Virtual EEPROM
+#   # HMC Device Address (Bus 1) - Virtual EEPROM
 #   HMC_I2C_ADDRESS: "0x54"
 #   VIRTUAL_EEPROM_BUS: "11"
 #   VIRTUAL_EEPROM_ADDR: "0x54"
-#   # Power Management Device (Not present on this BMC)
+#   # Power Management Device
 #   HGX_I2CTRANSFER_BUS_ADDRESS: "1"
 #   HGX_I2CTRANSFER_WRITE_TO_ADDRESS: "0x28"
-#   # FPGA/SMBPBI Device Address (Bus 12)
+#   # FPGA/SMBPBI Device Address (Bus 2)
 #   FPGA_SMBPBI_ADDRESS: "0x60"
+#   # FPGA SMBPBI Address on Bus 1 (fencing status, used by S18)
+#   FPGA_BUS1_SMBPBI_ADDRESS: "0x60"
+#   #
+#   # --- GPU SMBPBI Device Addresses (Bus 1, used by S17/S18) ---
+#   GPU_SMBPBI_ADDR_0: "0x4c"
+#   GPU_SMBPBI_ADDR_1: "0x4d"
+#   GPU_SMBPBI_ADDR_2: "0x4e"
+#   GPU_SMBPBI_ADDR_3: "0x4f"
+#   GPU_SMBPBI_ADDR_4: "0x44"
+#   GPU_SMBPBI_ADDR_5: "0x45"
+#   GPU_SMBPBI_ADDR_6: "0x46"
+#   GPU_SMBPBI_ADDR_7: "0x47"
+#   #
+#   # --- GPU DRAM Temperature Sensor Address (Bus 1, used by S17) ---
+#   GPU_DRAM_TEMP_ADDR: "0x54"
+#   #
+#   # --- GPU Tlimit Addresses (Bus 1, used by S17) ---
+#   GPU_TLIMIT_ADDR_0: "0x6c"
+#   GPU_TLIMIT_ADDR_1: "0x70"
+#   GPU_TLIMIT_ADDR_2: "0x74"
+#   GPU_TLIMIT_ADDR_3: "0x78"
+#   GPU_TLIMIT_ADDR_4: "0x7C"
+#   GPU_TLIMIT_ADDR_5: "0x80"
+#   GPU_TLIMIT_ADDR_6: "0x84"
+#   GPU_TLIMIT_ADDR_7: "0x88"
+#   #
+#   # --- NVSwitch Temperature Addresses (Bus 1, used by S17) ---
+#   NVSWITCH_TEMP_ADDR_0: "0x3A"
+#   NVSWITCH_TEMP_ADDR_1: "0x3E"
+#   NVSWITCH_TEMP_ADDR_2: "0x42"
+#   NVSWITCH_TEMP_ADDR_3: "0x46"
+#   #
+#   # --- Inlet Sensor Addresses (Bus 2, used by S17) ---
+#   INLET_ADDR_0: "0x10"
+#   INLET_ADDR_1: "0x12"
+#   #
+#   # --- Retimer Addresses (Bus 2, used by S17) ---
+#   RETIMER_ADDR_1: "0x62"
+#   RETIMER_ADDR_2: "0x64"
+#   RETIMER_ADDR_3: "0x66"
+#   RETIMER_ADDR_4: "0x68"
+#   RETIMER_ADDR_5: "0x6a"
+#   RETIMER_ADDR_6: "0x6c"
+#   RETIMER_ADDR_7: "0x6e"
+#   #
+#   # --- HSC Temperature Addresses (Bus 2, used by S17) ---
+#   HSC_TEMP_ADDR_0: "0x30"
+#   HSC_TEMP_ADDR_1: "0x32"
+#   HSC_TEMP_ADDR_2: "0x34"
+#   HSC_TEMP_ADDR_3: "0x36"
+#   HSC_TEMP_ADDR_4: "0x38"
+#   HSC_TEMP_ADDR_5: "0x3a"
+#   HSC_TEMP_ADDR_6: "0x3c"
+#   HSC_TEMP_ADDR_7: "0x3e"
+#   HSC_TEMP_ADDR_8: "0x40"
+#   HSC_TEMP_ADDR_9: "0x42"
+#   #
+#   # --- PCB Sensor Addresses (Bus 2, used by S17) ---
+#   PCB_ADDR_0: "0x20"
+#   PCB_ADDR_1: "0x22"
+#   PCB_ADDR_2: "0x24"
+#   PCB_ADDR_3: "0x28"
+#   #
+#   # --- GPU Power Addresses (Bus 1, used by S17) ---
+#   GPU_POWER_ADDR_0: "0x4B"
+#   GPU_POWER_ADDR_1: "0x4F"
+#   GPU_POWER_ADDR_2: "0x53"
+#   GPU_POWER_ADDR_3: "0x57"
+#   GPU_POWER_ADDR_4: "0x5B"
+#   GPU_POWER_ADDR_5: "0x5F"
+#   GPU_POWER_ADDR_6: "0x63"
+#   GPU_POWER_ADDR_7: "0x67"
+#   #
+#   # --- HSC Power Addresses (Bus 2, used by S17) ---
+#   HSC_POWER_ADDR_0: "0x70"
+#   HSC_POWER_ADDR_1: "0x72"
+#   HSC_POWER_ADDR_2: "0x74"
+#   HSC_POWER_ADDR_3: "0x76"
+#   HSC_POWER_ADDR_4: "0x78"
+#   HSC_POWER_ADDR_5: "0x7a"
+#   HSC_POWER_ADDR_6: "0x7c"
+#   HSC_POWER_ADDR_7: "0x7e"
+#   HSC_POWER_ADDR_8: "0x80"
+#   HSC_POWER_ADDR_9: "0x82"
+#   #
+#   # --- GPU DRAM Power Addresses (Bus 1, used by S17) ---
+#   GPU_DRAM_POWER_ADDR_0: "0xCE"
+#   GPU_DRAM_POWER_ADDR_1: "0xD2"
+#   GPU_DRAM_POWER_ADDR_2: "0xD6"
+#   GPU_DRAM_POWER_ADDR_3: "0xDA"
+#   GPU_DRAM_POWER_ADDR_4: "0xDE"
+#   GPU_DRAM_POWER_ADDR_5: "0xE2"
+#   GPU_DRAM_POWER_ADDR_6: "0xE6"
+#   GPU_DRAM_POWER_ADDR_7: "0xEA"
+#   #
+#   # --- NVSwitch SMBPBI Addresses (Bus 2, used by S18) ---
+#   NVSWITCH_SMBPBI_ADDR_0: "0x19"
+#   NVSWITCH_SMBPBI_ADDR_1: "0x1a"
+#   NVSWITCH_SMBPBI_ADDR_2: "0x1b"
+#   NVSWITCH_SMBPBI_ADDR_3: "0x1c"
 
 # Firmware Inventory Table Properties
 # --------------------------------------------------------------
@@ -263,6 +387,12 @@ EXPAND_QUERY_SYSTEM_LEVEL: 1
 #       DiagnosticDataType: OEM
 #       OEMDiagnosticDataType: SystemDiagnostic
 #     timeout: 1500
+#   - uri: "/redfish/v1/Systems/HGX_Baseboard_0/LogServices/Dump/Actions/LogService.CollectDiagnosticData"
+#     payload:
+#       DiagnosticDataType: OEM
+#       OEMDiagnosticDataType: DiagnosticType=ROT
+#     timeout: 1500
+
 
 # Post Code URI Configuration
 # --------------------------------------------------------------
@@ -276,7 +406,7 @@ EXPAND_QUERY_SYSTEM_LEVEL: 1
 # --------------------------------------------------------------
 # * Be sure to uncomment the entire block to use it.
 # --------------------------------------------------------------
-# POST_CODES_URI: 
+# POST_CODES_URI:
 #   - "/redfish/v1/Systems/{system_id}/LogServices/CurrentBIOSPostCodes/Entries"
 #   - "/redfish/v1/Systems/{system_id}/LogServices/PreviousBIOSPostCodes/Entries"
 
@@ -288,3 +418,4 @@ EXPAND_QUERY_SYSTEM_LEVEL: 1
 # Can be overridden per-DUT in dut_config.yaml under DUT_Defaults or individual duts.
 # --------------------------------------------------------------
 # EXTRA_LOG_COLLECTION: true
+

@@ -20,14 +20,9 @@ Handles dynamic replacement of placeholders in action URIs, payloads, and
 configurations with support for DUT-specific values and nested substitutions.
 """
 
-import asyncio
 import os
 import re
-import time
-from functools import lru_cache
-from typing import Any, Dict, List, Optional, Set, Union
-
-from .config_variable_resolver import ConfigurationVariableResolver
+from typing import Any, Dict, List, Set
 
 
 class VariableSubstitutionError(Exception):
@@ -287,12 +282,15 @@ class VariableSubstitutionService:
         Returns:
             Template with config variables substituted.
         """
+        has_config_placeholders = bool(self.config_pattern.search(template))
+
         if not self.config_resolver:
-            await self._log(
-                "WARNING",
-                "No config resolver available, skipping config variable substitution",
-                dut_id,
-            )
+            if has_config_placeholders:
+                await self._log(
+                    "WARNING",
+                    "No config resolver available, skipping config variable substitution",
+                    dut_id,
+                )
             return template
 
         result = template
@@ -476,7 +474,7 @@ class VariableSubstitutionService:
                     return None
 
             return current
-        except Exception as e:
+        except Exception:
             # Log error but don't raise - let the calling method handle it
             return None
 
@@ -606,10 +604,10 @@ class VariableSubstitutionService:
         """
         if value is None:
             return ""
-        elif isinstance(value, (int, float)):
-            return str(value)
         elif isinstance(value, bool):
             return str(value).lower()
+        elif isinstance(value, (int, float)):
+            return str(value)
         elif isinstance(value, str):
             return value
         else:
@@ -750,63 +748,6 @@ class VariableSubstitutionService:
         self.cache_misses = 0
         await self._log("INFO", "Variable substitution cache cleared", dut_id)
 
-    async def add_variable_type(
-        self, var_name: str, pattern: str, dut_id: str = None
-    ) -> None:
-        """
-        Add a new variable type with validation pattern.
-
-        Args:
-            var_name: Name of the variable type
-            pattern: Regex pattern for validation
-            dut_id: DUT ID for logging
-        """
-        self.variable_types[var_name] = pattern
-        await self._log(
-            "DEBUG",
-            f"Added variable type: {var_name} with pattern: {pattern}",
-            dut_id,
-        )
-
-    def get_supported_variables(self) -> Set[str]:
-        """
-        Get the set of supported variable names.
-
-        Returns:
-            Set of supported variable names.
-        """
-        return set(self.variable_types.keys())
-
-    async def validate_context(
-        self, context: Dict[str, Any], dut_id: str = None
-    ) -> Dict[str, List[str]]:
-        """
-        Validate a context dictionary against supported variables.
-
-        Args:
-            context: Context dictionary to validate
-            dut_id: DUT ID for logging
-
-        Returns:
-            Dictionary with 'valid' and 'invalid' variable lists
-        """
-        valid_vars = []
-        invalid_vars = []
-
-        for var_name, value in context.items():
-            if var_name in self.variable_types:
-                pattern = self.variable_types[var_name]
-                str_value = str(value)
-                if re.match(pattern, str_value):
-                    valid_vars.append(var_name)
-                else:
-                    invalid_vars.append(var_name)
-            else:
-                # Unknown variable type - consider it valid but log warning
-                await self._log("WARNING", f"Unknown variable type: {var_name}", dut_id)
-                valid_vars.append(var_name)
-
-        return {"valid": valid_vars, "invalid": invalid_vars}
 
 
 # Backward compatibility - keep the old class name for existing code

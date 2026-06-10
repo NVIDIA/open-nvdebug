@@ -21,15 +21,39 @@ Provides IPMI-based collectors for BMC access including SEL logs, sensor data,
 FRU information, and system diagnostics via ipmitool.
 """
 
-import asyncio
-import json
 import logging
 import re
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Tuple, Union
 
 from .base_service import BaseService
 
 logger = logging.getLogger(__name__)
+
+
+_FRU_BLOCK_RE = re.compile(
+    r"(?ms)^FRU Device Description.*?(?=^FRU Device Description|\Z)"
+)
+_DEVICE_NOT_PRESENT = "Device not present"
+
+
+def _fru_print_partial_success(stdout: str) -> bool:
+    """
+    Return True when a non-zero ``ipmitool fru print`` exit was caused solely
+    by absent FRU slots, and at least one FRU block was collected successfully.
+
+    ``ipmitool`` exits 1 whenever any FRU reports ``Device not present`` (empty
+    slot) even if every populated slot was read successfully. On platforms
+    like Umbriel B300 slots 9-15 are empty by design, so the command returns
+    1 on every run. This helper lets I4 treat that outcome as success.
+    """
+    if not stdout or _DEVICE_NOT_PRESENT not in stdout:
+        return False
+    for block in _FRU_BLOCK_RE.findall(stdout):
+        body = block.split("\n", 1)[1] if "\n" in block else ""
+        body = body.strip()
+        if body and not body.startswith(_DEVICE_NOT_PRESENT):
+            return True
+    return False
 
 
 class IPMIService(BaseService):
@@ -113,7 +137,7 @@ class IPMIService(BaseService):
                         await self._log_runtime(
                             "INFO",
                             "IPMIService",
-                            f"Using preflight results for IPMI validation - connection already verified",
+                            "Using preflight results for IPMI validation - connection already verified",
                             dut_id,
                         )
                         return await self._create_standardized_collector_result(
@@ -261,7 +285,23 @@ class IPMIService(BaseService):
 
             # Check if we should ignore command failures
             ignore_errors = kwargs.get("ignore_errors", False)
-            success = exit_code == 0 or ignore_errors
+            ignore_absent_fru = kwargs.get("ignore_absent_fru", False)
+            absent_fru_tolerated = (
+                ignore_absent_fru
+                and exit_code != 0
+                and _fru_print_partial_success(stdout)
+            )
+            success = exit_code == 0 or ignore_errors or absent_fru_tolerated
+
+            if absent_fru_tolerated:
+                await self._log_runtime(
+                    "WARN",
+                    "IPMIService",
+                    f"IPMI command '{command}' exited {exit_code} but stdout "
+                    "contained valid FRU data; remaining slots reported "
+                    "'Device not present' — treating as partial success",
+                    dut_id,
+                )
 
             await self._log_runtime(
                 "INFO" if success else "ERROR",
@@ -323,6 +363,7 @@ class IPMIService(BaseService):
                     "output": self._process_command_output(stdout),
                     "stderr": self._process_command_output(stderr),
                     "error_log_path": error_log_path,
+                    "absent_fru_tolerated": absent_fru_tolerated,
                 },
             )
         except Exception as e:
@@ -383,14 +424,14 @@ class IPMIService(BaseService):
         self, dut_id: str, command: str, **kwargs
     ) -> Dict[str, Any]:
         """
-        Run IPMI command with NVBMC-specific handling.
+        Run IPMI command with NVBMC-specific handling (legacy-compatible).
 
         Args:
             dut_id: DUT ID.
             command: IPMI command to execute.
         """
         try:
-            # Run the original command once
+            # Run the original command once (like legacy code)
             exit_code, stdout, stderr = await self.dut_manager.execute_ipmi_command(
                 dut_id, command
             )
@@ -407,19 +448,19 @@ class IPMIService(BaseService):
                 function_tag=kwargs.get("function_tag", "ipmi_command"),
             )
 
-            # Check for specific patterns that indicate success
+            # Legacy NVBMC logic: Check for specific patterns that indicate success
             success = exit_code == 0
             normalized_exit_code = exit_code
 
-            # If exit code is non-zero, check for success patterns
+            # If exit code is non-zero, check for NVBMC-specific success patterns
             if not success and stdout:
-                # Check for session info patterns
+                # Check for session info patterns (legacy logic)
                 if "session handle" in stdout:
                     success = True
                     normalized_exit_code = (
                         0  # Normalize exit code for downstream compatibility
                     )
-                # Check for error patterns that should be treated as success
+                # Check for NVBMC error patterns that should be treated as success
                 elif any(
                     pattern in stdout
                     for pattern in [

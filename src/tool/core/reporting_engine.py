@@ -22,18 +22,17 @@ report generation for collection results.
 
 import logging
 import re
+import sys
 from datetime import datetime
 from io import StringIO
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
 from ..utils.console_output import create_sanitized_console
-from ..utils.json_utils import safe_json_dump, safe_json_dumps
-from ..utils.sanitizer import LogSanitizer
 
 logger = logging.getLogger(__name__)
 sanitized_console = create_sanitized_console()
@@ -485,49 +484,20 @@ class ReportingEngine:
                 service_groups[group] = []
             service_groups[group].append(collector_id)
 
-        # Also include skipped collectors in the summary (avoid duplicates)
-        skipped_results = results.get("skipped_results", {})
-        skipped_collectors_for_dut = skipped_results.get(dut_id, [])
-        for skipped_info in skipped_collectors_for_dut:
-            collector_id = skipped_info["collector_id"]
-            group = skipped_info["group"]
-            if group not in service_groups:
-                service_groups[group] = []
-            # Only add if not already in the group (avoid duplicates)
-            if collector_id not in service_groups[group]:
-                service_groups[group].append(collector_id)
+        # Only collectors that reached the execution stage are shown in the summary.
+        # Pre-execution skips (baseboard constraints, config options) are excluded.
 
         # Process results for each service group for this DUT
         for group, group_collectors in service_groups.items():
             for collector_id in group_collectors:
-                # Check if this collector was skipped
-                skipped_info = None
-                for skipped in skipped_collectors_for_dut:
-                    if skipped["collector_id"] == collector_id:
-                        skipped_info = skipped
-                        break
+                collector_info = self.config_manager.get_collector_info(collector_id)
+                collector_name = collector_info.get("name", "Unknown")
+                formatted_name = self._format_collector_name(collector_name)
 
-                if skipped_info:
-                    # This collector was skipped
-                    collector_name = skipped_info["collector_name"]
-                    formatted_name = self._format_collector_name(collector_name)
-                    status = "skipped"
-                    reason = skipped_info["reason"]
-                    execution_time = 0.0
-                else:
-                    # This collector was executed
-                    collector_info = self.config_manager.get_collector_info(
-                        collector_id
-                    )
-                    collector_name = collector_info.get("name", "Unknown")
-
-                    # Format collector name properly (convert snake_case to Title Case)
-                    formatted_name = self._format_collector_name(collector_name)
-
-                    # Get status for this specific DUT
-                    status = "not_ran"
-                    reason = "Collector not executed (likely due to preflight failure)"
-                    execution_time = 0.0
+                # Default: collector reached execution but no result recorded
+                status = "not_ran"
+                reason = "Collector not executed (likely due to preflight failure)"
+                execution_time = 0.0
 
                 # Check sequential results
                 sequential_results = results.get("sequential_results", {})
@@ -742,8 +712,14 @@ class ReportingEngine:
                     status_text = Text("PASS", style="green")
                 elif status == "fail":
                     status_text = Text("FAIL", style="red")
-                    # Store failure details
-                    failure_details.append((dut_id, group.title(), message))
+                    # Store failure details with status for color coding
+                    failure_details.append((dut_id, group.title(), message, "fail"))
+                elif status == "skip":
+                    status_text = Text("SKIP", style="yellow")
+                    # Store skip details with status for color coding
+                    failure_details.append((dut_id, group.title(), message, "skip"))
+                elif status == "interrupted":
+                    status_text = Text("STOP", style="magenta")
                 else:
                     status_text = Text("? UNK", style="yellow")
 
@@ -767,17 +743,22 @@ class ReportingEngine:
                     dut_id, "INFO", "PreflightResults", matrix_table_text
                 )
 
-        # Create failure details table if there are any failures
+        # Create failure/skip details table if there are any failures or skips
         if failure_details:
             console.print("")  # Add spacing
 
-            failure_table = Table(title="Preflight Failure Details")
+            failure_table = Table(title="Preflight Failure/Skip Details")
             failure_table.add_column("DUT", style="cyan", width=20)
             failure_table.add_column("Service", style="cyan", width=12)
-            failure_table.add_column("Failure Reason", style="red")
+            failure_table.add_column("Failure/Skip Reason")
 
-            for dut_id, service, reason in failure_details:
-                failure_table.add_row(dut_id, service, reason)
+            for dut_id, service, reason, status in failure_details:
+                # Color code the reason based on status
+                if status == "skip":
+                    reason_text = Text(reason, style="yellow")
+                else:  # fail
+                    reason_text = Text(reason, style="red")
+                failure_table.add_row(dut_id, service, reason_text)
 
             console.print(failure_table)
             failure_table_text = console.export_text()
@@ -792,6 +773,77 @@ class ReportingEngine:
                     await self.logger.write_to_dut_runtime_log(
                         dut_id, "INFO", "PreflightFailures", failure_table_text
                     )
+
+    async def log_dependency_check_table(
+        self, dependency_results: Dict[str, list]
+    ) -> None:
+        """
+        Log dependency check results table to console and DUT runtime logs.
+
+        Args:
+            dependency_results: Dictionary mapping DUT ID to list of dicts with keys:
+                'dependency', 'type', 'collector_id', 'collector_name', 'target'.
+        """
+        # Filter to only show DUTs with missing dependencies
+        duts_with_missing = {
+            dut_id: deps
+            for dut_id, deps in dependency_results.items()
+            if deps and len(deps) > 0
+        }
+
+        if not duts_with_missing:
+            console = Console(record=True, force_terminal=True)
+            console.print("")
+            console.print(
+                "[green]✓ Dependency Check: All required dependencies are available[/green]"
+            )
+            sys.stdout.flush()
+            return
+
+        console = Console(record=True, force_terminal=True)
+        console.print("")
+
+        for dut_id in sorted(duts_with_missing.keys()):
+            missing_deps = duts_with_missing[dut_id]
+
+            dep_table = Table(
+                title=f"Missing Dependencies — {dut_id}",
+                title_style="bold red",
+                border_style="dim",
+                show_lines=True,
+                pad_edge=True,
+            )
+            dep_table.add_column("Dependency", style="red", min_width=20)
+            dep_table.add_column("Type", style="yellow", min_width=10)
+            dep_table.add_column("Checked On", style="magenta", min_width=8)
+            dep_table.add_column("Collector", style="cyan", min_width=10)
+            dep_table.add_column("Collector Name", style="dim", min_width=20)
+
+            for dep in missing_deps:
+                dep_table.add_row(
+                    dep["dependency"],
+                    dep["type"],
+                    dep["target"],
+                    dep["collector_id"],
+                    dep["collector_name"],
+                )
+
+            console.print(dep_table)
+            console.print("")
+
+        sys.stdout.flush()
+        dep_table_text = console.export_text()
+
+        # Log dependency table to each DUT's runtime log
+        if (
+            hasattr(self, "orchestrator")
+            and self.orchestrator
+            and self.orchestrator.dut_manager
+        ):
+            for dut_id in self.orchestrator.dut_manager.get_all_dut_ids():
+                await self.logger.write_to_dut_runtime_log(
+                    dut_id, "INFO", "DependencyCheck", dep_table_text
+                )
 
     async def log_preflight_results(self, preflight_results: Dict[str, Any]) -> None:
         """

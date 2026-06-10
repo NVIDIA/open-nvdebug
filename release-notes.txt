@@ -1,3 +1,17 @@
+May 15, 2026
+===================
+
+nvdebug version 2.1.0
+
+-  Added new Host collectors H22 (NVIDIA IMEX Logs) and H23 (NVLSM Log).
+-  Added new Redfish collectors R50, R52-R54, and R57-R59 covering chassis serial number, DGX diagnostic dumps,
+   NVMe inventory and temperature sensors, and manager event log.
+-  Added new BMC SSH collectors S20-S23 for BMC UART capture and USB/MCTP journals and inventory.
+-  Updated the bundled Telemetry Catalog to v4.1.
+-  Added the Vue SPA report app as the default report experience, with legacy HTML reports still available.
+-  Updated SPA report app dependencies to resolve known npm audit advisories.
+-  Improved PowerShelf preflight and added a dedicated R1 manager-logs collector for PowerShelf.
+
 Oct 24, 2025
 ===================
 

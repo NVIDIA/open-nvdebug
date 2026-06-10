@@ -23,7 +23,7 @@ support for iterating over systems, chassis, and managers.
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from ..utils.enums import ResourceType
 from ..utils.uri_config_manager import URIConfigManager
@@ -91,7 +91,7 @@ class DiscoveryConfig:
     # Whether to discover sub-resources (can be slow and cause 403 errors)
     discover_sub_resources: bool = False
 
-    # Whether to discover firmware inventory (can be very slow with 60+ members)
+    # Whether to discover firmware inventory (enabled dynamically based on collector requirements)
     discover_firmware_inventory: bool = False
 
 
@@ -159,11 +159,14 @@ class DynamicDiscoveryService:
         error_messages: List[str] = None,
         operation_name: str = "dynamic_discovery",
         additional_context: Dict[str, Any] = None,
+        dut_id: str = None,
+        collector_id: str = None,
     ) -> Dict[str, Any]:
         """
         Create a standardized collector result dictionary.
 
         This method provides a consistent result format for all collector operations.
+        Now aligned with BaseService signature for consistency.
 
         Args:
             successful_operations: Number of successful operations
@@ -172,6 +175,8 @@ class DynamicDiscoveryService:
             error_messages: List of error messages
             operation_name: Name of the operation performed
             additional_context: Additional context information
+            dut_id: DUT identifier (optional, added to additional_context if provided)
+            collector_id: Collector identifier (optional, added to additional_context if provided)
 
         Returns:
             Standardized result dictionary
@@ -182,6 +187,12 @@ class DynamicDiscoveryService:
             error_messages = []
         if additional_context is None:
             additional_context = {}
+
+        # Add dut_id and collector_id to additional_context if provided
+        if dut_id:
+            additional_context["dut_id"] = dut_id
+        if collector_id:
+            additional_context["collector_id"] = collector_id
 
         return {
             "success": successful_operations > 0 and len(error_messages) == 0,
@@ -224,9 +235,11 @@ class DynamicDiscoveryService:
                     successful_operations=0,
                     total_operations=1,
                     output_files=[],
-                    error_messages=["Redfish preflight failed"],
+                    error_messages=[f"Redfish preflight failed: {redfish_status}"],
                     operation_name="dynamic_discovery",
-                    additional_context={},
+                    additional_context={"preflight_status": redfish_status},
+                    dut_id=dut_id,
+                    collector_id="dynamic_discovery",
                 )
 
         discovery_results = {
@@ -371,16 +384,33 @@ class DynamicDiscoveryService:
             return discovery_results
 
         except Exception as e:
+            import traceback
+
+            from tool.utils.sanitizer import BuiltInSanitizers, LogSanitizer
+
+            error_details = traceback.format_exc()
+            # Sanitize stack trace to remove any credential values
+            sanitizer = LogSanitizer(
+                additional_regex=[
+                    BuiltInSanitizers.CREDENTIALS,
+                    BuiltInSanitizers.API_KEYS,
+                    BuiltInSanitizers.TOKENS,
+                ]
+            )
+            error_details = sanitizer.sanitize(error_details)
             await self.logger.write_to_dut_runtime_log(
-                dut_id, "ERROR", "DynamicDiscovery", f"Discovery failed: {str(e)}"
+                dut_id,
+                "ERROR",
+                "DynamicDiscovery",
+                f"Discovery failed: {str(e)}\nTraceback:\n{error_details}",
             )
             return self._create_standardized_collector_result(
                 successful_operations=0,
                 total_operations=1,
                 output_files=[],
-                error_messages=[str(e)],
+                error_messages=[str(e), error_details],
                 operation_name="dynamic_discovery",
-                additional_context={},
+                additional_context={"error_traceback": error_details},
                 dut_id=dut_id,
                 collector_id="dynamic_discovery",
             )
@@ -445,28 +475,56 @@ class DynamicDiscoveryService:
                 f"_discover_resource: making Redfish request GET {uri}",
             )
 
-            success, collection, _, _ = await self.dut_manager.execute_redfish_request(
-                dut_id, "GET", uri, timeout=10
+            success, collection, error_info, _ = (
+                await self.dut_manager.execute_redfish_request(
+                    dut_id, "GET", uri, timeout=10
+                )
             )
 
             await self.logger.write_to_dut_runtime_log(
                 dut_id,
                 "DEBUG",
                 "DynamicDiscovery",
-                f"_discover_resource: Redfish request result - success={success}, collection_keys={list(collection.keys()) if collection else 'None'}",
+                f"_discover_resource: Redfish request result - success={success}, collection_keys={list(collection.keys()) if (collection and isinstance(collection, dict)) else 'None'}",
             )
 
-            if not success or not collection:
+            # Accept response if it's a valid dict, even if success is False (e.g., HTTP 500 with valid JSON)
+            if not collection or not isinstance(collection, dict):
+                # Log the actual error details
+                http_status = (
+                    error_info.get("http_status")
+                    if error_info and isinstance(error_info, dict)
+                    else "unknown"
+                )
+                error_message = (
+                    error_info.get("error_message", "No details")
+                    if error_info and isinstance(error_info, dict)
+                    else "No details"
+                )
                 await self.logger.write_to_dut_runtime_log(
                     dut_id,
                     "ERROR",
                     "DynamicDiscovery",
-                    f"_discover_resource: failed to get {resource_type.value} collection from {uri}",
+                    f"_discover_resource: failed to get valid {resource_type.value} collection from {uri} (HTTP {http_status}): {str(error_message)[:200]}",
                 )
                 return {
                     "success": False,
                     "error": f"Failed to get {resource_type.value} collection",
                 }
+
+            # If we got a valid dict but success=False, log a warning
+            if not success:
+                http_status = (
+                    error_info.get("http_status")
+                    if error_info and isinstance(error_info, dict)
+                    else "unknown"
+                )
+                await self.logger.write_to_dut_runtime_log(
+                    dut_id,
+                    "WARNING",
+                    "DynamicDiscovery",
+                    f"_discover_resource: got valid JSON for {resource_type.value} despite HTTP error {http_status}, proceeding with discovery",
+                )
 
             members = collection.get("Members", [])
             member_ids = []
@@ -595,24 +653,55 @@ class DynamicDiscoveryService:
                     "DynamicDiscovery",
                     f"_discover_resource: discovering firmware inventory for UpdateService (singleton: {is_singleton_service})",
                 )
-                firmware_inventory = await self._discover_firmware_inventory(
-                    dut_id, uri
-                )
-                if firmware_inventory:
-                    # For singleton services, add to the service details
-                    if is_singleton_service:
-                        service_id = member_ids[0] if member_ids else "UpdateService"
-                        member_details[service_id][
-                            "firmware_inventory"
-                        ] = firmware_inventory
-                    else:
-                        member_details["firmware_inventory"] = firmware_inventory
+                try:
+                    firmware_inventory = await self._discover_firmware_inventory(
+                        dut_id, uri
+                    )
+                    if firmware_inventory:
+                        # For singleton services, add to the service details
+                        if is_singleton_service:
+                            service_id = (
+                                member_ids[0] if member_ids else "UpdateService"
+                            )
+                            member_details[service_id][
+                                "firmware_inventory"
+                            ] = firmware_inventory
+                        else:
+                            member_details["firmware_inventory"] = firmware_inventory
 
+                        await self.logger.write_to_dut_runtime_log(
+                            dut_id,
+                            "DEBUG",
+                            "DynamicDiscovery",
+                            f"_discover_resource: discovered firmware inventory with {len(firmware_inventory.get('Members', []))} components",
+                        )
+                    else:
+                        await self.logger.write_to_dut_runtime_log(
+                            dut_id,
+                            "WARN",
+                            "DynamicDiscovery",
+                            "_discover_resource: firmware inventory discovery returned None for UpdateService",
+                        )
+                except Exception as fw_error:
+                    import traceback
+
+                    from tool.utils.sanitizer import BuiltInSanitizers, LogSanitizer
+
+                    error_traceback = traceback.format_exc()
+                    # Sanitize stack trace to remove any credential values
+                    sanitizer = LogSanitizer(
+                        additional_regex=[
+                            BuiltInSanitizers.CREDENTIALS,
+                            BuiltInSanitizers.API_KEYS,
+                            BuiltInSanitizers.TOKENS,
+                        ]
+                    )
+                    error_traceback = sanitizer.sanitize(error_traceback)
                     await self.logger.write_to_dut_runtime_log(
                         dut_id,
-                        "DEBUG",
+                        "ERROR",
                         "DynamicDiscovery",
-                        f"_discover_resource: discovered firmware inventory with {len(firmware_inventory.get('Members', []))} components",
+                        f"_discover_resource: firmware inventory discovery failed: {str(fw_error)}\nTraceback:\n{error_traceback}",
                     )
             elif (
                 resource_type == ResourceType.UPDATE_SERVICE
@@ -622,7 +711,7 @@ class DynamicDiscoveryService:
                     dut_id,
                     "DEBUG",
                     "DynamicDiscovery",
-                    f"_discover_resource: skipping firmware inventory discovery for UpdateService (disabled in config)",
+                    "_discover_resource: skipping firmware inventory discovery for UpdateService (disabled in config)",
                 )
 
             # Cache the results
@@ -679,15 +768,27 @@ class DynamicDiscoveryService:
             }
 
         except Exception as e:
+            import traceback
+
+            error_details = traceback.format_exc()
+            await self.logger.write_to_dut_runtime_log(
+                dut_id,
+                "ERROR",
+                "DynamicDiscovery",
+                f"Failed to discover {resource_type.value}: {str(e)}\nTraceback:\n{error_details}",
+            )
             return self._create_standardized_collector_result(
                 successful_operations=0,
                 total_operations=1,
                 output_files=[],
-                error_messages=[str(e)],
-                operation_name="dynamic_discovery",
-                additional_context={},
+                error_messages=[str(e), error_details],
+                operation_name=f"discover_{resource_type.value}",
+                additional_context={
+                    "resource_type": resource_type.value,
+                    "error_traceback": error_details,
+                },
                 dut_id=dut_id,
-                collector_id="dynamic_discovery",
+                collector_id=f"dynamic_discovery_{resource_type.value}",
             )
 
     async def _discover_firmware_inventory(
@@ -706,16 +807,21 @@ class DynamicDiscoveryService:
         try:
             # Get firmware inventory URI from config manager if available
             if self.uri_config_manager:
-                dut_config = self.dut_manager.get_dut_config(dut_id)
+                dut_config = self.dut_manager.get_dut_config(dut_id) or {}
                 baseboard = dut_config.get("baseboard")
                 platform = dut_config.get("platform")
 
                 firmware_uri = self.uri_config_manager.get_uri(
                     dut_id, "firmware_inventory", baseboard, platform
                 )
+                if not firmware_uri:
+                    firmware_uri = dut_config.get(
+                        "firmware_inventory_uri",
+                        f"{update_service_uri}/FirmwareInventory",
+                    )
             else:
                 # Fallback to DUT config or default
-                dut_config = self.dut_manager.get_dut_config(dut_id)
+                dut_config = self.dut_manager.get_dut_config(dut_id) or {}
                 firmware_uri = dut_config.get(
                     "firmware_inventory_uri", f"{update_service_uri}/FirmwareInventory"
                 )
@@ -728,6 +834,7 @@ class DynamicDiscoveryService:
             )
 
             if success and firmware_inventory:
+                firmware_inventory_uri = firmware_uri
                 await self.logger.write_to_dut_runtime_log(
                     dut_id,
                     "INFO",
@@ -776,16 +883,24 @@ class DynamicDiscoveryService:
                     firmware_inventory_uri = f"{update_service_uri}/FirmwareInventory"
 
             if firmware_inventory:
+                members = firmware_inventory.get("Members", [])
+                if not members:
+                    await self.logger.write_to_dut_runtime_log(
+                        dut_id,
+                        "INFO",
+                        "DynamicDiscovery",
+                        "Firmware inventory returned no members",
+                    )
+                    return None
                 await self.logger.write_to_dut_runtime_log(
                     dut_id,
                     "INFO",
                     "DynamicDiscovery",
-                    f"Discovered firmware inventory with {len(firmware_inventory.get('Members', []))} components",
+                    f"Discovered firmware inventory with {len(members)} components",
                 )
 
                 # Get detailed information for each firmware component
                 firmware_details = {}
-                members = firmware_inventory.get("Members", [])
 
                 for member in members:
                     member_uri = member.get("@odata.id")
@@ -915,7 +1030,22 @@ class DynamicDiscoveryService:
         """
         cache_key = f"{dut_id}_UpdateService"
         update_service_details = self._resource_details.get(cache_key, {})
+
+        # Firmware inventory can be stored in two ways:
+        # 1. Directly as update_service_details["firmware_inventory"] (old way)
+        # 2. Nested under a service ID for singleton services (new way)
         firmware_inventory = update_service_details.get("firmware_inventory")
+
+        # If not found at top level, try looking in nested service IDs
+        if not firmware_inventory:
+            # For singleton services, firmware inventory is stored under the service ID
+            for service_id, service_details in update_service_details.items():
+                if (
+                    isinstance(service_details, dict)
+                    and "firmware_inventory" in service_details
+                ):
+                    firmware_inventory = service_details["firmware_inventory"]
+                    break
 
         # Log what's being retrieved from cache using async logging
         if firmware_inventory:
@@ -923,14 +1053,14 @@ class DynamicDiscoveryService:
                 dut_id,
                 "DEBUG",
                 "DynamicDiscovery",
-                f"get_firmware_inventory: cache_key='{cache_key}', found firmware inventory with {firmware_inventory.get('total_components', 0)} components",
+                f"get_firmware_inventory: cache_key='{cache_key}', found firmware inventory with {len(firmware_inventory) if firmware_inventory and isinstance(firmware_inventory, dict) else 0} components",
             )
         else:
             await self.logger.write_to_dut_runtime_log(
                 dut_id,
                 "DEBUG",
                 "DynamicDiscovery",
-                f"get_firmware_inventory: cache_key='{cache_key}', no firmware inventory found",
+                f"get_firmware_inventory: cache_key='{cache_key}', no firmware inventory found in cache. Cache contents: {list(update_service_details.keys())}",
             )
 
         return firmware_inventory

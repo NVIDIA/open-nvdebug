@@ -23,8 +23,7 @@ empty directory cleanup, and collector file organization.
 
 import os
 import shutil
-from pathlib import Path
-from typing import Any, Dict, List
+from typing import List
 
 from .enums import CollectorServiceMapping
 

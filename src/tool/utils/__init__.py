@@ -18,14 +18,13 @@
 Utils module for NVDebug Tool.
 
 This module provides utility functions and classes for the NVDebug tool including:
-    - Configuration variable resolution
     - Console output and sanitization
     - Constants and enumerations
     - Dependency checking
     - File and JSON utilities
     - Logging setup
     - Resource management
-    - YAML processing and validation
+    - YAML processing
     - Variable substitution
     - Timing management
     - URI configuration
@@ -33,12 +32,10 @@ This module provides utility functions and classes for the NVDebug tool includin
 
 # Import all utility modules and their public functions/classes
 from . import (
-    config_variable_resolver,
     console_output,
     constants,
     dependency_checker,
     enums,
-    exceptions,
     file_utils,
     json_utils,
     logging,
@@ -49,13 +46,9 @@ from . import (
     uri_config_manager,
     variable_substitution,
     yaml_manager,
-    yaml_validator,
 )
 
 # Import specific functions and classes for easier access
-from .config_variable_resolver import (
-    ConfigurationVariableResolver as ConfigVariableResolver,
-)
 from .console_output import SanitizedConsole as ConsoleOutput
 from .constants import *
 from .dependency_checker import DependencyChecker
@@ -63,14 +56,11 @@ from .enums import (
     CollectionLevel,
     CollectorServiceMapping,
     DutExecutionMode,
-    DutNodeType,
     NetworkType,
     PreflightChecks,
-    RedfishHmcAccess,
     get_main_preflight_names,
     get_preflight_enum_from_service,
 )
-from .exceptions import *
 from .file_utils import (
     cleanup_empty_directories,
     ensure_directory_exists,
@@ -78,28 +68,19 @@ from .file_utils import (
     is_directory_empty,
 )
 from .json_utils import process_value_for_json, safe_json_dump, safe_json_dumps
-from .logging import setup_logging
-from .resource_manager import (
-    ResourceManager,
-    get_platforms_resource,
-    get_tool_resource,
-    get_tool_resource_content,
-)
+from .resource_manager import ResourceManager
 from .sanitizer import LogSanitizer as Sanitizer
 from .timing_manager import TimingManager
 from .uri_config_manager import URIConfigManager as UriConfigManager
 from .variable_substitution import VariableSubstitutionService as VariableSubstitution
 from .yaml_manager import YAMLManager as YamlManager
-from .yaml_validator import YAMLValidator as YamlValidator
 
 __all__ = [
     # Modules
-    "config_variable_resolver",
     "console_output",
     "constants",
     "dependency_checker",
     "enums",
-    "exceptions",
     "file_utils",
     "json_utils",
     "logging",
@@ -110,9 +91,7 @@ __all__ = [
     "uri_config_manager",
     "variable_substitution",
     "yaml_manager",
-    "yaml_validator",
     # Classes
-    "ConfigVariableResolver",
     "ConsoleOutput",
     "DependencyChecker",
     "ResourceManager",
@@ -121,27 +100,20 @@ __all__ = [
     "UriConfigManager",
     "VariableSubstitution",
     "YamlManager",
-    "YamlValidator",
     # Enums
     "CollectionLevel",
     "CollectorServiceMapping",
     "DutExecutionMode",
-    "DutNodeType",
     "NetworkType",
     "PreflightChecks",
-    "RedfishHmcAccess",
     # Functions
     "cleanup_empty_directories",
     "ensure_directory_exists",
     "get_collector_group_from_id",
     "get_main_preflight_names",
     "get_preflight_enum_from_service",
-    "get_platforms_resource",
-    "get_tool_resource",
-    "get_tool_resource_content",
     "is_directory_empty",
     "process_value_for_json",
     "safe_json_dump",
     "safe_json_dumps",
-    "setup_logging",
 ]

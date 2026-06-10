@@ -25,6 +25,7 @@ import sys
 from pathlib import Path
 from typing import Optional, Tuple
 
+from .frozen_path import get_base_path, is_frozen
 from .resource_manager import ResourceManager
 
 
@@ -42,9 +43,8 @@ def find_config_directory() -> Path:
     search_locations = []
 
     # Strategy 1: PyInstaller bundle directory
-    meipass_dir = getattr(sys, "_MEIPASS", None)
-    if meipass_dir:
-        search_locations.append(Path(meipass_dir) / "config")
+    if is_frozen():
+        search_locations.append(get_base_path() / "config")
 
     # Strategy 2: Binary directory (legacy approach)
     try:
@@ -105,8 +105,9 @@ def find_config_files() -> Tuple[Optional[Path], Optional[Path]]:
     """
     Automatically find dut_config.yaml and config.yaml files in the same directory as the executable.
 
-    This function automatically finds these configuration files if they were in the same 
-    relative path (same directory) as the executable.
+    This function implements the same logic as the legacy nvdebug tool, which automatically
+    found these configuration files if they were in the same relative path (same directory)
+    as the executable.
 
     Args:
         None
@@ -116,10 +117,9 @@ def find_config_files() -> Tuple[Optional[Path], Optional[Path]]:
     """
     search_locations = []
 
-    # Strategy 1: PyInstaller bundle directory (using ResourceManager)
-    meipass_dir = getattr(sys, "_MEIPASS", None)
-    if meipass_dir:
-        search_locations.append(Path(meipass_dir))
+    # Strategy 1: PyInstaller bundle directory
+    if is_frozen():
+        search_locations.append(get_base_path())
 
     # Strategy 2: Binary directory (legacy approach) - same directory as executable
     try:
@@ -150,6 +150,11 @@ def find_config_files() -> Tuple[Optional[Path], Optional[Path]]:
                 current_file.parent,
             ]
         )
+        try:
+            repo_root = current_file.parents[3]
+            search_locations.extend([repo_root, repo_root / "default_config"])
+        except IndexError:
+            pass
     except (OSError, RuntimeError):
         pass
 
@@ -193,18 +198,19 @@ def find_config_files() -> Tuple[Optional[Path], Optional[Path]]:
             continue
 
     # Strategy 8: Try to find config files as package resources (using ResourceManager)
+    # Note: ModuleNotFoundError can occur when running from source (src.tool vs tool)
     if dut_config_path is None:
         try:
             dut_config_path = Path(
                 ResourceManager.get_resource_path("tool", "dut_config.yaml")
             )
-        except FileNotFoundError:
+        except (FileNotFoundError, ModuleNotFoundError):
             pass
 
     if config_path is None:
         try:
             config_path = Path(ResourceManager.get_resource_path("tool", "config.yaml"))
-        except FileNotFoundError:
+        except (FileNotFoundError, ModuleNotFoundError):
             pass
 
     return dut_config_path, config_path
@@ -225,10 +231,9 @@ def find_all_config_files() -> Tuple[Optional[Path], Optional[Path], Optional[Pa
     """
     search_locations = []
 
-    # Strategy 1: PyInstaller bundle directory (using ResourceManager)
-    meipass_dir = getattr(sys, "_MEIPASS", None)
-    if meipass_dir:
-        search_locations.append(Path(meipass_dir))
+    # Strategy 1: PyInstaller bundle directory
+    if is_frozen():
+        search_locations.append(get_base_path())
 
     # Strategy 2: Binary directory (legacy approach) - same directory as executable
     try:
@@ -259,6 +264,11 @@ def find_all_config_files() -> Tuple[Optional[Path], Optional[Path], Optional[Pa
                 current_file.parent,
             ]
         )
+        try:
+            repo_root = current_file.parents[3]
+            search_locations.extend([repo_root, repo_root / "default_config"])
+        except IndexError:
+            pass
     except (OSError, RuntimeError):
         pass
 
@@ -313,18 +323,19 @@ def find_all_config_files() -> Tuple[Optional[Path], Optional[Path], Optional[Pa
             continue
 
     # Strategy 8: Try to find config files as package resources (using ResourceManager)
+    # Note: ModuleNotFoundError can occur when running from source (src.tool vs tool)
     if dut_config_path is None:
         try:
             dut_config_path = Path(
                 ResourceManager.get_resource_path("tool", "dut_config.yaml")
             )
-        except FileNotFoundError:
+        except (FileNotFoundError, ModuleNotFoundError):
             pass
 
     if config_path is None:
         try:
             config_path = Path(ResourceManager.get_resource_path("tool", "config.yaml"))
-        except FileNotFoundError:
+        except (FileNotFoundError, ModuleNotFoundError):
             pass
 
     if tool_config_path is None:
@@ -332,7 +343,7 @@ def find_all_config_files() -> Tuple[Optional[Path], Optional[Path], Optional[Pa
             tool_config_path = Path(
                 ResourceManager.get_resource_path("tool", "tool_config.yaml")
             )
-        except FileNotFoundError:
+        except (FileNotFoundError, ModuleNotFoundError):
             pass
 
     return dut_config_path, config_path, tool_config_path

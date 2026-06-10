@@ -191,3 +191,9 @@ config.json
 # Safety check reports
 safety-report.json
 
+# Report app dependencies and generated bundles
+src/report-app/node_modules/
+src/report-app/dist/
+src/report-app/*.tsbuildinfo
+src/tool/report_app_dist/*
+!src/tool/report_app_dist/.gitkeep

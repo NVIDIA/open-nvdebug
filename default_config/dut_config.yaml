@@ -57,6 +57,10 @@ DUT_Defaults: &dut_defaults ## User should not modify this line or add anything 
 
   # Redfish info
   RF_DEFAULT_PREFIX: "/redfish/v1" # Redfish service root. Default is "/redfish/v1"
+  # RF_HMC_DEFAULT_PREFIX: "/redfish/v1" # HMC-specific Redfish prefix (arm64 / aggregation platforms only).
+  #   When set, URIs targeting HGX_* resources (e.g. HGX_Baseboard_0, HGX_BMC_0) will use this
+  #   prefix instead of RF_DEFAULT_PREFIX. Useful when the Customer BMC exposes HMC resources
+  #   under a different Redfish root path. Takes precedence over uri_overrides.hmc_prefix_override.
   RF_AUTH: true # Indicates if REST API authentication is required by the Redfish service. True by default
   # RF_HMC_ACCESS_METHOD: HostBmcTcpPortForwarding # This is the default access method for HMC. Available options are: HostBmcTcpPortForwarding, HostBmcTcp, HmcTcpPortForwarding, HmcTcp
 

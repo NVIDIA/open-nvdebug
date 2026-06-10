@@ -1,0 +1,51 @@
+{
+  "name": "nvdebug-report-app",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc -b && vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint src/",
+    "storybook": "storybook dev -p 6006",
+    "build-storybook": "storybook build",
+    "test:e2e": "playwright test"
+  },
+  "dependencies": {
+    "@vueuse/core": "^14.2.1",
+    "chart.js": "^4.5.1",
+    "fuse.js": "^7.1.0",
+    "html2pdf.js": "^0.14.0",
+    "monaco-editor": "^0.52.2",
+    "pinia": "^3.0.4",
+    "simple-statistics": "^7.8.9",
+    "vue": "^3.5.30",
+    "vue-chartjs": "^5.3.3",
+    "vue-router": "^4.6.4",
+    "vue-virtual-scroller": "^2.0.0-beta.10"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@playwright/test": "^1.52.0",
+    "@storybook/vue3": "^10.3.6",
+    "@storybook/vue3-vite": "^10.3.6",
+    "@tailwindcss/vite": "^4.2.2",
+    "@vitejs/plugin-vue": "^6.0.5",
+    "@vue/test-utils": "^2.4.6",
+    "eslint": "^10.0.3",
+    "eslint-plugin-vue": "^10.8.0",
+    "jsdom": "^29.0.0",
+    "storybook": "^10.3.6",
+    "tailwindcss": "^4.2.2",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.57.1",
+    "vite": "^8.0.0",
+    "vite-plugin-singlefile": "^2.3.2",
+    "vitest": "^4.1.0",
+    "vue-eslint-parser": "^10.4.0",
+    "vue-tsc": "^3.2.6"
+  }
+}

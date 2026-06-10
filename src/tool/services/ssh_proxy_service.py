@@ -23,10 +23,9 @@ but for general SSH proxy (jump box) scenarios. It sets up SSH tunnels for Redfi
 and IPMI connections through the SSH proxy.
 """
 
-import asyncio
 import logging
+import shlex
 import socket
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .port_forwarding_service import PortForwardingService
@@ -58,7 +57,9 @@ class SSHProxyService:
         host_ip: Optional[str] = None,
         ssh_proxy_host: str = None,
         ssh_proxy_username: str = None,
-        ssh_proxy_password: str = None,
+        ssh_proxy_password: Optional[str] = None,
+        ssh_proxy_key_path: Optional[str] = None,
+        ssh_proxy_passwordless: bool = False,
         ssh_proxy_port: int = 22,
         bmc_redfish_port: int = 443,
         bmc_use_https: bool = True,
@@ -77,6 +78,8 @@ class SSHProxyService:
             ssh_proxy_host: SSH proxy host (jump box)
             ssh_proxy_username: SSH proxy username
             ssh_proxy_password: SSH proxy password
+            ssh_proxy_key_path: SSH proxy private key path
+            ssh_proxy_passwordless: Use SSH agent/default-key auth without a password
             ssh_proxy_port: SSH proxy port
             bmc_redfish_port: BMC Redfish port
             bmc_ipmi_port: BMC IPMI port
@@ -98,8 +101,12 @@ class SSHProxyService:
         if not ssh_proxy_username:
             return False, {}, "SSH proxy username not configured"
 
-        if not ssh_proxy_password:
-            return False, {}, "SSH proxy password not configured"
+        if not (ssh_proxy_key_path or ssh_proxy_passwordless or ssh_proxy_password):
+            return (
+                False,
+                {},
+                "SSH proxy password, key path, or passwordless auth not configured",
+            )
 
         # Test SSH proxy connection first to avoid hanging
         await self.logger.write_to_dut_runtime_log(
@@ -115,6 +122,8 @@ class SSHProxyService:
             ssh_proxy_port,
             ssh_proxy_username,
             ssh_proxy_password,
+            ssh_proxy_key_path,
+            ssh_proxy_passwordless,
         )
 
         if not test_success:
@@ -159,9 +168,10 @@ class SSHProxyService:
         # Setup tunnel configuration
         tunnel_config = tunnel_config or {}
         local_host = tunnel_config.get("TUNNEL_LOCAL_HOST", "localhost")
+        # Omit BatchMode=yes so keyboard-interactive auth works (same as proxy test)
         ssh_options = tunnel_config.get(
             "SSH_TUNNEL_OPTIONS",
-            "-4 -o StrictHostKeyChecking=no -o LogLevel=ERROR -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o BatchMode=yes -fNT",
+            "-4 -o StrictHostKeyChecking=no -o LogLevel=ERROR -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o PreferredAuthentications=keyboard-interactive,password -fNT",
         )
         ssh_prefix = tunnel_config.get("SSH_TUNNEL_PREFIX", "sshpass -p")
 
@@ -187,6 +197,8 @@ class SSHProxyService:
                     ssh_password=ssh_proxy_password,
                     destination_server_ip=bmc_ip,
                     ssh_port=ssh_proxy_port,
+                    ssh_key_path=ssh_proxy_key_path,
+                    ssh_passwordless=ssh_proxy_passwordless,
                     remote_port=bmc_redfish_port,
                     local_ports=[redfish_port],
                     remote_tcp_protocol=redfish_protocol,
@@ -231,6 +243,8 @@ class SSHProxyService:
                     ssh_password=ssh_proxy_password,
                     destination_server_ip=bmc_ip,
                     ssh_port=ssh_proxy_port,
+                    ssh_key_path=ssh_proxy_key_path,
+                    ssh_passwordless=ssh_proxy_passwordless,
                     remote_port=bmc_ipmi_port,
                     local_ports=[ipmi_port],
                     remote_tcp_protocol="tcp",
@@ -275,6 +289,8 @@ class SSHProxyService:
                     ssh_password=ssh_proxy_password,
                     destination_server_ip=bmc_ip,
                     ssh_port=ssh_proxy_port,
+                    ssh_key_path=ssh_proxy_key_path,
+                    ssh_passwordless=ssh_proxy_passwordless,
                     remote_port=22,  # Standard SSH port for BMC
                     local_ports=[bmc_ssh_port],
                     remote_tcp_protocol="tcp",
@@ -319,6 +335,8 @@ class SSHProxyService:
                     ssh_password=ssh_proxy_password,
                     destination_server_ip=host_ip,
                     ssh_port=ssh_proxy_port,
+                    ssh_key_path=ssh_proxy_key_path,
+                    ssh_passwordless=ssh_proxy_passwordless,
                     remote_port=22,  # Standard SSH port for Host
                     local_ports=[host_ssh_port],
                     remote_tcp_protocol="tcp",
@@ -536,7 +554,9 @@ class SSHProxyService:
         ssh_proxy_host: str,
         ssh_proxy_port: int,
         ssh_proxy_username: str,
-        ssh_proxy_password: str,
+        ssh_proxy_password: Optional[str],
+        ssh_proxy_key_path: Optional[str] = None,
+        ssh_proxy_passwordless: bool = False,
     ) -> bool:
         """
         Test SSH proxy connection with credentials to avoid hanging
@@ -547,23 +567,20 @@ class SSHProxyService:
             ssh_proxy_port: SSH proxy port
             ssh_proxy_username: SSH proxy username
             ssh_proxy_password: SSH proxy password
+            ssh_proxy_key_path: SSH proxy private key path
+            ssh_proxy_passwordless: Use SSH agent/default-key auth without a password
 
         Returns:
             bool: True if connection successful, False otherwise
         """
         try:
-            # Create a simple SSH test command with strict timeout settings
-            test_cmd = (
-                f"sshpass -p {ssh_proxy_password} ssh "
-                f"-o ConnectTimeout=10 "
-                f"-o ServerAliveInterval=5 "
-                f"-o ServerAliveCountMax=2 "
-                f"-o StrictHostKeyChecking=no "
-                f"-o BatchMode=yes "
-                f"-o LogLevel=ERROR "
-                f"-p {ssh_proxy_port} "
-                f"{ssh_proxy_username}@{ssh_proxy_host} "
-                f"'echo SSH_PROXY_TEST_SUCCESS'"
+            test_cmd = self._build_ssh_proxy_test_command(
+                ssh_proxy_host=ssh_proxy_host,
+                ssh_proxy_port=ssh_proxy_port,
+                ssh_proxy_username=ssh_proxy_username,
+                ssh_proxy_password=ssh_proxy_password,
+                ssh_proxy_key_path=ssh_proxy_key_path,
+                ssh_proxy_passwordless=ssh_proxy_passwordless,
             )
 
             await self.logger.write_to_dut_runtime_log(
@@ -639,3 +656,59 @@ class SSHProxyService:
                 f"SSH proxy connection test failed with exception: {e}",
             )
             return False
+
+    @staticmethod
+    def _build_ssh_proxy_test_command(
+        ssh_proxy_host: str,
+        ssh_proxy_port: int,
+        ssh_proxy_username: str,
+        ssh_proxy_password: Optional[str],
+        ssh_proxy_key_path: Optional[str] = None,
+        ssh_proxy_passwordless: bool = False,
+    ) -> str:
+        """
+        Build the SSH proxy connection-test command for the selected auth mode.
+        """
+        base_options = (
+            "-o ConnectTimeout=10 "
+            "-o ServerAliveInterval=5 "
+            "-o ServerAliveCountMax=2 "
+            "-o StrictHostKeyChecking=no "
+            "-o LogLevel=ERROR "
+        )
+        destination = (
+            f"{shlex.quote(str(ssh_proxy_username))}@"
+            f"{shlex.quote(str(ssh_proxy_host))}"
+        )
+
+        if ssh_proxy_key_path:
+            ssh_invocation = (
+                "ssh "
+                f"{base_options}"
+                "-o PreferredAuthentications=publickey "
+                "-o BatchMode=yes "
+                "-o IdentitiesOnly=yes "
+                f"-i {shlex.quote(str(ssh_proxy_key_path))} "
+            )
+        elif ssh_proxy_passwordless:
+            ssh_invocation = (
+                "ssh "
+                f"{base_options}"
+                "-o PreferredAuthentications=publickey "
+                "-o BatchMode=yes "
+            )
+        else:
+            # Do NOT use BatchMode=yes for password mode: it can prevent
+            # keyboard-interactive auth, which sshpass can otherwise satisfy.
+            ssh_invocation = (
+                f"sshpass -p {shlex.quote(str(ssh_proxy_password))} ssh "
+                f"{base_options}"
+                "-o PreferredAuthentications=keyboard-interactive,password "
+            )
+
+        return (
+            f"{ssh_invocation}"
+            f"-p {int(ssh_proxy_port)} "
+            f"{destination} "
+            "'echo SSH_PROXY_TEST_SUCCESS'"
+        )

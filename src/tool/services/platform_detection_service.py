@@ -21,14 +21,8 @@ and hardware configuration from DUTs for platform and baseboard detection.
 """
 
 import logging
-import os
 import re
 from typing import Any, Dict, Optional, Tuple
-
-import yaml
-
-from ..utils import get_tool_resource_content
-from ..utils.resources import find_config_directory
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +45,113 @@ class PlatformDetectionService:
         self.logger = logger
         self.baseboard_manager = baseboard_manager
         self.platform_mappings = {}  # Will be loaded in async_init()
+
+    @staticmethod
+    def _extract_first_string_field(payload: Any, field_name: str) -> Optional[str]:
+        if isinstance(payload, dict):
+            value = payload.get(field_name)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            for nested in payload.values():
+                found = PlatformDetectionService._extract_first_string_field(
+                    nested, field_name
+                )
+                if found:
+                    return found
+        elif isinstance(payload, list):
+            for item in payload:
+                found = PlatformDetectionService._extract_first_string_field(
+                    item, field_name
+                )
+                if found:
+                    return found
+        return None
+
+    @staticmethod
+    def _model_is_generic(model: str) -> bool:
+        normalized = model.strip().lower()
+        return normalized in {
+            "",
+            "$",
+            "null",
+            "na",
+            "n/a",
+            "none",
+            "unknown",
+            "openbmc",
+            "ami redfish server",
+            "gb hmc",
+            "gb bmc",
+        } or normalized.startswith("unknownmodel")
+
+    @staticmethod
+    def _candidate_score(uri: str) -> int:
+        if uri.startswith("/redfish/v1/Systems/HGX_Baseboard_"):
+            return 700
+        if "/Systems/" in uri and "HGX_Baseboard" in uri:
+            return 690
+        if uri.startswith("/redfish/v1/Chassis/HGX_Chassis_") and uri.endswith(
+            "/Assembly"
+        ):
+            return 610
+        if uri.startswith("/redfish/v1/Chassis/HGX_Chassis_"):
+            return 620
+        if uri.startswith("/redfish/v1/Systems/System_"):
+            return 560
+        if uri.startswith("/redfish/v1/Systems/"):
+            return 520
+        if uri.startswith("/redfish/v1/Chassis/Chassis_") and uri.endswith(
+            "/Assembly"
+        ):
+            return 490
+        if uri.startswith("/redfish/v1/Chassis/Chassis_"):
+            return 500
+        if uri.startswith("/redfish/v1/Chassis/") and "BMC" in uri:
+            return 320
+        if uri.startswith("/redfish/v1/Chassis/HMC_"):
+            return 300
+        if uri.startswith("/redfish/v1/Chassis/"):
+            return 440
+        if uri == "/redfish/v1":
+            return 250
+        return 200
+
+    async def _probe_redfish_identity_candidate(
+        self,
+        dut_id: str,
+        uri: str,
+        platform_dict: Dict[str, str],
+    ) -> Optional[Dict[str, Any]]:
+        success, payload, _, _ = await self.dut_manager.execute_redfish_request(
+            dut_id, "GET", uri, timeout=10
+        )
+        if not success or not payload:
+            return None
+
+        model = self._extract_first_string_field(payload, "Model")
+        if model and model.startswith("$"):
+            chassis_id = uri.rstrip("/").split("/")[-1]
+            model = platform_dict.get(chassis_id, model)
+
+        if not model and uri == "/redfish/v1":
+            model = self._extract_first_string_field(payload, "Product")
+
+        if not model or self._model_is_generic(model):
+            return None
+
+        payload = dict(payload)
+        payload["Model"] = model
+        payload.setdefault(
+            "PartNumber", self._extract_first_string_field(payload, "PartNumber") or "N/A"
+        )
+        payload.setdefault(
+            "SerialNumber",
+            self._extract_first_string_field(payload, "SerialNumber") or "N/A",
+        )
+        return {
+            "score": self._candidate_score(uri),
+            "payload": payload,
+        }
 
     async def async_init(self):
         """
@@ -352,71 +453,53 @@ class PlatformDetectionService:
             tuple: (success, chassis_data)
         """
         try:
-            # Get platform mappings from configuration
             platform_dict = self.platform_mappings.get("redfish_chassis_mappings", {})
-
-            # First try DGX chassis - use shorter timeout for platform detection
             success, response, _, _ = await self.dut_manager.execute_redfish_request(
                 dut_id, "GET", "/redfish/v1/Chassis/DGX", timeout=10
             )
-
             if success and response:
                 return True, response
 
-            # If DGX fails, discover available chassis - use shorter timeout for platform detection
             success, chassis_list_response, _, _ = (
                 await self.dut_manager.execute_redfish_request(
-                    dut_id, "GET", "/redfish/v1/Chassis/", timeout=10
+                    dut_id, "GET", "/redfish/v1/Chassis", timeout=10
                 )
             )
-
             if not success or not chassis_list_response:
                 return False, None
 
-            # Extract chassis names
-            members = chassis_list_response.get("Members", [])
-            chassis_list = []
-            for member in members:
-                odata_id = member.get("@odata.id", "")
-                if odata_id:
-                    chassis_name = odata_id.split("/")[-1]
-                    chassis_list.append(chassis_name)
+            for member in chassis_list_response.get("Members", []):
+                uri = member.get("@odata.id")
+                if not isinstance(uri, str) or not uri.startswith("/redfish/v1/Chassis/"):
+                    continue
 
-            # Try each known chassis
-            for chassis in chassis_list:
-                if chassis in platform_dict:
-                    success, response, _, _ = (
-                        await self.dut_manager.execute_redfish_request(
-                            dut_id,
-                            "GET",
-                            f"/redfish/v1/Chassis/{chassis}",
-                            timeout=10,
-                        )
-                    )
-                    if success and response:
-                        model = response.get("Model")
-                        if model and not model.startswith("$"):
-                            return True, response
-                        elif model and model.startswith("$"):
-                            # Use mapped platform name
-                            response["Model"] = platform_dict[chassis]
-                            return True, response
+                chassis_id = uri.rstrip("/").split("/")[-1]
+                if chassis_id not in platform_dict and chassis_id != "Unknown":
+                    continue
 
-            # Fallback to BMC_0 - use shorter timeout for platform detection
-            success, response, _, _ = await self.dut_manager.execute_redfish_request(
-                dut_id, "GET", "/redfish/v1/Chassis/BMC_0", timeout=10
-            )
+                success, chassis_data, _, _ = await self.dut_manager.execute_redfish_request(
+                    dut_id, "GET", uri, timeout=10
+                )
+                if not success or not chassis_data:
+                    continue
 
-            if success and response:
-                model = response.get("Model")
-                if model:
-                    # Check if we can map it to a known platform
-                    for platform, model_name in platform_dict.items():
-                        platform_name = platform.partition("_Management_Board")[0]
-                        if platform_name in model:
-                            response["Model"] = model_name
-                            break
-                    return True, response
+                model = self._extract_first_string_field(chassis_data, "Model")
+                if not model:
+                    continue
+
+                resolved_model = model
+                if model.startswith("$") and chassis_id in platform_dict:
+                    resolved_model = platform_dict[chassis_id]
+                elif model.endswith("_Management_Board"):
+                    base_model = model[: -len("_Management_Board")]
+                    resolved_model = platform_dict.get(base_model, resolved_model)
+
+                if not resolved_model or self._model_is_generic(resolved_model):
+                    continue
+
+                chassis_payload = dict(chassis_data)
+                chassis_payload["Model"] = resolved_model
+                return True, chassis_payload
 
             return False, None
 
@@ -465,7 +548,7 @@ class PlatformDetectionService:
             partno = None
             serialno = None
 
-            # Parse FRU output using regex
+            # Parse FRU output using regex (from legacy code)
             match_model = re.search(r"Product\s+Name\s*:\s*(.+)", output)
             if match_model:
                 model = match_model.group(1).strip()

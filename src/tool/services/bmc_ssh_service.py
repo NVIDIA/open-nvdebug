@@ -28,14 +28,17 @@ import glob
 import json
 import logging
 import os
-import random
+import posixpath
 import re
-import string
+import secrets
+import shlex
 import time
 import traceback
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
-from ..utils.temp_dir_config import create_temp_directory, get_bmc_temp_dir
+from ..utils.command_safety import build_remote_cmd
+from ..utils.streaming import format_stream_window_component, normalize_stream_window
+from ..utils.tar_utils import get_tar_command
 from .base_service import BaseService
 
 logger = logging.getLogger(__name__)
@@ -107,7 +110,7 @@ class BMCSSHService(BaseService):
                         await self._log_runtime(
                             "INFO",
                             "BMCSSHService",
-                            f"Using preflight results for BMC SSH validation - connection already verified",
+                            "Using preflight results for BMC SSH validation - connection already verified",
                             dut_id,
                         )
                         return await self._create_standardized_collector_result(
@@ -220,9 +223,174 @@ class BMCSSHService(BaseService):
         """
         return await self._validate_bmc_connection(dut_id, **kwargs)
 
+    async def _validate_hmc_ssh_connection(
+        self, dut_id: str, **kwargs
+    ) -> Dict[str, Any]:
+        """
+        Validate direct HMC SSH connectivity for collectors that target the HMC.
+
+        Args:
+            dut_id: The DUT identifier
+            **kwargs: Additional keyword arguments
+        """
+        collector_id = kwargs.get("collector_id", "hmc_ssh_validation")
+
+        try:
+            if not self.dut_manager or not self.dut_manager.is_hmc_present(dut_id):
+                return await self._create_standardized_collector_result(
+                    successful_operations=0,
+                    total_operations=1,
+                    output_files=[],
+                    error_messages=["HMC IP not configured for this DUT"],
+                    operation_name="hmc_ssh_validation",
+                    additional_context={
+                        "hmc_ssh_available": False,
+                        "hmc_present": False,
+                    },
+                    dut_id=dut_id,
+                    collector_id=collector_id,
+                )
+
+            exit_code, stdout, stderr = await self.dut_manager.execute_bmc_command(
+                dut_id,
+                "true",
+                timeout=30,
+                hmc=True,
+            )
+
+            success = exit_code == 0
+            message = (
+                "HMC SSH connection validation passed"
+                if success
+                else f"HMC SSH connection validation failed: {stderr or stdout or 'unknown error'}"
+            )
+
+            await self._log_runtime(
+                "INFO" if success else "ERROR",
+                "BMCSSHService",
+                message,
+                dut_id,
+            )
+
+            return await self._create_standardized_collector_result(
+                successful_operations=1 if success else 0,
+                total_operations=1,
+                output_files=[],
+                error_messages=[] if success else [message],
+                operation_name="hmc_ssh_validation",
+                additional_context={
+                    "validation_message": message,
+                    "hmc_ssh_available": success,
+                    "hmc_present": True,
+                },
+                dut_id=dut_id,
+                collector_id=collector_id,
+            )
+        except Exception as e:
+            await self._log_runtime(
+                "ERROR",
+                "BMCSSHService",
+                f"HMC SSH validation exception: {str(e)}",
+                dut_id,
+            )
+            return await self._create_standardized_collector_result(
+                successful_operations=0,
+                total_operations=1,
+                output_files=[],
+                error_messages=[f"HMC SSH validation error: {str(e)}"],
+                operation_name="hmc_ssh_validation",
+                additional_context={
+                    "hmc_ssh_available": False,
+                    "hmc_present": True,
+                },
+                dut_id=dut_id,
+                collector_id=collector_id,
+            )
+
+    async def _render_command_template(
+        self,
+        dut_id: str,
+        command_template: str,
+        config_keys: Optional[Dict[str, str]] = None,
+        config_key_defaults: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """
+        Render a command template using DUT/baseboard configuration values.
+
+        Args:
+            dut_id: DUT identifier
+            command_template: Template string (e.g., "cat {firmware_path}")
+            config_keys: Mapping of template variables to config keys
+            config_key_defaults: Optional defaults for template variables
+
+        Returns:
+            Rendered command string or None if rendering fails.
+        """
+        if not command_template:
+            return None
+
+        if not config_keys:
+            return command_template
+
+        merged_config = await self._get_merged_config(dut_id)
+        resolved_values: Dict[str, str] = {}
+        missing_placeholders: List[str] = []
+
+        for placeholder, config_key in config_keys.items():
+            value = None
+            if merged_config:
+                value = merged_config.get(config_key)
+
+            if value is None and config_key_defaults:
+                default_value = config_key_defaults.get(placeholder)
+                if default_value is not None:
+                    value = default_value
+
+            if value is None:
+                missing_placeholders.append(f"{placeholder}->{config_key}")
+                continue
+
+            resolved_values[placeholder] = str(value)
+
+        if missing_placeholders:
+            await self._log_runtime(
+                "WARN",
+                "BMCSSHService",
+                "Missing values for command template placeholders: "
+                + ", ".join(missing_placeholders),
+                dut_id,
+            )
+            return None
+
+        try:
+            rendered_command = command_template.format(**resolved_values)
+            await self._log_runtime(
+                "DEBUG",
+                "BMCSSHService",
+                f"Rendered command template '{command_template}' -> '{rendered_command}'",
+                dut_id,
+            )
+            return rendered_command
+        except KeyError as exc:
+            await self._log_runtime(
+                "ERROR",
+                "BMCSSHService",
+                f"Failed to render command template '{command_template}': {exc}",
+                dut_id,
+            )
+            return None
+
     # Execution methods
     async def run_bmc_command(
-        self, dut_id: str, command: str, collection_level: str = "L1", **kwargs
+        self,
+        dut_id: str,
+        command: str,
+        collection_level: str = "L1",
+        baseboard_commands: Optional[Dict[str, str]] = None,
+        command_template: Optional[str] = None,
+        config_keys: Optional[Dict[str, str]] = None,
+        config_key_defaults: Optional[Dict[str, Any]] = None,
+        **kwargs,
     ) -> Dict[str, Any]:
         """
         Run BMC SSH command with collection level handling.
@@ -231,12 +399,108 @@ class BMCSSHService(BaseService):
             dut_id: The DUT identifier
             command: The command to run
             collection_level: The collection level
+            baseboard_commands: Optional mapping of baseboard/group names to commands
+            command_template: Template to build the command from configuration values
+            config_keys: Mapping of template variables to configuration keys
+            config_key_defaults: Optional defaults for missing configuration values
             **kwargs: Additional keyword arguments
         """
         try:
+            collector_id = kwargs.get("collector_id")
+            timeout = kwargs.get(
+                "timeout",
+                await self._get_collector_timeout(collector_id or "", dut_id, 300),
+            )
+            use_hmc_ip = kwargs.get("use_hmc_ip", False)
             # Start timing for this BMC command
             if self.timing_manager:
                 self.timing_manager.start_request(f"BMC_SSH: {command}")
+
+            template_source = None
+            using_command_template = False
+            using_command_as_template = False
+            if command_template:
+                template_source = command_template
+                using_command_template = True
+            elif config_keys:
+                template_source = command
+                using_command_as_template = True
+
+            if template_source:
+                rendered_command = await self._render_command_template(
+                    dut_id,
+                    template_source,
+                    config_keys=config_keys,
+                    config_key_defaults=config_key_defaults,
+                )
+                if rendered_command:
+                    command = rendered_command
+                else:
+                    if using_command_as_template:
+                        error_message = (
+                            f"Failed to render command template '{template_source}' "
+                            "due to missing configuration values."
+                        )
+                        return await self._create_standardized_collector_result(
+                            successful_operations=0,
+                            total_operations=1,
+                            output_files=[],
+                            error_messages=[error_message],
+                            operation_name="bmc_ssh_command",
+                            additional_context={
+                                "command_template": template_source,
+                                "config_keys": config_keys,
+                            },
+                            dut_id=dut_id,
+                            collector_id=collector_id,
+                        )
+                    else:
+                        await self._log_runtime(
+                            "WARN",
+                            "BMCSSHService",
+                            f"Falling back to provided command '{command}' because template rendering failed.",
+                            dut_id,
+                            collector_id=collector_id,
+                        )
+
+            # Apply baseboard-specific command override if provided
+            if baseboard_commands:
+                try:
+                    dut = self.dut_manager.get_dut(dut_id)
+                    baseboard = ""
+                    baseboard_type = ""
+
+                    if dut:
+                        baseboard = dut.config.get("baseboard", "")
+                        baseboard_manager = self.dut_manager._get_baseboard_manager()
+                        if baseboard_manager and baseboard:
+                            baseboard_type = (
+                                baseboard_manager.get_baseboard_type(baseboard) or ""
+                            )
+
+                    selected_command = None
+                    if baseboard and baseboard in baseboard_commands:
+                        selected_command = baseboard_commands[baseboard]
+                    elif baseboard_type and baseboard_type in baseboard_commands:
+                        selected_command = baseboard_commands[baseboard_type]
+                    elif "default" in baseboard_commands:
+                        selected_command = baseboard_commands["default"]
+
+                    if selected_command:
+                        await self._log_runtime(
+                            "INFO",
+                            "BMCSSHService",
+                            f"Using baseboard-specific command for '{baseboard or baseboard_type}': {selected_command}",
+                            dut_id,
+                        )
+                        command = selected_command
+                except Exception as override_error:
+                    await self._log_runtime(
+                        "WARN",
+                        "BMCSSHService",
+                        f"Failed to apply baseboard command override: {override_error}",
+                        dut_id,
+                    )
 
             # Handle collection level variations if provided
             if "collection_level_handling" in kwargs:
@@ -245,7 +509,7 @@ class BMCSSHService(BaseService):
                     command = level_commands[collection_level]
 
             exit_code, stdout, stderr = await self.dut_manager.execute_bmc_command(
-                dut_id, command
+                dut_id, command, timeout=timeout, hmc=use_hmc_ip
             )
 
             # End timing for this BMC command
@@ -272,7 +536,7 @@ class BMCSSHService(BaseService):
                 dut_id,
                 kwargs.get("collector_id", ""),
                 content,
-                output_pattern=kwargs.get("filename"),
+                output_pattern=kwargs.get("output_pattern") or kwargs.get("filename"),
                 function_tag=kwargs.get("function_tag", "bmc_command"),
             )
 
@@ -347,6 +611,7 @@ class BMCSSHService(BaseService):
             successful_operations = 0
             total_operations = 0
             collection_level = kwargs.get("collection_level", "L1")
+            use_hmc_ip = kwargs.get("use_hmc_ip", False)
 
             for i, command_item in enumerate(commands):
                 total_operations += 1
@@ -378,7 +643,7 @@ class BMCSSHService(BaseService):
                     ignore_errors = command_item.get("ignore_errors", False)
 
                 exit_code, stdout, stderr = await self.dut_manager.execute_bmc_command(
-                    dut_id, command, timeout
+                    dut_id, command, timeout, hmc=use_hmc_ip
                 )
 
                 # Create output file with generalization using common utility
@@ -389,7 +654,8 @@ class BMCSSHService(BaseService):
                     dut_id,
                     kwargs.get("collector_id", ""),
                     content,
-                    output_pattern=kwargs.get("filename"),
+                    output_pattern=kwargs.get("output_pattern")
+                    or kwargs.get("filename"),
                     function_tag=file_name,
                 )
                 output_files.append(file_path)
@@ -475,8 +741,9 @@ class BMCSSHService(BaseService):
             for pattern in file_patterns:
                 total_operations += 1
                 # Use find command to locate files
-                find_command = (
-                    f"find / -name '{pattern}' -type f 2>/dev/null | head -10"
+                find_command = build_remote_cmd(
+                    "find / -name {pattern} -type f 2>/dev/null | head -10",
+                    pattern=pattern,
                 )
                 exit_code, stdout, stderr = await self.dut_manager.execute_bmc_command(
                     dut_id, find_command
@@ -487,7 +754,9 @@ class BMCSSHService(BaseService):
                     for file_path in files:
                         if file_path:
                             # Read file content
-                            cat_command = f"cat '{file_path}' 2>/dev/null"
+                            cat_command = build_remote_cmd(
+                                "cat {path} 2>/dev/null", path=file_path
+                            )
                             exit_code, content, stderr = (
                                 await self.dut_manager.execute_bmc_command(
                                     dut_id, cat_command
@@ -589,14 +858,14 @@ class BMCSSHService(BaseService):
             for pattern in log_patterns:
                 total_operations += 1
                 # Check if file exists
-                test_command = f"test -f {pattern}"
+                test_command = build_remote_cmd("test -f {path}", path=pattern)
                 exit_code, _, stderr = await self.dut_manager.execute_bmc_command(
                     dut_id, test_command
                 )
 
                 if exit_code == 0:
                     # Read log file
-                    cat_command = f"cat {pattern}"
+                    cat_command = build_remote_cmd("cat {path}", path=pattern)
                     exit_code, content, stderr = (
                         await self.dut_manager.execute_bmc_command(dut_id, cat_command)
                     )
@@ -904,19 +1173,51 @@ class BMCSSHService(BaseService):
         # 2. Tool config (medium priority)
         # 3. DUT config (highest priority)
 
+        # Get tool config (global merged with DUT-specific overrides)
+        tool_config = {}
+        try:
+            if self.orchestrator and hasattr(self.orchestrator, "config_manager"):
+                tool_config = await self.orchestrator.get_dut_specific_tool_config(
+                    dut_id
+                )
+        except Exception as e:
+            await self._log_runtime(
+                "WARNING",
+                "BMCSSHService",
+                f"Failed to get tool config for merge: {e}",
+                dut_id,
+            )
+
         # Start with baseboard config
         merged_config = baseboard_config.copy()
 
-        # Merge DUT config on top (DUT config takes precedence)
+        # Merge tool config on top (tool config overrides baseboard)
+        merged_config.update(tool_config)
+
+        # Merge DUT config on top (DUT config takes highest precedence)
         merged_config.update(dut_config)
 
-        # Special handling for i2c_config - merge nested configs
+        # Special handling for i2c_config - merge nested configs with proper precedence
         baseboard_i2c_config = baseboard_config.get("i2c_config", {})
+        tool_i2c_config = tool_config.get("i2c_config", {})
         dut_i2c_config = dut_config.get("i2c_config", {})
 
-        # Merge i2c_config with proper precedence
-        merged_i2c_config = {**baseboard_i2c_config, **dut_i2c_config}
+        # Merge i2c_config: baseboard (lowest) -> tool_config (medium) -> dut_config (highest)
+        merged_i2c_config = {
+            **baseboard_i2c_config,
+            **tool_i2c_config,
+            **dut_i2c_config,
+        }
         merged_config["i2c_config"] = merged_i2c_config
+
+        await self._log_runtime(
+            "DEBUG",
+            "BMCSSHService",
+            f"i2c_config merge sources - baseboard: {len(baseboard_i2c_config)} keys, "
+            f"tool_config: {len(tool_i2c_config)} keys, dut_config: {len(dut_i2c_config)} keys, "
+            f"merged: {len(merged_i2c_config)} keys",
+            dut_id,
+        )
 
         await self._log_runtime(
             "DEBUG",
@@ -927,9 +1228,52 @@ class BMCSSHService(BaseService):
 
         return merged_config
 
+    async def _apply_i2c_collector_override(
+        self,
+        dut_id: str,
+        i2c_config: Dict[str, Any],
+        collector_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Overlay platform-specific I2C collector configuration when present.
+
+        Baseboard configs can define ``I2C_COLLECTOR_OVERRIDES`` inside
+        ``i2c_config``. Overrides are keyed by collector ``function_tag`` or
+        collector id and replace YAML stage command/config fields for platforms
+        whose telemetry is exposed through alternate paths.
+        """
+        merged_config = await self._get_merged_config(dut_id)
+        merged_i2c_config = merged_config.get("i2c_config", {})
+        overrides = merged_i2c_config.get("I2C_COLLECTOR_OVERRIDES", {})
+        if not isinstance(overrides, dict):
+            return i2c_config
+
+        override_key = None
+        for candidate in (i2c_config.get("function_tag"), collector_id):
+            if candidate and candidate in overrides:
+                override_key = candidate
+                break
+
+        if not override_key:
+            return i2c_config
+
+        override_config = overrides.get(override_key)
+        if not isinstance(override_config, dict):
+            return i2c_config
+
+        resolved_i2c_config = dict(i2c_config)
+        resolved_i2c_config.update(override_config)
+        await self._log_runtime(
+            "INFO",
+            "BMCSSHService",
+            f"Applied I2C collector override for {override_key}",
+            dut_id,
+        )
+        return resolved_i2c_config
+
     async def _resolve_config_keys(
         self, dut_id: str, config_keys: Dict[str, str]
-    ) -> Dict[str, str]:
+    ) -> Tuple[Dict[str, str], List[str]]:
         """
         Resolve config keys to actual values using merged configuration.
 
@@ -939,11 +1283,14 @@ class BMCSSHService(BaseService):
                         e.g., {"bus1": "HGX_I2C1_BUS_ADDRESS", "fpga_reg": "FPGA_REGISTER_TABLE_ADDRESS"}
 
         Returns:
-            Dictionary mapping variable names to resolved values
-            e.g., {"bus1": "11", "fpga_reg": "0x0b"}
+            Tuple of:
+            - Dictionary mapping variable names to resolved values
+              e.g., {"bus1": "11", "fpga_reg": "0x0b"}
+            - List of unresolved variable names (for skip detection)
         """
         merged_config = await self._get_merged_config(dut_id)
         resolved_config = {}
+        unresolved_keys = []
 
         # Get the i2c_config section from merged config
         i2c_config = merged_config.get("i2c_config", {})
@@ -964,11 +1311,130 @@ class BMCSSHService(BaseService):
                     f"Config key '{config_key}' not found in i2c_config for variable '{var_name}'",
                     dut_id,
                 )
-                resolved_config[var_name] = (
-                    f"{{{var_name}}}"  # Keep unresolved for debugging
+                unresolved_keys.append(f"{var_name} ({config_key})")
+                # Don't add unresolved placeholders - we'll skip execution instead
+
+        return resolved_config, unresolved_keys
+
+    async def _expand_i2c_device_commands(
+        self,
+        dut_id: str,
+        device_command_config: Dict[str, Any],
+        resolved_config: Dict[str, str],
+    ) -> Tuple[List[str], List[str], List[str], List[str]]:
+        """
+        Expand config-driven device commands into concrete commands.
+
+        Args:
+            dut_id: The DUT identifier
+            device_command_config: Configuration describing the device list and
+                per-device operations
+            resolved_config: Resolved scalar config values
+
+        Returns:
+            Tuple of:
+            - commands to execute
+            - command names
+            - command groups
+            - configuration/expansion errors
+        """
+        merged_config = await self._get_merged_config(dut_id)
+        i2c_config = merged_config.get("i2c_config", {})
+
+        devices_key = device_command_config.get("devices_key")
+        if not devices_key:
+            return [], [], [], ["device_commands missing required 'devices_key'"]
+
+        devices = i2c_config.get(devices_key)
+        if devices is None:
+            return (
+                [],
+                [],
+                [],
+                [f"device list key '{devices_key}' not found in i2c_config"],
+            )
+
+        if not isinstance(devices, list):
+            return (
+                [],
+                [],
+                [],
+                [
+                    f"device list '{devices_key}' must be a list, got {type(devices).__name__}"
+                ],
+            )
+
+        command_template = device_command_config.get("command_template")
+        operations = device_command_config.get("operations", [])
+        name_template = device_command_config.get(
+            "name_template", "{device_name}_{name_suffix}"
+        )
+        required_device_keys = device_command_config.get(
+            "required_device_keys", ["name", "addr", "bus"]
+        )
+
+        if not command_template:
+            return [], [], [], ["device_commands missing required 'command_template'"]
+
+        if not operations:
+            return [], [], [], ["device_commands missing required 'operations'"]
+
+        commands_to_batch: List[str] = []
+        command_names: List[str] = []
+        command_group_names: List[str] = []
+        errors: List[str] = []
+
+        for device_index, device in enumerate(devices, start=1):
+            if not isinstance(device, dict):
+                errors.append(
+                    f"device entry #{device_index} in '{devices_key}' must be a mapping"
+                )
+                continue
+
+            missing_device_keys = [
+                key for key in required_device_keys if key not in device
+            ]
+            if missing_device_keys:
+                errors.append(
+                    f"device entry #{device_index} in '{devices_key}' missing keys: {', '.join(missing_device_keys)}"
+                )
+                continue
+
+            template_values = {
+                **resolved_config,
+                **{key: str(value) for key, value in device.items()},
+                "device_index": str(device_index),
+                "device_name": str(device.get("name", f"device_{device_index}")),
+            }
+
+            for operation in operations:
+                if not isinstance(operation, dict):
+                    errors.append(
+                        f"operation entry for '{template_values['device_name']}' must be a mapping"
+                    )
+                    continue
+
+                operation_values = {
+                    key: str(value) for key, value in operation.items()
+                }
+                all_values = {**template_values, **operation_values}
+
+                try:
+                    processed_cmd = command_template.format(**all_values)
+                    cmd_name = name_template.format(**all_values)
+                except KeyError as exc:
+                    errors.append(
+                        f"missing template value {exc!s} for device '{template_values['device_name']}'"
+                    )
+                    continue
+
+                commands_to_batch.append(processed_cmd)
+                command_names.append(cmd_name)
+                command_group_names.append(
+                    str(operation.get("group", device_command_config.get("group", "")))
                 )
 
-        return resolved_config
+        return commands_to_batch, command_names, command_group_names, errors
 
     async def run_bmc_i2c_commands(
         self,
@@ -1019,9 +1485,46 @@ class BMCSSHService(BaseService):
                 dut_id,
             )
 
+            i2c_config = await self._apply_i2c_collector_override(
+                dut_id,
+                i2c_config,
+                kwargs.get("collector_id"),
+            )
+
             # Resolve config keys to actual values
             config_keys = i2c_config.get("config_keys", {})
-            resolved_config = await self._resolve_config_keys(dut_id, config_keys)
+            resolved_config, unresolved_keys = await self._resolve_config_keys(
+                dut_id, config_keys
+            )
+
+            # If there are unresolved config keys, skip this collector
+            # This handles the case where the baseboard doesn't have i2c_config defined
+            if unresolved_keys:
+                missing_keys_str = ", ".join(unresolved_keys)
+                skip_message = (
+                    f"Required I2C configuration keys not defined for this baseboard: {missing_keys_str}. "
+                    f"Please add these values to the baseboard's i2c_config in baseboards.yaml."
+                )
+                await self._log_runtime(
+                    "WARNING",
+                    "BMCSSHService",
+                    skip_message,
+                    dut_id,
+                )
+                return await self._create_standardized_collector_result(
+                    successful_operations=0,
+                    total_operations=0,
+                    output_files=[],
+                    error_messages=[],
+                    operation_name="bmc_i2c_commands",
+                    additional_context={
+                        "status": "skipped",
+                        "reason": skip_message,
+                        "unresolved_config_keys": unresolved_keys,
+                    },
+                    dut_id=dut_id,
+                    collector_id=kwargs.get("collector_id"),
+                )
 
             # Handle base command (e.g., i2cdetect -l)
             base_command = i2c_config.get("base_command")
@@ -1148,6 +1651,49 @@ class BMCSSHService(BaseService):
                     command_names.append(cmd_name)
                     command_group_names.append("")  # Direct commands don't have groups
 
+            # Handle config-driven device command expansion
+            device_command_config = i2c_config.get("device_commands")
+            if device_command_config:
+                (
+                    expanded_commands,
+                    expanded_names,
+                    expanded_groups,
+                    expansion_errors,
+                ) = await self._expand_i2c_device_commands(
+                    dut_id, device_command_config, resolved_config
+                )
+
+                if expansion_errors:
+                    missing_keys_str = "; ".join(expansion_errors)
+                    skip_message = (
+                        "Required I2C device configuration is not defined correctly for this baseboard: "
+                        f"{missing_keys_str}. Please update the baseboard's i2c_config in baseboards.yaml."
+                    )
+                    await self._log_runtime(
+                        "WARNING",
+                        "BMCSSHService",
+                        skip_message,
+                        dut_id,
+                    )
+                    return await self._create_standardized_collector_result(
+                        successful_operations=0,
+                        total_operations=0,
+                        output_files=[],
+                        error_messages=[],
+                        operation_name="bmc_i2c_commands",
+                        additional_context={
+                            "status": "skipped",
+                            "reason": skip_message,
+                            "device_command_errors": expansion_errors,
+                        },
+                        dut_id=dut_id,
+                        collector_id=kwargs.get("collector_id"),
+                    )
+
+                commands_to_batch.extend(expanded_commands)
+                command_names.extend(expanded_names)
+                command_group_names.extend(expanded_groups)
+
             # Execute all collected commands in batch (sequentially, not in parallel)
             if commands_to_batch:
                 await self._log_runtime(
@@ -1169,6 +1715,19 @@ class BMCSSHService(BaseService):
                 batch_duration = batch_end_time - batch_start_time
 
                 # Process batch results
+                fatal_stderr_markers = [
+                    "no access privilege",
+                    "permission denied",
+                    "access denied",
+                    "not authorized",
+                ]
+                fatal_stderr_patterns = [
+                    re.compile(
+                        rf"(?<![\w-]){re.escape(marker)}(?![\w-])", re.IGNORECASE
+                    )
+                    for marker in fatal_stderr_markers
+                ]
+
                 for i, (exit_code, stdout, stderr) in enumerate(batch_results):
                     cmd_name = (
                         command_names[i] if i < len(command_names) else f"command_{i}"
@@ -1180,11 +1739,17 @@ class BMCSSHService(BaseService):
                         batch_results
                     )  # Approximate per-command time
 
+                    stderr_str = (stderr or "").strip()
+                    stderr_has_fatal = any(
+                        pattern.search(stderr_str) for pattern in fatal_stderr_patterns
+                    )
+                    cmd_success = (exit_code == 0) and not stderr_has_fatal
+
                     timing_data.append(
                         {
                             "command": cmd_name,
                             "duration": cmd_duration,
-                            "success": exit_code == 0,
+                            "success": cmd_success,
                         }
                     )
 
@@ -1195,7 +1760,7 @@ class BMCSSHService(BaseService):
                         dut_id,
                     )
 
-                    if exit_code == 0:
+                    if cmd_success:
                         file_path = await self.write_output_with_generalization(
                             dut_id,
                             kwargs.get("collector_id", ""),
@@ -1219,9 +1784,18 @@ class BMCSSHService(BaseService):
                             }
                         )
                     else:
-                        error_msg = (
-                            f"Command failed with exit_code {exit_code}: {stderr}"
-                        )
+                        if stderr_has_fatal:
+                            error_detail = (
+                                stderr_str
+                                or "stderr indicated access privilege failure"
+                            )
+                            error_msg = (
+                                f"Command failed due to stderr content: {error_detail}"
+                            )
+                        else:
+                            error_msg = (
+                                f"Command failed with exit_code {exit_code}: {stderr}"
+                            )
                         results.append(
                             {
                                 "command": commands_to_batch[i],
@@ -1248,16 +1822,32 @@ class BMCSSHService(BaseService):
                 # If continue_on_failure is False, all commands must succeed
                 overall_success = len(failed_commands) == 0
 
+            # A failure that means "address not populated on this bus" (ENXIO /
+            # "No such device or address", emitted by i2c_msg_xfer when i2ctransfer
+            # prefixes it as "Sending messages failed: ..."). Treat this as
+            # device-absent, not as a tool error.
+            def _is_device_absent(err_text: str) -> bool:
+                if not err_text:
+                    return False
+                markers = (
+                    "No such device or address",
+                    "Sending messages failed",
+                )
+                return any(m in err_text for m in markers)
+
+            all_device_absent = bool(failed_commands) and all(
+                _is_device_absent(str(cmd.get("error", "")) + " " + str(cmd.get("stderr", "")))
+                for cmd in failed_commands
+            )
+
             # Create detailed reason for failure
             if not overall_success and failed_commands:
-                # Check if all failures are due to missing I2C devices
-                all_no_device = all(
-                    "No such device or address" in str(cmd.get("error", ""))
-                    for cmd in failed_commands
-                )
-
-                if all_no_device:
-                    reason = "All I2C commands failed: No such device or address - I2C devices not available on this BMC"
+                if all_device_absent:
+                    reason = (
+                        f"All {len(failed_commands)} I2C probes returned "
+                        "'No such device or address' — configured PDB/HSC device "
+                        "addresses are not populated on this baseboard"
+                    )
                 else:
                     failure_reasons = [
                         f"{cmd.get('name', 'unknown')}: {cmd.get('error', 'No specific command error reason provided')}"
@@ -1413,21 +2003,33 @@ Command breakdown:
                     cmd_error = cmd.get("error", "No specific error provided")
                     detailed_error_messages.append(f"{cmd_name}: {cmd_error}")
 
+            additional_context = {
+                "total_commands": len(results),
+                "successful_commands": len(successful_commands),
+                "command_groups_processed": list(command_groups.keys()),
+                "timing_data": timing_data,
+                "total_time": total_time,
+                "results": results,
+                "structured_json_file": json_file_path,
+            }
+
+            # When every failure is "device not populated", mark the collector
+            # skipped so finalize_collector's skip_message path surfaces a
+            # graceful "device not present" message instead of a hard failure.
+            # This applies regardless of continue_on_failure: absence of the
+            # hardware on this baseboard is not a tool error.
+            if failed_commands and not successful_commands and all_device_absent:
+                additional_context["status"] = "skipped"
+                additional_context["reason"] = reason
+                additional_context["all_devices_absent"] = True
+
             return await self._create_standardized_collector_result(
                 successful_operations=len(successful_commands),
                 total_operations=len(results),
                 output_files=output_files,
                 error_messages=detailed_error_messages,
                 operation_name="bmc_i2c_commands",
-                additional_context={
-                    "total_commands": len(results),
-                    "successful_commands": len(successful_commands),
-                    "command_groups_processed": list(command_groups.keys()),
-                    "timing_data": timing_data,
-                    "total_time": total_time,
-                    "results": results,
-                    "structured_json_file": json_file_path,
-                },
+                additional_context=additional_context,
             )
         except Exception as e:
             error_traceback = traceback.format_exc()
@@ -1471,7 +2073,9 @@ Command breakdown:
             # Extract parameters directly from kwargs (hook execution passes them directly)
             source_path = kwargs.get("source_path", "/var/log/")
             archive_name = kwargs.get("archive_name", "file_transfer")
-            function_tag = kwargs.get("function_tag", "file_transfer")
+            # Use archive_name for output file naming — it is per-hook and not overridden by
+            # the shared context (which sets function_tag to the collector name).
+            function_tag = archive_name or kwargs.get("function_tag", "file_transfer")
             use_sftp = kwargs.get("use_sftp", True)
             fallback_hexdump = kwargs.get("fallback_hexdump", True)
             retry_count = kwargs.get("retry_count", 3)
@@ -1497,6 +2101,42 @@ Command breakdown:
 
             # Create timestamp substitution for output pattern
             timestamp_substitutions = {"timestamp": archive_timestamp}
+            output_pattern = kwargs.get("output_pattern")
+            if self.logger and getattr(self.logger, "_get_tool_config_value", None):
+                if self.logger._get_tool_config_value("streaming_only", False):
+                    try:
+                        begin_dt, end_dt = normalize_stream_window(
+                            self.logger._get_tool_config_value("stream_begin"),
+                            self.logger._get_tool_config_value("stream_end"),
+                        )
+                        begin_component = format_stream_window_component(begin_dt)
+                        end_component = format_stream_window_component(end_dt)
+                        if output_pattern:
+                            output_pattern = output_pattern.replace(
+                                "_{timestamp}", f"_{begin_component}_{end_component}"
+                            ).replace(
+                                "{timestamp}", f"{begin_component}_{end_component}"
+                            )
+                    except ValueError as e:
+                        await self._log_runtime(
+                            "ERROR",
+                            "BMCSSHService",
+                            f"Invalid streaming window for BMC file transfer: {str(e)}",
+                            dut_id,
+                        )
+                        raise
+                    except Exception as e:
+                        logger.exception(
+                            "Unexpected error while normalizing streaming window for BMC file transfer on DUT %s",
+                            dut_id,
+                        )
+                        await self._log_runtime(
+                            "ERROR",
+                            "BMCSSHService",
+                            f"Unexpected error while applying streaming window for BMC file transfer: {str(e)}",
+                            dut_id,
+                        )
+                        raise
 
             await self._log_runtime(
                 "INFO",
@@ -1515,7 +2155,9 @@ Command breakdown:
                 dut_id,
             )
 
-            test_command = f"touch {bmc_temp_dir}/.test && rm {bmc_temp_dir}/.test"
+            test_command = build_remote_cmd(
+                "touch {dir}/.test && rm {dir}/.test", dir=bmc_temp_dir
+            )
             exit_code, stdout, stderr = await self.dut_manager.execute_bmc_command(
                 dut_id, test_command
             )
@@ -1538,8 +2180,74 @@ Command breakdown:
                     collector_id="bmc_file_transfer",
                 )
 
+            source_exists_cmd = build_remote_cmd("test -e {path}", path=source_path)
+            exit_code, _, stderr = await self.dut_manager.execute_bmc_command(
+                dut_id, source_exists_cmd
+            )
+            primary_source_path = source_path
+            used_fallback = False
+            fallback_source_path = kwargs.get("fallback_source_path")
+            if exit_code != 0 and fallback_source_path:
+                fallback_exists_cmd = build_remote_cmd(
+                    "test -e {path}", path=fallback_source_path
+                )
+                fb_exit_code, _, _ = await self.dut_manager.execute_bmc_command(
+                    dut_id, fallback_exists_cmd
+                )
+                if fb_exit_code == 0:
+                    await self._log_runtime(
+                        "INFO",
+                        "BMCSSHService",
+                        f"Primary source path {source_path} not present on BMC; "
+                        f"falling back to {fallback_source_path}",
+                        dut_id,
+                    )
+                    source_path = fallback_source_path
+                    used_fallback = True
+                    exit_code = 0
+            if exit_code != 0:
+                if fallback_source_path:
+                    skip_reason = (
+                        f"Neither primary path {primary_source_path} nor fallback "
+                        f"{fallback_source_path} present on BMC; skipping file transfer"
+                    )
+                else:
+                    skip_reason = (
+                        f"Source path {source_path} is not present on BMC; skipping file transfer"
+                    )
+                await self._log_runtime(
+                    "INFO",
+                    "BMCSSHService",
+                    skip_reason,
+                    dut_id,
+                )
+                return await self._create_standardized_collector_result(
+                    successful_operations=0,
+                    total_operations=0,
+                    output_files=[],
+                    error_messages=[],
+                    operation_name="bmc_file_transfer",
+                    additional_context={
+                        "status": "skipped",
+                        "reason": skip_reason,
+                        "source_path": primary_source_path,
+                        "fallback_source_path": fallback_source_path,
+                        "source_path_missing": True,
+                    },
+                    dut_id=dut_id,
+                    collector_id="bmc_file_transfer",
+                )
+
+            source_is_directory = True
+            if used_fallback:
+                is_dir_cmd = build_remote_cmd("test -d {path}", path=source_path)
+                is_dir_exit_code, _, _ = await self.dut_manager.execute_bmc_command(
+                    dut_id, is_dir_cmd
+                )
+                source_is_directory = is_dir_exit_code == 0
+
             # Check size of source directory (following symlinks to get true size)
-            size_command = f"du -sh {source_path}"
+            size_command = build_remote_cmd("du -sh {path}", path=source_path)
             exit_code, stdout, stderr = await self.dut_manager.execute_bmc_command(
                 dut_id, size_command
             )
@@ -1565,8 +2273,9 @@ Command breakdown:
                 )
 
             # Check for symlinks in source directory
-            symlink_check = (
-                f"find {source_path} -maxdepth 2 -type l -ls 2>/dev/null | head -5"
+            symlink_check = build_remote_cmd(
+                "find {path} -maxdepth 2 -type l -ls 2>/dev/null | head -5",
+                path=source_path,
             )
             exit_code, symlink_output, _ = await self.dut_manager.execute_bmc_command(
                 dut_id, symlink_check
@@ -1596,8 +2305,35 @@ Command breakdown:
                         # Note: This will increase archive size but ensures the archive is self-contained
                         # and usable by end users. If space is limited, the command will fail gracefully.
                         # Important: -h must come before -f, or after the filename, not between them
+
+                        # Get tar command with fallback to bundled busybox
+                        try:
+                            tar_cmd = get_tar_command()
+                        except RuntimeError as e:
+                            await self._log_runtime(
+                                "ERROR",
+                                "BMCSSHService",
+                                f"tar not available: {e}",
+                                dut_id,
+                            )
+                            return {"error": f"tar not available: {e}"}
+
                         temp_path = f"{bmc_temp_dir}/{tempfilename}"
-                        sftp_command = f"tar -h -czf {temp_path} -C {source_path} ."
+                        if source_is_directory:
+                            sftp_command = build_remote_cmd(
+                                f"{tar_cmd} -h -czf {{dest}} -C {{src}} .",
+                                dest=temp_path,
+                                src=source_path,
+                            )
+                        else:
+                            src_parent = posixpath.dirname(source_path) or "/"
+                            src_basename = posixpath.basename(source_path)
+                            sftp_command = build_remote_cmd(
+                                f"{tar_cmd} -h -czf {{dest}} -C {{parent}} {{name}}",
+                                dest=temp_path,
+                                parent=src_parent,
+                                name=src_basename,
+                            )
                         exit_code, stdout, stderr = (
                             await self.dut_manager.execute_bmc_command(
                                 dut_id, sftp_command
@@ -1615,7 +2351,21 @@ Command breakdown:
                                 "Archive creation failed while dereferencing symlinks; retrying without -h to include symlinks as links",
                                 dut_id,
                             )
-                            fallback_cmd = f"tar -czf {temp_path} -C {source_path} ."
+                            if source_is_directory:
+                                fallback_cmd = build_remote_cmd(
+                                    f"{tar_cmd} -czf {{dest}} -C {{src}} .",
+                                    dest=temp_path,
+                                    src=source_path,
+                                )
+                            else:
+                                src_parent = posixpath.dirname(source_path) or "/"
+                                src_basename = posixpath.basename(source_path)
+                                fallback_cmd = build_remote_cmd(
+                                    f"{tar_cmd} -czf {{dest}} -C {{parent}} {{name}}",
+                                    dest=temp_path,
+                                    parent=src_parent,
+                                    name=src_basename,
+                                )
                             exit_code2, stdout2, stderr2 = (
                                 await self.dut_manager.execute_bmc_command(
                                     dut_id, fallback_cmd
@@ -1651,7 +2401,7 @@ Command breakdown:
                                 await self._log_runtime(
                                     "WARNING",
                                     "BMCSSHService",
-                                    f"Archive created with warnings - some files skipped due to permission errors",
+                                    "Archive created with warnings - some files skipped due to permission errors",
                                     dut_id,
                                 )
                             await self._log_runtime(
@@ -1661,6 +2411,8 @@ Command breakdown:
                                 dut_id,
                             )
 
+                            # Download the archive using the legacy approach: hexdump for binary-safe transfer
+                            # This is the proven method from the legacy nvdebug code
                             await self._log_runtime(
                                 "INFO",
                                 "BMCSSHService",
@@ -1669,7 +2421,9 @@ Command breakdown:
                             )
 
                             # Get file size first
-                            size_cmd = f"ls -l {temp_path} | awk '{{print $5}}'"
+                            size_cmd = build_remote_cmd(
+                                "ls -l {path} | awk '{{print $5}}'", path=temp_path
+                            )
                             exit_code, size_output, stderr = (
                                 await self.dut_manager.execute_bmc_command(
                                     dut_id, size_cmd
@@ -1736,8 +2490,9 @@ Command breakdown:
                                     dut_id,
                                     kwargs.get("collector_id", ""),
                                     archive_data,
-                                    output_pattern=kwargs.get("output_pattern"),
+                                    output_pattern=output_pattern,
                                     function_tag=function_tag,
+                                    default_extension=".tar.gz",
                                     substitutions=timestamp_substitutions,
                                     binary_mode=True,
                                 )
@@ -1751,7 +2506,9 @@ Command breakdown:
                                 )
 
                                 # Clean up temp file
-                                cleanup_command = f"rm -f {temp_path}"
+                                cleanup_command = build_remote_cmd(
+                                    "rm -f {path}", path=temp_path
+                                )
                                 await self.dut_manager.execute_bmc_command(
                                     dut_id, cleanup_command
                                 )
@@ -1762,7 +2519,11 @@ Command breakdown:
                                     output_files=output_files,
                                     error_messages=[],
                                     operation_name="bmc_file_transfer",
-                                    additional_context={"transfer_method": "SFTP"},
+                                    additional_context={
+                                        "transfer_method": "SFTP",
+                                        "source_path": source_path,
+                                        "used_fallback_source_path": used_fallback,
+                                    },
                                 )
                             else:
                                 await self._log_runtime(
@@ -1823,7 +2584,9 @@ Command breakdown:
                     for file_path in key_files:
                         try:
                             # First check if file exists to avoid unnecessary errors
-                            check_command = f"test -f {file_path}"
+                            check_command = build_remote_cmd(
+                                "test -f {path}", path=file_path
+                            )
                             check_exit_code, _, _ = (
                                 await self.dut_manager.execute_bmc_command(
                                     dut_id, check_command
@@ -1842,8 +2605,9 @@ Command breakdown:
 
                             # Use binary-safe hexdump that can be converted back
                             # -v = no asterisk abbreviation, -e = format string
-                            hexdump_command = (
-                                f"hexdump -v -e '1/1 \"%02x\"' {file_path}"
+                            hexdump_command = build_remote_cmd(
+                                "hexdump -v -e '1/1 \"%02x\"' {path}",
+                                path=file_path,
                             )
                             exit_code, hex_data, stderr = (
                                 await self.dut_manager.execute_bmc_command(
@@ -2161,11 +2925,7 @@ Command breakdown:
 
                             max_attempts = 10
                             for attempt in range(max_attempts):
-                                eof_marker = "NVDEBUG_EOF_" + "".join(
-                                    random.choices(
-                                        string.ascii_uppercase + string.digits, k=16
-                                    )
-                                )
+                                eof_marker = "NVDEBUG_EOF_" + secrets.token_hex(8)
                                 if eof_marker not in text_content:
                                     break
                             else:
@@ -2175,7 +2935,16 @@ Command breakdown:
                                 eof_marker = f"NVDEBUG_EOF_{int(time.time() * 1000000)}"
 
                             # Upload using heredoc (cat << 'EOF' - single quotes prevent variable expansion)
-                            upload_command = f"cat > {remote_file_path} << '{eof_marker}'\n{text_content}\n{eof_marker}"
+                            upload_command = (
+                                build_remote_cmd(
+                                    "cat > {path} << '{eof}'\n",
+                                    path=remote_file_path,
+                                    eof=eof_marker,
+                                )
+                                + text_content
+                                + "\n"
+                                + eof_marker
+                            )
                             exit_code, stdout, stderr = (
                                 await self.dut_manager.execute_bmc_command(
                                     dut_id, upload_command, timeout=180
@@ -2247,7 +3016,7 @@ Command breakdown:
                     ]
 
                     # Remove file if exists
-                    rm_command = f"rm -f {remote_file_path}"
+                    rm_command = build_remote_cmd("rm -f {path}", path=remote_file_path)
                     await self.dut_manager.execute_bmc_command(dut_id, rm_command)
 
                     # Write chunks
@@ -2272,7 +3041,10 @@ Command breakdown:
                             raise Exception(f"Failed to write chunk {i}: {stderr}")
 
                     # Decode base64 file
-                    decode_command = f"base64 -d {remote_file_path}.b64 > {remote_file_path} && rm {remote_file_path}.b64"
+                    decode_command = build_remote_cmd(
+                        "base64 -d {path}.b64 > {path} && rm {path}.b64",
+                        path=remote_file_path,
+                    )
                     exit_code, stdout, stderr = (
                         await self.dut_manager.execute_bmc_command(
                             dut_id, decode_command
@@ -2335,7 +3107,7 @@ Command breakdown:
                     ]
 
                     # Remove file if exists
-                    rm_command = f"rm -f {remote_file_path}"
+                    rm_command = build_remote_cmd("rm -f {path}", path=remote_file_path)
                     await self.dut_manager.execute_bmc_command(dut_id, rm_command)
 
                     # Write chunks
@@ -2359,7 +3131,10 @@ Command breakdown:
                             raise Exception(f"Failed to write hex chunk {i}: {stderr}")
 
                     # Convert hex to binary
-                    convert_command = f"xxd -r -p {remote_file_path}.hex {remote_file_path} && rm {remote_file_path}.hex"
+                    convert_command = build_remote_cmd(
+                        "xxd -r -p {path}.hex {path} && rm {path}.hex",
+                        path=remote_file_path,
+                    )
                     exit_code, stdout, stderr = (
                         await self.dut_manager.execute_bmc_command(
                             dut_id, convert_command
@@ -2387,7 +3162,7 @@ Command breakdown:
                     )
 
             if not upload_success:
-                error_msg = f"File upload failed: All methods (SCP, base64, hex) failed"
+                error_msg = "File upload failed: All methods (SCP, base64, hex) failed"
                 return await self._create_standardized_collector_result(
                     successful_operations=0,
                     total_operations=1,
@@ -2472,6 +3247,179 @@ Command breakdown:
                 operation_name="upload_file_to_bmc",
                 additional_context={},
             )
+
+    def _expand_hmc_candidate_value(
+        self, dut: "DUT", candidate: Any, visited: Optional[set] = None
+    ) -> List[str]:
+        """
+        Expand a candidate value into concrete HMC endpoints.
+
+        Args:
+            dut: DUT object providing configuration context.
+            candidate: Raw candidate value (string, list, or config key).
+            visited: Set used to prevent circular references.
+        """
+        if visited is None:
+            visited = set()
+
+        results: List[str] = []
+
+        if candidate is None:
+            return results
+
+        if isinstance(candidate, (list, tuple, set)):
+            for item in candidate:
+                results.extend(
+                    self._expand_hmc_candidate_value(dut, item, visited.copy())
+                )
+            return results
+
+        if not isinstance(candidate, str):
+            candidate = str(candidate)
+
+        candidate = candidate.strip()
+        if not candidate:
+            return results
+
+        if candidate in visited:
+            return results
+
+        visited.add(candidate)
+
+        config_dict = getattr(dut, "config", {})
+        if isinstance(config_dict, dict) and candidate in config_dict:
+            config_value = config_dict[candidate]
+            results.extend(
+                self._expand_hmc_candidate_value(dut, config_value, visited.copy())
+            )
+            return results
+
+        env_value = os.getenv(candidate)
+        if env_value and env_value != candidate:
+            results.extend(
+                self._expand_hmc_candidate_value(dut, env_value, visited.copy())
+            )
+            return results
+
+        results.append(candidate)
+        return results
+
+    @staticmethod
+    def _dedupe_candidates(candidates: List[str]) -> List[str]:
+        """
+        Deduplicate candidate list while preserving order.
+        """
+        seen: Set[str] = set()
+        ordered: List[str] = []
+        for candidate in candidates:
+            value = candidate.strip()
+            if value and value not in seen:
+                seen.add(value)
+                ordered.append(value)
+        return ordered
+
+    async def _resolve_hmc_ip_with_fallback(self, dut_id: str) -> Optional[str]:
+        """
+        Resolve an HMC endpoint using candidate fallbacks.
+        """
+        dut = self.dut_manager.get_dut(dut_id)
+        if not dut:
+            return None
+
+        if getattr(dut.credentials, "hmc_ip", None) and getattr(
+            dut.credentials, "hmc_ip_validated", False
+        ):
+            return dut.credentials.hmc_ip.strip()
+
+        candidate_sources: List[Any] = [
+            getattr(dut.credentials, "hmc_ip", None),
+            getattr(dut.credentials, "hmc_ip_candidates", []) or [],
+            dut.config.get("HMC_IP_CANDIDATES"),
+            dut.config.get("HMC_IP"),
+            dut.config.get("hmc_ip"),
+        ]
+
+        platform_detection = dut.config.get("platform_detection", {})
+        if isinstance(platform_detection, dict):
+            candidate_sources.append(platform_detection.get("hmc_ip_candidates"))
+            candidate_sources.append(platform_detection.get("hmc_ip"))
+
+        expanded_candidates: List[str] = []
+        for source in candidate_sources:
+            expanded_candidates.extend(self._expand_hmc_candidate_value(dut, source))
+
+        candidate_list = self._dedupe_candidates(expanded_candidates)
+        if not candidate_list:
+            await self._log_runtime(
+                "WARNING",
+                "BMCSSHService",
+                "No HMC IP candidates available for fallback resolution",
+                dut_id,
+            )
+            return None
+
+        selected_candidate: Optional[str] = None
+        for candidate in candidate_list:
+            ping_target = candidate.split(":")[0]
+            ping_command = f"ping -c 1 -W 2 {shlex.quote(ping_target)}"
+            exit_code, _, _ = await self.dut_manager.execute_bmc_command(
+                dut_id, ping_command, timeout=30
+            )
+            if exit_code == 0:
+                selected_candidate = candidate
+                await self._log_runtime(
+                    "INFO",
+                    "BMCSSHService",
+                    f"Selected reachable HMC endpoint '{candidate}'",
+                    dut_id,
+                )
+                break
+
+            await self._log_runtime(
+                "DEBUG",
+                "BMCSSHService",
+                f"HMC endpoint '{candidate}' unreachable via BMC ping, trying next candidate",
+                dut_id,
+            )
+
+        if not selected_candidate:
+            selected_candidate = candidate_list[0]
+            await self._log_runtime(
+                "WARNING",
+                "BMCSSHService",
+                (
+                    f"All HMC endpoint candidates unreachable; falling back to first "
+                    f"candidate '{selected_candidate}'"
+                ),
+                dut_id,
+            )
+
+        dut.credentials.hmc_ip = selected_candidate
+        dut.credentials.hmc_ip_validated = True
+
+        if selected_candidate not in dut.credentials.hmc_ip_candidates:
+            dut.credentials.hmc_ip_candidates.insert(0, selected_candidate)
+
+        dut.config["HMC_IP"] = selected_candidate
+        dut.config["hmc_ip"] = selected_candidate
+
+        existing_config_candidates = dut.config.get("HMC_IP_CANDIDATES", [])
+        if not isinstance(existing_config_candidates, list):
+            existing_config_candidates = []
+        dut.config["HMC_IP_CANDIDATES"] = self._dedupe_candidates(
+            [selected_candidate] + existing_config_candidates
+        )
+
+        if isinstance(platform_detection, dict):
+            pd_candidates = platform_detection.get("hmc_ip_candidates", [])
+            if not isinstance(pd_candidates, list):
+                pd_candidates = []
+            platform_detection["hmc_ip_candidates"] = self._dedupe_candidates(
+                [selected_candidate] + pd_candidates
+            )
+            platform_detection["hmc_ip"] = selected_candidate
+
+        return selected_candidate
 
     async def run_bmc_script(
         self,
@@ -2564,9 +3512,7 @@ Command breakdown:
 
             # Create a unique working directory if requested
             if use_working_directory and not working_dir:
-                random_suffix = "".join(
-                    random.choices(string.ascii_lowercase + string.digits, k=6)
-                )
+                random_suffix = secrets.token_hex(8)
                 working_dir = f"/tmp/nvdebug_{random_suffix}"
 
                 # Create the working directory on BMC
@@ -2595,7 +3541,9 @@ Command breakdown:
                     working_dir = None
 
             # Check if script exists - first try the exact path, then look for versioned scripts
-            check_command = f"test -f {script_name} && echo 'found' || echo 'not found'"
+            check_command = build_remote_cmd(
+                "test -f {path} && echo 'found' || echo 'not found'", path=script_name
+            )
             exit_code, stdout, stderr = await self.dut_manager.execute_bmc_command(
                 dut_id, check_command
             )
@@ -2613,8 +3561,10 @@ Command breakdown:
                 search_pattern = script_name_pattern.replace(
                     "{base_script_name}", base_script_name
                 )
-                find_command = (
-                    f"find {script_dir}/ -name '{search_pattern}' 2>/dev/null | head -1"
+                find_command = build_remote_cmd(
+                    "find {dir}/ -name {pattern} 2>/dev/null | head -1",
+                    dir=script_dir,
+                    pattern=search_pattern,
                 )
 
                 exit_code, stdout, stderr = await self.dut_manager.execute_bmc_command(
@@ -2676,9 +3626,16 @@ Command breakdown:
 
             # Add HMC IP if requested (use short flag -i for script compatibility)
             if use_hmc_ip:
-                dut = self.dut_manager.get_dut(dut_id)
-                if dut.credentials.hmc_ip:
-                    script_command += f" -i {dut.credentials.hmc_ip}"
+                resolved_hmc_ip = await self._resolve_hmc_ip_with_fallback(dut_id)
+                if resolved_hmc_ip:
+                    script_command += f" -i {resolved_hmc_ip}"
+                else:
+                    await self._log_runtime(
+                        "WARNING",
+                        "BMCSSHService",
+                        "Unable to determine a reachable HMC endpoint; continuing without -i flag",
+                        dut_id,
+                    )
 
             # If working directory is set, pass it to the script via -o flag
             # This tells the script where to write its output files
@@ -2713,9 +3670,11 @@ Command breakdown:
             if auto_retrieve_files:
                 # Look for output files created by the script
                 # Convert space-separated patterns to find command format
+                from tool.utils.command_safety import quote_arg
+
                 patterns = output_file_pattern.split()
                 find_conditions = " -o ".join(
-                    [f"-name '{pattern}'" for pattern in patterns]
+                    [f"-name {quote_arg(pattern)}" for pattern in patterns]
                 )
 
                 # Search in all specified directories, prioritize working_dir if it exists
@@ -2723,10 +3682,17 @@ Command breakdown:
                 if working_dir and working_dir not in search_dirs_list:
                     # Add working directory as first search location
                     search_dirs_list.insert(0, working_dir)
-                search_dirs = " ".join(search_dirs_list)
+                search_dirs = " ".join(quote_arg(d) for d in search_dirs_list)
                 # Need to wrap find conditions in parentheses when using multiple directories
                 # Use head -n 10 for BusyBox compatibility (BMC uses BusyBox)
-                find_command = f"find {search_dirs} \\( {find_conditions} \\) 2>/dev/null | head -n 10"
+                # search_dirs and find_conditions are pre-quoted via quote_arg above
+                find_command = (
+                    "find "
+                    + search_dirs
+                    + " \\( "
+                    + find_conditions
+                    + " \\) 2>/dev/null | head -n 10"
+                )
 
                 find_exit_code, find_stdout, find_stderr = (
                     await self.dut_manager.execute_bmc_command(dut_id, find_command)
@@ -2800,7 +3766,10 @@ Command breakdown:
                                 if base64_cmd and file_data is None:
                                     # Check if we're using hexdump fallback (not real base64)
                                     if "hexdump" in base64_cmd:
-                                        download_command = f"{base64_cmd} {file_path}"
+                                        download_command = build_remote_cmd(
+                                            f"{base64_cmd} {{path}}",
+                                            path=file_path,
+                                        )
                                         exit_code, stdout_hex, stderr = (
                                             await self.dut_manager.execute_bmc_command(
                                                 dut_id, download_command
@@ -2815,7 +3784,10 @@ Command breakdown:
                                             download_method = "hexdump"
                                     else:
                                         # Using base64 (real or our script)
-                                        download_command = f"{base64_cmd} {file_path}"
+                                        download_command = build_remote_cmd(
+                                            f"{base64_cmd} {{path}}",
+                                            path=file_path,
+                                        )
                                         exit_code, stdout_b64, stderr = (
                                             await self.dut_manager.execute_bmc_command(
                                                 dut_id, download_command
@@ -3022,14 +3994,22 @@ Command breakdown:
                 search_dirs_list.insert(0, working_dir)
 
             # Convert space-separated patterns to find command format
+            from tool.utils.command_safety import quote_arg
+
             patterns = output_file_pattern.split()
             find_conditions = " -o ".join(
-                [f"-name '{pattern}'" for pattern in patterns]
+                [f"-name {quote_arg(pattern)}" for pattern in patterns]
             )
 
-            search_dirs = " ".join(search_dirs_list)
+            # Pre-quote each directory individually for shell safety
+            search_dirs = " ".join(quote_arg(d) for d in search_dirs_list)
+            # search_dirs and find_conditions are pre-quoted via quote_arg above
             find_command = (
-                f"find {search_dirs} \\( {find_conditions} \\) 2>/dev/null | head -n 10"
+                "find "
+                + search_dirs
+                + " \\( "
+                + find_conditions
+                + " \\) 2>/dev/null | head -n 10"
             )
 
             find_exit_code, find_stdout, find_stderr = (
@@ -3080,7 +4060,10 @@ Command breakdown:
                             if base64_cmd and file_data is None:
                                 # Check if we're using hexdump fallback (not real base64)
                                 if "hexdump" in base64_cmd:
-                                    download_command = f"{base64_cmd} {file_path}"
+                                    download_command = build_remote_cmd(
+                                        f"{base64_cmd} {{path}}",
+                                        path=file_path,
+                                    )
                                     exit_code, stdout_hex, stderr = (
                                         await self.dut_manager.execute_bmc_command(
                                             dut_id, download_command
@@ -3093,7 +4076,10 @@ Command breakdown:
                                         download_method = "hexdump"
                                 else:
                                     # Regular base64
-                                    download_command = f"{base64_cmd} {file_path}"
+                                    download_command = build_remote_cmd(
+                                        f"{base64_cmd} {{path}}",
+                                        path=file_path,
+                                    )
                                     exit_code, stdout_b64, stderr = (
                                         await self.dut_manager.execute_bmc_command(
                                             dut_id, download_command
@@ -3154,7 +4140,7 @@ Command breakdown:
                 and working_dir
                 and kwargs.get("working_dir_created")
             ):
-                cleanup_cmd = f"rm -rf {working_dir}"
+                cleanup_cmd = build_remote_cmd("rm -rf {path}", path=working_dir)
                 exit_code, stdout, stderr = await self.dut_manager.execute_bmc_command(
                     dut_id, cleanup_cmd
                 )

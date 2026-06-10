@@ -19,7 +19,7 @@ HMC Service for NVDebug Tool.
 
 This service provides transparent HMC (Host Management Controller) access
 through port forwarding, SSH tunneling, and aggregation methods.
-It sets up the infrastructure so existing Redfish calls work transparently.
+Like legacy nvdebug, it sets up the infrastructure so existing Redfish calls work transparently.
 """
 
 import logging
@@ -56,11 +56,13 @@ class HMCService:
         dut_id: str,
         bmc_ip: str,
         bmc_ssh_username: str,
-        bmc_ssh_password: str,
+        bmc_ssh_password: Optional[str],
         hmc_ip: str,
         hmc_username: Optional[str] = None,
         hmc_password: Optional[str] = None,
         bmc_ssh_port: int = 22,
+        bmc_ssh_key_path: Optional[str] = None,
+        bmc_ssh_passwordless: bool = False,
         hmc_http_port: int = 80,
         hmc_https_port: int = 443,
         hmc_use_https: bool = False,
@@ -92,7 +94,7 @@ class HMCService:
             dut_id,
             "DEBUG",
             "HMCService",
-            f"[HMC DEBUG] setup_hmc_port_forwarding called",
+            "[HMC DEBUG] setup_hmc_port_forwarding called",
         )
         await self.logger.write_to_dut_runtime_log(
             dut_id, "DEBUG", "HMCService", f"[HMC DEBUG] bmc_ip: {bmc_ip}"
@@ -118,7 +120,7 @@ class HMCService:
                 dut_id,
                 "DEBUG",
                 "HMCService",
-                f"[HMC DEBUG] About to setup port forwarding to HMC",
+                "[HMC DEBUG] About to setup port forwarding to HMC",
             )
             await self.logger.write_to_dut_runtime_log(
                 dut_id,
@@ -163,6 +165,8 @@ class HMCService:
                     ssh_password=bmc_ssh_password,
                     destination_server_ip=hmc_ip,
                     ssh_port=bmc_ssh_port,
+                    ssh_key_path=bmc_ssh_key_path,
+                    ssh_passwordless=bmc_ssh_passwordless,
                     remote_port=(hmc_https_port if hmc_use_https else hmc_http_port),
                     remote_tcp_protocol="https" if hmc_use_https else "http",
                     local_ports=local_ports,
@@ -373,20 +377,40 @@ class HMCService:
             endpoint = f"/redfish/v1/Managers/{hmc_id}/Actions/Manager.ResetToDefaults"
             payload = {}
 
-            success, response_data, _, _ = await dut_manager.execute_redfish_request(
+            request_result = await dut_manager.execute_redfish_request(
                 dut_id, "POST", endpoint, payload, timeout=timeout
             )
+
+            if isinstance(request_result, tuple):
+                if len(request_result) >= 4:
+                    success, response_data, *_ = request_result
+                elif len(request_result) == 3:
+                    success, response_data, _ = request_result
+                elif len(request_result) == 2:
+                    success, response_data = request_result
+                elif len(request_result) == 1:
+                    success = request_result[0]
+                    response_data = None
+                else:
+                    success = False
+                    response_data = "Unexpected response format"
+            else:
+                success = bool(request_result)
+                response_data = None
 
             if success:
                 await self.logger.write_to_dut_runtime_log(
                     dut_id,
                     "INFO",
                     "HMCService",
-                    f"HMC reset to defaults successful",
+                    "HMC reset to defaults successful",
                 )
                 return True, "HMC reset to defaults successful"
             else:
-                return False, f"HMC reset to defaults failed: {response_data}"
+                failure_detail = (
+                    response_data if response_data is not None else "Unknown error"
+                )
+                return False, f"HMC reset to defaults failed: {failure_detail}"
 
         except Exception as e:
             return False, f"HMC reset to defaults error: {str(e)}"

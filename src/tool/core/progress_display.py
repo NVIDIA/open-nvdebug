@@ -20,9 +20,7 @@ Shows real-time progress bars for collector execution using Rich progress bars
 with per-DUT task tracking and overall progress visualization.
 """
 
-import asyncio
 from datetime import datetime
-from typing import Any, Dict, Optional
 
 from rich.progress import (
     BarColumn,
@@ -285,7 +283,11 @@ class ProgressDisplay:
 
                     # Format per-DUT elapsed time
                     # Format per-DUT elapsed time
-                    duration_str = self._format_duration(dut_progress.duration if hasattr(dut_progress, 'duration') else 0.0)
+                    duration_str = self._format_duration(
+                        dut_progress.duration
+                        if hasattr(dut_progress, "duration")
+                        else 0.0
+                    )
 
                     if remaining_count > 0 and remaining_collectors:
                         # Show remaining collector names with per-DUT elapsed time

@@ -21,7 +21,57 @@ This module provides utilities for handling timeout overrides based on
 collector definitions and DUT configuration.
 """
 
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict
+
+
+def _is_positive_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and value > 0
+
+
+def _get_positive_int(value: Any) -> int | None:
+    if _is_positive_number(value):
+        return int(value)
+    return None
+
+
+def _resolve_timeout_config_value(
+    timeout_config_key: str,
+    dut_config: Dict[str, Any],
+    tool_config: Dict[str, Any] | None = None,
+    collector_timeout: int | None = None,
+) -> int | None:
+    """Resolve timeout_config while preserving DUT-level overrides.
+
+    ConfigManager may populate tool_config with default values for compatibility.
+    When that value matches the collector timeout, treat it as a default rather
+    than an explicit global override. H14's NVOS tech dump timeout is
+    intentionally per-DUT overridable even when a global tool timeout is set.
+    """
+    tool_timeout = None
+    if tool_config and timeout_config_key in tool_config:
+        tool_timeout = _get_positive_int(tool_config[timeout_config_key])
+
+    dut_timeout = None
+    if dut_config and timeout_config_key in dut_config:
+        dut_timeout = _get_positive_int(dut_config[timeout_config_key])
+
+    if timeout_config_key == "NVOS_TECH_DUMP_TIMEOUT" and dut_timeout is not None:
+        return dut_timeout
+
+    if (
+        tool_timeout is not None
+        and (
+            dut_timeout is None
+            or collector_timeout is None
+            or tool_timeout != collector_timeout
+        )
+    ):
+        return tool_timeout
+
+    if dut_timeout is not None:
+        return dut_timeout
+
+    return tool_timeout
 
 
 def get_collector_timeout(
@@ -35,10 +85,14 @@ def get_collector_timeout(
     Get the appropriate timeout for a collector based on configuration.
 
     Priority order:
-    1. Collector's own timeout (from spreadsheet)
-    2. timeout_config override in tool_config (if explicitly set in YAML)
-    3. timeout_config override in dut_config (if explicitly set in YAML)
+    1. timeout_config override in tool_config (if explicitly set in YAML)
+    2. timeout_config override in dut_config (if explicitly set in YAML)
+    3. Collector's own timeout (from spreadsheet)
     4. Default timeout
+
+    A tool_config value matching the collector's own timeout is treated as a
+    default, not an explicit global override, so DUT-specific overrides still
+    apply.
 
     Args:
         collector_id: The collector ID
@@ -55,7 +109,8 @@ def get_collector_timeout(
 
     # First priority: Check collector definition timeout
     collector_timeout = collector_def.get("timeout")
-    if isinstance(collector_timeout, (int, float)) and collector_timeout > 0:
+    collector_timeout_int = _get_positive_int(collector_timeout)
+    if collector_timeout_int is not None:
         # Check if there's a timeout_config override that should take precedence
         stages = collector_def.get("stages", {})
         for stage_name, stage_config in stages.items():
@@ -65,27 +120,17 @@ def get_collector_timeout(
                         params = hook["params"]
                         timeout_config_key = params.get("timeout_config")
                         if timeout_config_key:
-                            # Check tool config for explicit override (only if set in YAML)
-                            if tool_config and timeout_config_key in tool_config:
-                                timeout_value = tool_config[timeout_config_key]
-                                if (
-                                    timeout_value is not None
-                                    and isinstance(timeout_value, (int, float))
-                                    and timeout_value > 0
-                                ):
-                                    return int(timeout_value)
-
-                            # Check DUT config for explicit override (only if set in YAML)
-                            if dut_config and timeout_config_key in dut_config:
-                                timeout_value = dut_config[timeout_config_key]
-                                if (
-                                    isinstance(timeout_value, (int, float))
-                                    and timeout_value > 0
-                                ):
-                                    return int(timeout_value)
+                            timeout_value = _resolve_timeout_config_value(
+                                timeout_config_key,
+                                dut_config,
+                                tool_config,
+                                collector_timeout_int,
+                            )
+                            if timeout_value is not None:
+                                return timeout_value
 
         # No explicit override found, use collector's timeout
-        return int(collector_timeout)
+        return collector_timeout_int
 
     # Fallback: Check for timeout_config if collector doesn't have its own timeout
     stages = collector_def.get("stages", {})
@@ -96,24 +141,13 @@ def get_collector_timeout(
                     params = hook["params"]
                     timeout_config_key = params.get("timeout_config")
                     if timeout_config_key:
-                        # Check tool config for explicit override
-                        if tool_config and timeout_config_key in tool_config:
-                            timeout_value = tool_config[timeout_config_key]
-                            if (
-                                timeout_value is not None
-                                and isinstance(timeout_value, (int, float))
-                                and timeout_value > 0
-                            ):
-                                return int(timeout_value)
-
-                        # Check DUT config for explicit override
-                        if dut_config and timeout_config_key in dut_config:
-                            timeout_value = dut_config[timeout_config_key]
-                            if (
-                                isinstance(timeout_value, (int, float))
-                                and timeout_value > 0
-                            ):
-                                return int(timeout_value)
+                        timeout_value = _resolve_timeout_config_value(
+                            timeout_config_key,
+                            dut_config,
+                            tool_config,
+                        )
+                        if timeout_value is not None:
+                            return timeout_value
 
     return default_timeout
 
@@ -210,7 +244,7 @@ def get_nvos_tech_dump_timeout(
     collector_id: str,
     collector_def: Dict[str, Any],
     dut_config: Dict[str, Any],
-    default_timeout: int = 450,
+    default_timeout: int = 600,
 ) -> int:
     """
     Get the NVOS tech dump timeout for H14 collector.

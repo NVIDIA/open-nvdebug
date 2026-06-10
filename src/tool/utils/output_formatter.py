@@ -360,12 +360,18 @@ class OutputFormatter:
                     status_text = Text("PARTIAL", style="yellow")
                 elif status == "skipped":
                     status_text = Text("SKIPPED", style="dim")
+                    # Store skip details with status for color coding
+                    failure_details.append((dut_id, group.title(), message, "skip"))
                 elif status == "notran":
                     status_text = Text("NOT RAN", style="dim")
                 elif status == "fail":
                     status_text = Text("FAIL", style="red")
-                    # Store failure details
-                    failure_details.append((dut_id, group.title(), message))
+                    # Store failure details with status for color coding
+                    failure_details.append((dut_id, group.title(), message, "fail"))
+                elif status == "skip":
+                    status_text = Text("SKIP", style="yellow")
+                    # Store skip details with status for color coding
+                    failure_details.append((dut_id, group.title(), message, "skip"))
                 else:
                     status_text = Text("? UNK", style="yellow")
 
@@ -376,17 +382,24 @@ class OutputFormatter:
         # Print matrix table to console
         self.console.print(matrix_table)
 
-        # Create failure details table if there are any failures
+        # Create failure/skip details table if there are any failures or skips
         if failure_details:
             self.console.print("")  # Add spacing
 
-            failure_table = Table(title="Preflight Failure Details")
+            failure_table = Table(title="Preflight Failure/Skip Details")
             failure_table.add_column("DUT", style="cyan", width=20)
             failure_table.add_column("Service", style="cyan", width=12)
-            failure_table.add_column("Failure Reason", style="red")
+            failure_table.add_column("Failure/Skip Reason")
 
-            for dut_id, service, reason in failure_details:
-                failure_table.add_row(dut_id, service, reason)
+            from rich.text import Text
+
+            for dut_id, service, reason, status in failure_details:
+                # Color code the reason based on status
+                if status == "skip":
+                    reason_text = Text(reason, style="yellow")
+                else:  # fail
+                    reason_text = Text(reason, style="red")
+                failure_table.add_row(dut_id, service, reason_text)
 
             self.console.print(failure_table)
 

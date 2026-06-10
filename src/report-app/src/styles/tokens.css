@@ -1,0 +1,337 @@
+/* ============================================
+   NVIDIA NVDebug Report — Design System Tokens
+   Kaizen-Aligned · Modern Glass UI
+   ============================================ */
+
+/* ── Spacing Scale (Kaizen: 2/4/6/8/12/16/24/32/48/64) ── */
+:root {
+  --nv-space-0: 2px;
+  --nv-space-1: 4px;
+  --nv-space-1h: 6px;
+  --nv-space-2: 8px;
+  --nv-space-3: 12px;
+  --nv-space-4: 16px;
+  --nv-space-5: 20px;
+  --nv-space-6: 24px;
+  --nv-space-8: 32px;
+  --nv-space-10: 40px;
+  --nv-space-12: 48px;
+  --nv-space-16: 64px;
+}
+
+/* ── Typography Scale (Kaizen: 10/12/14/16/20/24/32/48) ── */
+:root {
+  --nv-font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  --nv-font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+
+  --nv-text-xs: 0.625rem;      /* 10px — Kaizen xs */
+  --nv-text-sm: 0.75rem;       /* 12px — Kaizen sm */
+  --nv-text-base: 0.875rem;    /* 14px — Kaizen ms (base) */
+  --nv-text-md: 0.875rem;      /* 14px — alias */
+  --nv-text-lg: 1rem;          /* 16px — Kaizen md */
+  --nv-text-xl: 1.25rem;       /* 20px — Kaizen ml */
+  --nv-text-2xl: 1.5rem;       /* 24px — Kaizen lg */
+  --nv-text-3xl: 2rem;         /* 32px — Kaizen xl */
+  --nv-text-4xl: 3rem;         /* 48px — Kaizen xxl */
+
+  /* Kaizen line-heights */
+  --nv-leading-caps: 0.9;
+  --nv-leading-text: 1.0;
+  --nv-leading-heading: 1.2;
+  --nv-leading-tight: 1.25;
+  --nv-leading-normal: 1.5;
+  --nv-leading-body: 1.5;
+  --nv-leading-relaxed: 1.625;
+
+  /* Kaizen weights: Light=300, Regular=400, Medium=500, Bold=700 */
+  --nv-weight-light: 300;
+  --nv-weight-normal: 400;
+  --nv-weight-medium: 500;
+  --nv-weight-semibold: 600;
+  --nv-weight-bold: 700;
+
+  /* Kaizen letter-spacing */
+  --nv-tracking-tight: -0.015rem;
+  --nv-tracking-normal: 0rem;
+  --nv-tracking-wide: 0.05rem;
+}
+
+/* ── Border Radius (keeping modern rounded — not Kaizen's sharp) ── */
+:root {
+  --nv-radius-xs: 2px;
+  --nv-radius-sm: 4px;
+  --nv-radius-md: 6px;
+  --nv-radius-lg: 8px;
+  --nv-radius-xl: 12px;
+  --nv-radius-2xl: 16px;
+  --nv-radius-full: 9999px;
+}
+
+/* ── Transitions ── */
+:root {
+  --nv-ease: cubic-bezier(0.4, 0, 0.2, 1);
+  --nv-ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --nv-ease-out: cubic-bezier(0, 0, 0.2, 1);
+  --nv-ease-in: cubic-bezier(0.4, 0, 1, 1);
+  --nv-duration-fast: 100ms;
+  --nv-duration-base: 150ms;
+  --nv-duration-slow: 300ms;
+  --nv-duration-slower: 500ms;
+  --nv-transition-colors: color var(--nv-duration-base) var(--nv-ease),
+                           background-color var(--nv-duration-base) var(--nv-ease),
+                           border-color var(--nv-duration-base) var(--nv-ease);
+  --nv-transition-all: all var(--nv-duration-base) var(--nv-ease);
+  --nv-transition-transform: transform var(--nv-duration-base) var(--nv-ease-spring);
+}
+
+/* ── Z-Index Scale ── */
+:root {
+  --nv-z-dropdown: 100;
+  --nv-z-sticky: 200;
+  --nv-z-overlay: 500;
+  --nv-z-modal: 1000;
+  --nv-z-tooltip: 1100;
+  --nv-z-toast: 1500;
+  --nv-z-command: 2000;
+  --nv-z-loader: 9000;
+}
+
+/* ══════════════════════════════════════════════
+   DARK THEME (Default)
+   Kaizen neutral palette: n000–n1000
+   ══════════════════════════════════════════════ */
+:root,
+:root[data-theme="dark"] {
+  /* ── Surface Colors (Kaizen neutrals) ── */
+  --nv-bg-primary: #202020;      /* n900 — displayBgMid */
+  --nv-bg-secondary: #121212;    /* n950 — displayBgLow */
+  --nv-bg-tertiary: #292929;     /* n800 — displayBgHigh */
+  --nv-bg-elevated: #343434;     /* n700 — displayBgHigher */
+  --nv-bg-hover: #343434;        /* n700 */
+  --nv-bg-active: #5e5e5e;       /* n600 */
+  --nv-bg-canvas: #202020;       /* displayBgCanvas */
+  --nv-bg-highest: #000000;      /* n1000 — displayBgHighest */
+
+  /* ── Text Colors (Kaizen foreground) ── */
+  --nv-text-primary: #f2f2f2;    /* n050 — displayFgPrimary */
+  --nv-text-secondary: #c6c6c6;  /* n300 — displayFgSecondary */
+  --nv-text-tertiary: #8f8f8f;   /* n400 — displayFgDisabled */
+  --nv-text-disabled: #767676;   /* n500 — displayFgPlaceholder */
+  --nv-text-strong: #ffffff;     /* n000 — displayFgStrong */
+
+  /* ── Border Colors (Kaizen) ── */
+  --nv-border: #343434;          /* displayBorderMid */
+  --nv-border-strong: #5e5e5e;   /* displayBorderHigh */
+  --nv-border-hover: #767676;    /* displayBorderMidHover */
+  --nv-border-subtle: #292929;   /* displayBorderHighestDisabled */
+
+  /* ── NVIDIA Accent (Kaizen brand) ── */
+  --nv-accent: #76B900;          /* brand — actionBgPrimary */
+  --nv-accent-hover: #8fcb2b;    /* g400 — actionBgPrimaryHover */
+  --nv-accent-active: #a7db57;   /* g300 — actionBgPrimaryActive */
+  --nv-accent-muted: rgba(118, 185, 0, 0.15);
+  --nv-accent-subtle: rgba(118, 185, 0, 0.08);
+  --nv-accent-bold: #57920d;     /* g600 — displayBgAccent2Bold */
+
+  /* ── Semantic Colors (Kaizen feedback) ── */
+  --nv-success: #76b900;         /* feedbackFgSuccess — brand green */
+  --nv-success-muted: rgba(118, 185, 0, 0.15);
+  --nv-success-bg: #d6f2ad;      /* feedbackBgSuccess */
+  --nv-error: #dc3528;           /* feedbackFgError */
+  --nv-error-muted: rgba(220, 53, 40, 0.15);
+  --nv-error-bg: #ffdad6;        /* feedbackBgError */
+  --nv-warning: #e7c32b;         /* feedbackBgCautionSolid */
+  --nv-warning-fg: #a96700;      /* feedbackFgCaution */
+  --nv-warning-muted: rgba(231, 195, 43, 0.15);
+  --nv-warning-bg: #f6e383;      /* feedbackBgCaution */
+  --nv-info: #2378ca;            /* feedbackFgInfo */
+  --nv-info-muted: rgba(35, 120, 202, 0.15);
+  --nv-info-bg: #cde6fa;         /* feedbackBgInfo */
+
+  /* ── Shadows (Kaizen dark elevation) ── */
+  --nv-shadow-xs: 0 1px 3px rgba(0, 0, 0, 0.40);
+  --nv-shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.50);
+  --nv-shadow-md: 0 2px 4px rgba(0, 0, 0, 0.47);
+  --nv-shadow-lg: 0 4px 5px rgba(0, 0, 0, 0.30);
+  --nv-shadow-xl: 0 8px 10px rgba(0, 0, 0, 0.40);
+  --nv-shadow-modal: 0 8px 10px rgba(0, 0, 0, 0.50);
+  --nv-shadow-popover: 0 4px 5px rgba(0, 0, 0, 0.30);
+  --nv-shadow-dropdown: 0 4px 5px rgba(0, 0, 0, 0.30);
+
+  /* ── Service Colors (domain-specific, no Kaizen equivalent) ── */
+  --nv-service-redfish: #dc6976;
+  --nv-service-ssh: #ffc107;
+  --nv-service-ipmi: #0dcaf0;
+  --nv-service-health-check: #6f42c1;
+  --nv-service-host: #28a745;
+  --nv-service-bmc: #fd7e14;
+  --nv-service-preflight: #20c997;
+
+  /* ── Status: Skipped ── */
+  --nv-skipped: #f97316;
+  --nv-skipped-muted: rgba(249, 115, 22, 0.15);
+
+  /* ── Chart Palette (Kaizen accent colors adapted) ── */
+  --nv-chart-blue: #9accf2;      /* Kaizen displayFgAccent1 */
+  --nv-chart-blue-light: #badef8;
+  --nv-chart-green: #a7db57;     /* Kaizen displayFgAccent2 */
+  --nv-chart-green-light: #bfe882;
+  --nv-chart-amber: #e7c32b;     /* Kaizen displayFgAccent3 */
+  --nv-chart-red: #feb3ad;       /* Kaizen displayFgAccent4 */
+  --nv-chart-purple: #debae8;    /* Kaizen displayFgAccent5 */
+  --nv-chart-purple-light: #ead1f3;
+  --nv-chart-teal: #7cd7c7;      /* Kaizen displayFgAccent6 */
+  --nv-chart-slate: #d8d8d8;     /* Kaizen displayFgAccent7 */
+  --nv-chart-gray: #8f8f8f;
+
+  /* ── Legacy compat ── */
+  --nv-shadow: var(--nv-shadow-sm);
+  --nv-surface-elevated: var(--nv-bg-elevated);
+  --nv-font-size-base: var(--nv-text-md);
+
+  /* ── Overlay ── */
+  --nv-overlay: rgba(0, 0, 0, 0.60);
+
+  /* ── Glass / Frosted Panels (modern, not in Kaizen) ── */
+  --nv-glass-bg: rgba(18, 18, 18, 0.60);
+  --nv-glass-bg-dense: rgba(18, 18, 18, 0.82);
+  --nv-glass-bg-light: rgba(32, 32, 32, 0.50);
+  --nv-glass-blur: blur(16px);
+  --nv-glass-blur-heavy: blur(24px);
+  --nv-glass-border: rgba(255, 255, 255, 0.08);
+  --nv-glass-border-highlight: rgba(255, 255, 255, 0.14);
+  --nv-glass-border-accent: rgba(118, 185, 0, 0.20);
+  --nv-glass-shadow: 0 8px 32px rgba(0, 0, 0, 0.40), 0 2px 8px rgba(0, 0, 0, 0.20);
+  --nv-glass-shadow-elevated: 0 16px 48px rgba(0, 0, 0, 0.55), 0 4px 16px rgba(0, 0, 0, 0.30);
+  --nv-glass-inset-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  --nv-glass-accent-gradient: linear-gradient(135deg, rgba(118, 185, 0, 0.06) 0%, rgba(18, 18, 18, 0.60) 100%);
+
+  /* ── App Background ── */
+  --nv-app-bg: #0a0a0a;
+  --nv-app-bg-gradient: radial-gradient(ellipse at 15% 50%, rgba(118, 185, 0, 0.05) 0%, transparent 50%),
+                         radial-gradient(ellipse at 85% 20%, rgba(35, 120, 202, 0.03) 0%, transparent 50%),
+                         radial-gradient(ellipse at 50% 90%, rgba(118, 185, 0, 0.02) 0%, transparent 40%);
+
+  /* ── Scrollbar ── */
+  --nv-scrollbar-track: rgba(0, 0, 0, 0.2);
+  --nv-scrollbar-thumb: rgba(255, 255, 255, 0.10);
+  --nv-scrollbar-thumb-hover: rgba(255, 255, 255, 0.18);
+}
+
+/* ══════════════════════════════════════════════
+   LIGHT THEME (Kaizen Light)
+   ══════════════════════════════════════════════ */
+:root[data-theme="light"] {
+  /* ── Surface Colors (Kaizen light) ── */
+  --nv-bg-primary: #ffffff;      /* displayBgHighest */
+  --nv-bg-secondary: #fafafa;    /* n025 — displayBgCanvas */
+  --nv-bg-tertiary: #f2f2f2;     /* n050 — displayBgLow */
+  --nv-bg-elevated: #ffffff;     /* displayBgHigh */
+  --nv-bg-hover: #f2f2f2;        /* displayBgLowHover → n050 */
+  --nv-bg-active: #e2e2e2;       /* n100 — displayBgMidActive */
+  --nv-bg-canvas: #fafafa;       /* n025 */
+  --nv-bg-highest: #ffffff;      /* displayBgHighest */
+
+  /* ── Text Colors (Kaizen light) ── */
+  --nv-text-primary: #202020;    /* n900 — displayFgPrimary */
+  --nv-text-secondary: #5e5e5e;  /* n600 — displayFgSecondary */
+  --nv-text-tertiary: #767676;   /* n500 — displayFgDisabled */
+  --nv-text-disabled: #8f8f8f;   /* n400 — displayFgPlaceholder */
+  --nv-text-strong: #000000;     /* n1000 — displayFgStrong */
+
+  /* ── Border Colors (Kaizen light) ── */
+  --nv-border: #d8d8d8;          /* displayBorderHighest */
+  --nv-border-strong: #c6c6c6;   /* displayBorderStatic */
+  --nv-border-hover: #8f8f8f;    /* displayBorderHighestHover */
+  --nv-border-subtle: #e2e2e2;   /* displayBorderHighestDisabled */
+
+  /* ── NVIDIA Accent (Kaizen: brand green in both themes) ── */
+  --nv-accent: #76b900;          /* brand — stays same in light */
+  --nv-accent-hover: #8fcb2b;    /* g400 */
+  --nv-accent-active: #a7db57;   /* g300 */
+  --nv-accent-muted: rgba(118, 185, 0, 0.12);
+  --nv-accent-subtle: rgba(118, 185, 0, 0.06);
+  --nv-accent-bold: #57920d;     /* g600 */
+
+  /* ── Semantic Colors (Kaizen feedback light) ── */
+  --nv-success: #76b900;         /* feedbackFgSuccess */
+  --nv-success-muted: rgba(118, 185, 0, 0.10);
+  --nv-success-bg: #ecfad9;      /* feedbackBgSuccess light */
+  --nv-error: #dc3528;           /* feedbackFgError */
+  --nv-error-muted: rgba(220, 53, 40, 0.10);
+  --nv-error-bg: #ffefed;        /* feedbackBgError light */
+  --nv-warning: #e7c32b;         /* feedbackBgCautionSolid */
+  --nv-warning-fg: #a96700;      /* feedbackFgCaution */
+  --nv-warning-muted: rgba(169, 103, 0, 0.10);
+  --nv-warning-bg: #f9f4ca;      /* feedbackBgCaution light */
+  --nv-info: #2378ca;            /* feedbackFgInfo */
+  --nv-info-muted: rgba(35, 120, 202, 0.10);
+  --nv-info-bg: #e9f4fb;         /* feedbackBgInfo light */
+
+  /* ── Shadows (Kaizen light elevation) ── */
+  --nv-shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.04);
+  --nv-shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.06), 0 1px 2px rgba(0, 0, 0, 0.04);
+  --nv-shadow-md: 0 2px 3px rgba(0, 0, 0, 0.04);
+  --nv-shadow-lg: 0 4px 5px rgba(0, 0, 0, 0.03);
+  --nv-shadow-xl: 0 8px 10px rgba(0, 0, 0, 0.04);
+  --nv-shadow-modal: 0 8px 10px rgba(0, 0, 0, 0.04);
+  --nv-shadow-popover: 0 4px 5px rgba(0, 0, 0, 0.03);
+  --nv-shadow-dropdown: 0 4px 5px rgba(0, 0, 0, 0.03);
+
+  /* ── Service Colors (darker for light backgrounds) ── */
+  --nv-service-redfish: #c0525f;
+  --nv-service-ssh: #d4a007;
+  --nv-service-ipmi: #0ba8c8;
+  --nv-service-health-check: #5a35a0;
+  --nv-service-host: #1e8038;
+  --nv-service-bmc: #d96a10;
+  --nv-service-preflight: #1aad80;
+
+  --nv-skipped: #ea580c;
+  --nv-skipped-muted: rgba(234, 88, 12, 0.1);
+
+  /* ── Chart Palette (Kaizen accents for light) ── */
+  --nv-chart-blue: #2a63ba;      /* displayFgAccent1 light */
+  --nv-chart-blue-light: #3a96d9;
+  --nv-chart-green: #57920d;     /* displayFgAccent2 light */
+  --nv-chart-green-light: #76b900;
+  --nv-chart-amber: #924c00;     /* displayFgAccent3 light */
+  --nv-chart-red: #b6251b;       /* displayFgAccent4 light */
+  --nv-chart-purple: #8c3ca0;    /* displayFgAccent5 light */
+  --nv-chart-purple-light: #a05ab4;
+  --nv-chart-teal: #006b5e;      /* displayFgAccent6 light */
+  --nv-chart-slate: #343434;     /* displayFgAccent7 light */
+  --nv-chart-gray: #5e5e5e;
+
+  /* ── Legacy compat ── */
+  --nv-shadow: var(--nv-shadow-sm);
+  --nv-surface-elevated: var(--nv-bg-elevated);
+  --nv-font-size-base: var(--nv-text-md);
+
+  /* ── Overlay ── */
+  --nv-overlay: rgba(0, 0, 0, 0.4);
+
+  /* ── Glass / Frosted Panels (Light) ── */
+  --nv-glass-bg: rgba(255, 255, 255, 0.88);
+  --nv-glass-bg-dense: rgba(255, 255, 255, 0.95);
+  --nv-glass-bg-light: rgba(255, 255, 255, 0.78);
+  --nv-glass-blur: blur(16px);
+  --nv-glass-blur-heavy: blur(24px);
+  --nv-glass-border: rgba(0, 0, 0, 0.08);
+  --nv-glass-border-highlight: rgba(0, 0, 0, 0.14);
+  --nv-glass-border-accent: rgba(118, 185, 0, 0.22);
+  --nv-glass-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+  --nv-glass-shadow-elevated: 0 8px 24px rgba(0, 0, 0, 0.10);
+  --nv-glass-inset-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.80);
+  --nv-glass-accent-gradient: linear-gradient(135deg, rgba(118, 185, 0, 0.06) 0%, rgba(255, 255, 255, 0.88) 100%);
+
+  /* ── App Background ── */
+  --nv-app-bg: #eeeef0;
+  --nv-app-bg-gradient: radial-gradient(ellipse at 15% 50%, rgba(118, 185, 0, 0.03) 0%, transparent 50%),
+                         radial-gradient(ellipse at 85% 20%, rgba(35, 120, 202, 0.02) 0%, transparent 50%);
+
+  /* ── Scrollbar ── */
+  --nv-scrollbar-track: rgba(0, 0, 0, 0.04);
+  --nv-scrollbar-thumb: rgba(0, 0, 0, 0.18);
+  --nv-scrollbar-thumb-hover: rgba(0, 0, 0, 0.30);
+}

@@ -20,13 +20,11 @@ Generates comprehensive multi-level HTML reports from structured log directories
 with collector metadata, execution times, and interactive navigation.
 """
 
-import asyncio
 import json
-import logging
 import os
 import re
 import shutil
-from datetime import datetime
+from collections import defaultdict
 from html import escape
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -73,6 +71,20 @@ class HTMLReportService:
             r"\.yaml$",
             r"\.yml$",
         ]
+        # Maximum file size for parsing (50 MB) - larger files will be download-only
+        self.max_parseable_file_size = 50 * 1024 * 1024  # 50 MB in bytes
+
+    @staticmethod
+    def _json_for_script(value: Any, **kwargs) -> str:
+        """Serialize JSON safely for direct embedding inside script tags."""
+        return (
+            json.dumps(value, **kwargs)
+            .replace("&", "\\u0026")
+            .replace("<", "\\u003c")
+            .replace(">", "\\u003e")
+            .replace("\u2028", "\\u2028")
+            .replace("\u2029", "\\u2029")
+        )
 
     @classmethod
     async def create(
@@ -246,13 +258,13 @@ class HTMLReportService:
         if self.report_dir.exists() and self.report_dir.is_dir():
             try:
                 shutil.rmtree(self.report_dir)
-            except Exception as e:
+            except Exception:
                 raise
 
         # Recreate the reports directory
         try:
             self.report_dir.mkdir(exist_ok=True)
-        except FileNotFoundError as e:
+        except FileNotFoundError:
             raise
 
         self.json_collapsible = json_collapsible
@@ -519,6 +531,19 @@ class HTMLReportService:
         Returns:
             str: HTML string that shows either all links inline or partial links with "Show remaining" button.
         """
+        # De-duplicate identical rendered link strings while preserving order.
+        # This prevents repeated links in the Execution Summary "Log Paths" column
+        # when the same output file is recorded multiple times upstream.
+        if link_objs:
+            seen = set()
+            deduped: List[str] = []
+            for item in link_objs:
+                if item in seen:
+                    continue
+                seen.add(item)
+                deduped.append(item)
+            link_objs = sorted(deduped)
+
         total_links = len(link_objs)
         if total_links <= threshold:
             return "<br>".join(link_objs) if link_objs else "N/A"
@@ -673,7 +698,7 @@ class HTMLReportService:
         elif s == "notran":
             return "status-notran"
         # Handle current status format
-        elif s == "complete":
+        elif s in ("success", "complete"):
             return "status-complete"
         elif s == "error":
             return "status-error"
@@ -734,7 +759,7 @@ class HTMLReportService:
             <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
             <style>
                 /* Base styles with modern polish */
-                body {{ 
+                body {{
                     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
                     margin: 0;
                     padding: 0 1rem;
@@ -742,7 +767,7 @@ class HTMLReportService:
                     background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
                     min-height: 100vh;
                 }}
-                
+
                 /* Container with card style */
                 .container {{
                     background: white;
@@ -754,29 +779,29 @@ class HTMLReportService:
                     margin-left: auto !important;
                     margin-right: auto !important;
                 }}
-                
+
                 .navbar-fixed-top {{
                     position: fixed;
-                    top: 0; 
-                    left: 0; 
+                    top: 0;
+                    left: 0;
                     right: 0;
                     z-index: 1030;
                     box-shadow: 0 2px 4px rgba(0,0,0,0.1);
                 }}
-                
+
                 /* Enhanced table styling */
-                table {{ 
+                table {{
                     border-collapse: collapse;
                     width: 100%;
                     margin-bottom: 20px;
                     background: white;
                 }}
-                th, td {{ 
+                th, td {{
                     border: 1px solid #e0e0e0;
                     padding: 12px;
                     text-align: left;
                 }}
-                th {{ 
+                th {{
                     font-weight: 600;
                 }}
                 thead:not(.table-dark) th {{
@@ -796,13 +821,13 @@ class HTMLReportService:
                 }}
                 tbody tr:hover {{ background-color: #f8f9fa; }}
                 .table-dark tbody tr:hover {{ background-color: rgba(255, 255, 255, 0.075); }}
-                a {{ 
+                a {{
                     text-decoration: none;
                     color: #0066cc;
                     transition: color 0.2s ease;
                 }}
                 a:hover {{ color: #0052a3; }}
-                
+
                 /* Status badges with modern colors */
                 .status-complete {{ background-color: #d4edda !important; color: #155724 !important; }}
                 .status-error {{ background-color: #f8d7da !important; color: #721c24 !important; }}
@@ -810,7 +835,7 @@ class HTMLReportService:
                 .status-skipped {{ background-color: #ffc107 !important; color: #212529 !important; }}
                 .status-na {{ background-color: #e9ecef !important; color: #6c757d !important; }}
                 .status-notran {{ background-color: #e9ecef !important; color: #6c757d !important; }}
-                
+
                 /* Cards and sections */
                 .card {{
                     border: none;
@@ -826,16 +851,16 @@ class HTMLReportService:
                 .card.bg-primary, .card.bg-success, .card.bg-danger, .card.bg-info, .card.bg-warning {{
                     height: 100%;
                 }}
-                .card.bg-primary .card-body, 
-                .card.bg-success .card-body, 
-                .card.bg-danger .card-body, 
-                .card.bg-info .card-body, 
+                .card.bg-primary .card-body,
+                .card.bg-success .card-body,
+                .card.bg-danger .card-body,
+                .card.bg-info .card-body,
                 .card.bg-warning .card-body {{
                     display: flex;
                     flex-direction: column;
                     height: 100%;
                 }}
-                
+
                 .section {{
                     background: white;
                     border-radius: 8px;
@@ -843,7 +868,7 @@ class HTMLReportService:
                     margin-bottom: 1.5rem;
                     box-shadow: 0 2px 4px rgba(0,0,0,0.06);
                 }}
-                
+
                 /* Enhanced buttons */
                 .btn {{
                     border-radius: 6px;
@@ -854,15 +879,15 @@ class HTMLReportService:
                     transform: translateY(-1px);
                     box-shadow: 0 4px 8px rgba(0,0,0,0.15);
                 }}
-                
+
                 /* Breadcrumb */
-                .breadcrumb {{ 
+                .breadcrumb {{
                     background: #f8f9fa;
                     padding: 0.75rem;
                     border-radius: 6px;
                     margin-bottom: 1rem;
                 }}
-                
+
                 /* Accordion */
                 .accordion {{
                     background-color: #f8f9fa;
@@ -887,53 +912,53 @@ class HTMLReportService:
                     max-height: 600px;
                     border-radius: 0 0 6px 6px;
                 }}
-                
+
                 /* Tree view */
                 ul {{ list-style-type: none; }}
-                li.folder > span {{ 
+                li.folder > span {{
                     font-weight: bold;
                     cursor: pointer;
                     color: #0066cc;
                 }}
                 #treeview ul {{ margin-left: 20px; }}
-                
-                .highlight {{ 
+
+                .highlight {{
                     background-color: #fff3cd;
                     padding: 2px 4px;
                     border-radius: 3px;
                 }}
-                
+
                 .nv-logo {{
                     display: inline-flex;
                     height: 25px;
                     padding-right: 20px;
                 }}
-                
-                .table-shadow {{ 
+
+                .table-shadow {{
                     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
                     border-radius: 8px;
                     overflow: hidden;
                 }}
-                
+
                 /* Progress bars */
                 .progress {{
                     border-radius: 8px;
                     overflow: hidden;
                 }}
-                
+
                 /* Headings */
                 h1, h2, h3, h4, h5, h6 {{
                     color: #2c3e50;
                     font-weight: 600;
                 }}
-                
+
                 /* Badge improvements */
                 .badge {{
                     padding: 0.35em 0.65em;
                     border-radius: 6px;
                     font-weight: 500;
                 }}
-                
+
                 /* Service color scheme - consistent across all reports */
                 .service-redfish,
                 span.badge.service-redfish,
@@ -977,7 +1002,7 @@ class HTMLReportService:
                     color: #495057 !important;
                     border: 1px solid #dee2e6 !important;
                 }}
-                
+
                 /* Service badges (inline display) */
                 .service-badge {{
                     display: inline-block !important;
@@ -987,7 +1012,7 @@ class HTMLReportService:
                     font-weight: 600 !important;
                     margin-right: 8px !important;
                 }}
-                
+
                 /* Gradient cards for summary boxes */
                 .card.bg-primary {{
                     background: linear-gradient(135deg, #667eea 0%, #764ba2 100%) !important;
@@ -1004,7 +1029,7 @@ class HTMLReportService:
                 .card.bg-warning {{
                     background: linear-gradient(135deg, #f2994a 0%, #f2c94c 100%) !important;
                 }}
-                
+
                 /* Chart containers */
                 .chart-container {{
                     background: white;
@@ -1013,7 +1038,7 @@ class HTMLReportService:
                     box-shadow: none !important;
                     margin-bottom: 20px;
                 }}
-                
+
                 /* Sortable table headers */
                 th.sortable {{
                     cursor: pointer;
@@ -1111,19 +1136,19 @@ class HTMLReportService:
                         stdoutGlobalSearch(value);
                     }}
                 }}
-                
+
                 // Universal table sorting with unique state per table
                 var tableSortStates = {{}};
-                
+
                 function makeTableSortable(tableId) {{
                     var table = document.getElementById(tableId);
                     if (!table) return;
-                    
+
                     // Initialize sort state for this table
                     tableSortStates[tableId] = {{}};
-                    
+
                     var headers = table.getElementsByTagName('th');
-                    
+
                     for (var i = 0; i < headers.length; i++) {{
                         (function(index, tId) {{
                             headers[index].classList.add('sortable');
@@ -1133,43 +1158,43 @@ class HTMLReportService:
                         }})(i, tableId);
                     }}
                 }}
-                
+
                 function sortTableByColumn(tableId, columnIndex) {{
                     var table = document.getElementById(tableId);
                     if (!table) return;
-                    
+
                     var tbody = table.getElementsByTagName('tbody')[0];
                     if (!tbody) return;
-                    
+
                     var rows = Array.from(tbody.getElementsByTagName('tr'));
                     if (rows.length === 0) return;
-                    
+
                     // Toggle sort direction
                     var sortStates = tableSortStates[tableId];
                     sortStates[columnIndex] = !sortStates[columnIndex];
                     var isAscending = sortStates[columnIndex];
-                    
+
                     rows.sort(function(a, b) {{
                         var aCell = a.getElementsByTagName('td')[columnIndex];
                         var bCell = b.getElementsByTagName('td')[columnIndex];
                         if (!aCell || !bCell) return 0;
-                        
+
                         var aValue = aCell.textContent.trim();
                         var bValue = bCell.textContent.trim();
-                        
-                        // Try numeric comparison first
-                        var aNum = parseFloat(aValue.replace(/[^0-9.-]/g, ''));
-                        var bNum = parseFloat(bValue.replace(/[^0-9.-]/g, ''));
+
+                        // Prefer data-sort attribute for unit-aware numeric sorting
+                        var aNum = aCell.hasAttribute('data-sort') ? parseFloat(aCell.getAttribute('data-sort')) : parseFloat(aValue.replace(/[^0-9.-]/g, ''));
+                        var bNum = bCell.hasAttribute('data-sort') ? parseFloat(bCell.getAttribute('data-sort')) : parseFloat(bValue.replace(/[^0-9.-]/g, ''));
                         if (!isNaN(aNum) && !isNaN(bNum)) {{
                             return isAscending ? aNum - bNum : bNum - aNum;
                         }}
-                        
+
                         // Fall back to string comparison
                         if (aValue < bValue) return isAscending ? -1 : 1;
                         if (aValue > bValue) return isAscending ? 1 : -1;
                         return 0;
                     }});
-                    
+
                     tbody.innerHTML = '';
                     rows.forEach(function(row) {{ tbody.appendChild(row); }});
                 }}
@@ -1180,7 +1205,7 @@ class HTMLReportService:
                     modalElements.forEach(function(modalElement) {{
                         new bootstrap.Modal(modalElement);
                     }});
-                    
+
                     // Make all tables with class 'table' sortable
                     const allTables = document.querySelectorAll('table.table');
                     allTables.forEach(function(table) {{
@@ -1192,15 +1217,15 @@ class HTMLReportService:
                             makeTableSortable(table.id);
                         }}
                     }});
-                    
+
                     /*/
-                    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches; 
-                        document.documentElement.setAttribute('data-bs-theme', prefersDark ? 'dark' : 'light'); 
-                        themeToggle.checked = prefersDark; 
-                        themeToggle.addEventListener('change', function() {{ 
-                            document.documentElement.setAttribute('data-bs-theme', this.checked ? 'dark' : 'light'); 
+                    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+                        document.documentElement.setAttribute('data-bs-theme', prefersDark ? 'dark' : 'light');
+                        themeToggle.checked = prefersDark;
+                        themeToggle.addEventListener('change', function() {{
+                            document.documentElement.setAttribute('data-bs-theme', this.checked ? 'dark' : 'light');
                     }});
-                    /**/ 
+                    /**/
 
                     var acc = document.getElementsByClassName("accordion");
                     for (var i = 0; i < acc.length; i++) {{
@@ -1352,6 +1377,7 @@ class HTMLReportService:
                     "preflight",
                     "collection_status",  # Skip collection_status.json - it's not a collector group
                     "metadata",  # Skip metadata.json - it's general node metadata
+                    "timing",  # Skip timing.json - it's timing metadata, not a collector group
                 ]:
                     continue
                 if group_name not in self.node_collector_json[node_name]:
@@ -1361,37 +1387,13 @@ class HTMLReportService:
                     with meta_json.open("r", encoding="utf-8") as f:
                         data = json.load(f)
                     collectors_data = data.get("collectors", {})
-                    await self._log(
-                        "DEBUG",
-                        f"Processing {group_name} metadata, found collectors: {list(collectors_data.keys())}",
-                    )
-                    await self._log(
-                        "DEBUG",
-                        f"File: {meta_json}, Data keys: {list(data.keys())}, Collectors count: {len(collectors_data)}",
-                    )
                     for collector_id, cinfo in collectors_data.items():
-                        await self._log(
-                            "DEBUG",
-                            f"Processing collector {collector_id} with data: {cinfo}",
-                        )
                         raw_time = cinfo.get("execution_time", 0.0)
-                        await self._log(
-                            "DEBUG",
-                            f"Collector {collector_id} raw_time: {raw_time} (type: {type(raw_time)})",
-                        )
                         # Handle both string and numeric execution times
                         if isinstance(raw_time, (int, float)):
                             exec_seconds = float(raw_time)
-                            await self._log(
-                                "DEBUG",
-                                f"Parsed {collector_id} execution_time as float: {exec_seconds}",
-                            )
                         else:
                             exec_seconds = self._parse_human_time_to_seconds(raw_time)
-                            await self._log(
-                                "DEBUG",
-                                f"Parsed {collector_id} execution_time from string: {exec_seconds}",
-                            )
                         status_val = cinfo.get("status", "NotRan")
                         reason_val = cinfo.get("reason", "")
                         files_val = cinfo.get("files", [])
@@ -1407,10 +1409,6 @@ class HTMLReportService:
                         self.node_collector_json[node_name][group_name][
                             collector_id
                         ] = collector_data
-                        await self._log(
-                            "DEBUG",
-                            f"Stored {collector_id} data: {collector_data}",
-                        )
                 except Exception as ex:
                     await self._log(
                         "ERROR",
@@ -1453,28 +1451,12 @@ class HTMLReportService:
                         ):
                             continue
 
-                        await self._log(
-                            "DEBUG",
-                            f"Processing collector {collector_id} with data: {cinfo}",
-                        )
                         raw_time = cinfo.get("execution_time", 0.0)
-                        await self._log(
-                            "DEBUG",
-                            f"Collector {collector_id} raw_time: {raw_time} (type: {type(raw_time)})",
-                        )
                         # Handle both string and numeric execution times
                         if isinstance(raw_time, (int, float)):
                             exec_seconds = float(raw_time)
-                            await self._log(
-                                "DEBUG",
-                                f"Parsed {collector_id} execution_time as float: {exec_seconds}",
-                            )
                         else:
                             exec_seconds = self._parse_human_time_to_seconds(raw_time)
-                            await self._log(
-                                "DEBUG",
-                                f"Parsed {collector_id} execution_time from string: {exec_seconds}",
-                            )
                         status_val = cinfo.get("status", "NotRan")
                         reason_val = cinfo.get("reason", "")
                         files_val = cinfo.get("files", [])
@@ -1490,10 +1472,6 @@ class HTMLReportService:
                         self.node_collector_json[node_name][group_name][
                             collector_id
                         ] = collector_data
-                        await self._log(
-                            "DEBUG",
-                            f"Stored {collector_id} data: {collector_data}",
-                        )
                 except Exception as ex:
                     await self._log(
                         "ERROR",
@@ -1523,23 +1501,15 @@ class HTMLReportService:
                 )
                 return False
 
-            await self._log(
-                "DEBUG",
-                f"Scanning directory contents: {list(self.root_dir.iterdir())}",
-            )
             for node in self.root_dir.iterdir():
-                await self._log(
-                    "DEBUG",
-                    f"Checking node: {node} (is_dir: {node.is_dir()}, name: {node.name})",
-                )
                 if node.is_dir() and node.name not in excluded_dirs:
-                    await self._log("DEBUG", f"Processing node: {node}")
                     await self._parse_collector_json_metadata(node)
                     node_report = await self._generate_node_report(node)
                     if node_report:
                         node_reports.append(node_report)
 
             await self._generate_global_file_map()
+            await self._generate_timing_analysis_page()
             await self._generate_top_level_report(node_reports)
             await self._log("INFO", f"HTML reports generated in {self.report_dir}")
             return True
@@ -1822,6 +1792,24 @@ class HTMLReportService:
         results = []
         node_name = node_path.name  # Get the node name from the path
 
+        # Skip strings that are clearly not file paths (e.g., error reason messages)
+        # These are typically long messages containing colons and spaces, or starting with "Collector"
+        if not path_str:
+            return results
+        # Skip if path would be too long for filesystem (typically 255 chars for filename, 4096 for full path)
+        if len(path_str) > 255:
+            # This is likely an error message, not a file path - display it as text
+            results.append(
+                f"<span class='text-muted'>{escape(path_str[:200])}...</span>"
+            )
+            return results
+        # Skip reason messages that start with common error prefixes
+        if path_str.startswith("Collector not executed") or path_str.startswith(
+            "Error:"
+        ):
+            results.append(f"<span class='text-muted'>{escape(path_str)}</span>")
+            return results
+
         # Check for placeholder pattern (e.g., "{some_dir}")
         if "{" in path_str and "}" in path_str:
             relative_path = Path(path_str.lstrip("/\\"))
@@ -1841,59 +1829,65 @@ class HTMLReportService:
             else:
                 results.append(f"{escape(path_str)} (directory not found)")
         else:
-            abs_path = node_path / path_str.lstrip("/\\")
+            try:
+                abs_path = node_path / path_str.lstrip("/\\")
 
-            # Check if this is a tar.xz file that was auto-parsed and removed
-            if path_str.endswith(".tar.xz") and not abs_path.exists():
-                # Look for extracted directory with same base name
-                base_name = path_str[:-7]  # Remove .tar.xz
-                extracted_dir = node_path / base_name
+                # Check if this is a tar.xz file that was auto-parsed and removed
+                if path_str.endswith(".tar.xz") and not abs_path.exists():
+                    # Look for extracted directory with same base name
+                    base_name = path_str[:-7]  # Remove .tar.xz
+                    extracted_dir = node_path / base_name
 
-                if extracted_dir.exists() and extracted_dir.is_dir():
-                    # List all files in the extracted directory
-                    for subfile in extracted_dir.rglob("*"):
-                        if subfile.is_file():
-                            fv = await self._generate_file_view(subfile)
-                            relp = str(subfile.relative_to(node_path))
-                            # Only prepend node name if viewing from status page
-                            link = (
-                                f"{escape(node_name)}/{escape(fv)}"
-                                if from_status_page
-                                else escape(fv)
-                            )
-                            results.append(f'<a href="{link}">{escape(relp)}</a>')
+                    if extracted_dir.exists() and extracted_dir.is_dir():
+                        # List all files in the extracted directory
+                        for subfile in extracted_dir.rglob("*"):
+                            if subfile.is_file():
+                                fv = await self._generate_file_view(subfile)
+                                relp = str(subfile.relative_to(node_path))
+                                # Only prepend node name if viewing from status page
+                                link = (
+                                    f"{escape(node_name)}/{escape(fv)}"
+                                    if from_status_page
+                                    else escape(fv)
+                                )
+                                results.append(f'<a href="{link}">{escape(relp)}</a>')
 
-                    # If no files found, show the directory itself
-                    if not results:
-                        results.append(f"{escape(base_name)} (extracted directory)")
+                        # If no files found, show the directory itself
+                        if not results:
+                            results.append(f"{escape(base_name)} (extracted directory)")
+                    else:
+                        # Original tar.xz file not found and no extracted directory
+                        results.append(f"{escape(path_str)} (file not found)")
+                elif abs_path.exists():
+                    if abs_path.is_dir():
+                        for subfile in abs_path.rglob("*"):
+                            if subfile.is_file():
+                                fv = await self._generate_file_view(subfile)
+                                relp = str(subfile.relative_to(node_path))
+                                # Only prepend node name if viewing from status page
+                                link = (
+                                    f"{escape(node_name)}/{escape(fv)}"
+                                    if from_status_page
+                                    else escape(fv)
+                                )
+                                results.append(f'<a href="{link}">{escape(relp)}</a>')
+                    else:
+                        fv = await self._generate_file_view(abs_path)
+                        # Only prepend node name if viewing from status page
+                        link = (
+                            f"{escape(node_name)}/{escape(fv)}"
+                            if from_status_page
+                            else escape(fv)
+                        )
+                        results.append(f'<a href="{link}">{escape(path_str)}</a>')
                 else:
-                    # Original tar.xz file not found and no extracted directory
-                    results.append(f"{escape(path_str)} (file not found)")
-            elif abs_path.exists():
-                if abs_path.is_dir():
-                    for subfile in abs_path.rglob("*"):
-                        if subfile.is_file():
-                            fv = await self._generate_file_view(subfile)
-                            relp = str(subfile.relative_to(node_path))
-                            # Only prepend node name if viewing from status page
-                            link = (
-                                f"{escape(node_name)}/{escape(fv)}"
-                                if from_status_page
-                                else escape(fv)
-                            )
-                            results.append(f'<a href="{link}">{escape(relp)}</a>')
-                else:
-                    fv = await self._generate_file_view(abs_path)
-                    # Only prepend node name if viewing from status page
-                    link = (
-                        f"{escape(node_name)}/{escape(fv)}"
-                        if from_status_page
-                        else escape(fv)
-                    )
-                    results.append(f'<a href="{link}">{escape(path_str)}</a>')
-            else:
-                # not found
-                results.append(f"{escape(path_str)}")
+                    # not found
+                    results.append(f"{escape(path_str)}")
+            except OSError:
+                # Path too long or other filesystem error - display as text
+                results.append(
+                    f"<span class='text-muted'>{escape(path_str[:200] + '...' if len(path_str) > 200 else path_str)}</span>"
+                )
         return results
 
     async def _build_left_column_for_node(
@@ -2178,7 +2172,7 @@ class HTMLReportService:
             node_execution_seconds = 0.0
             await self._log(
                 "DEBUG",
-                f"All collectors were filtered out, setting execution time to 0.0",
+                "All collectors were filtered out, setting execution time to 0.0",
             )
         else:
             # Use the execution time from the execution summary (now correctly populated)
@@ -2268,9 +2262,77 @@ class HTMLReportService:
                                     e["log path"] = json_log_paths
                         break
 
+        # Scan disk for collectors that may not be in the execution summary
+        # This ensures we capture all collectors that have files on disk
+        collector_groups = self._get_collector_groups(node_path)
+        for group_path in collector_groups:
+            group_name_orig = group_path.name
+            group_cap = self._normalize_group_name(group_name_orig)
+
+            # Scan disk for collectors in this group
+            disk_dict = await self._scan_collectors_from_disk(
+                group_path, node_path, include_files=False
+            )
+
+            # Merge disk files into grouped_entries (add new collectors or extend existing ones)
+            for c_id_lower, disk_info in disk_dict.items():
+                c_id = disk_info["collector_id_orig"]
+                c_name = disk_info["collector_name_orig"]
+                log_paths = disk_info["paths"]  # List of path strings
+
+                # Check if this collector already exists in grouped_entries
+                found_key = None
+                for key in grouped_entries.keys():
+                    cg, cid, cname = key
+                    if cg.lower() == group_cap.lower() and cid.lower() == c_id.lower():
+                        found_key = key
+                        break
+
+                if found_key:
+                    # Collector exists - merge disk files into existing log paths
+                    for entry in grouped_entries[found_key]:
+                        # Ensure log path is a list before appending
+                        if not isinstance(entry["log path"], list):
+                            entry["log path"] = (
+                                [] if entry["log path"] is None else [entry["log path"]]
+                            )
+
+                        existing_paths = set(entry["log path"])
+                        # Add disk paths that aren't already present
+                        for path in log_paths:
+                            if path not in existing_paths:
+                                entry["log path"].append(path)
+                else:
+                    # Collector doesn't exist - add it
+                    # Get status from JSON if available
+                    status = "Unknown"
+                    if (
+                        group_name_orig in node_json_data
+                        or group_name_orig.lower() in node_json_data
+                    ):
+                        group_json = node_json_data.get(
+                            group_name_orig,
+                            node_json_data.get(group_name_orig.lower(), {}),
+                        )
+                        if c_id.lower() in group_json:
+                            status = group_json[c_id.lower()].get("status", "Unknown")
+
+                    grouped_entries.setdefault(
+                        (group_cap, c_id, c_name),
+                        [],
+                    ).append(
+                        {
+                            "collection name": f"{group_cap}_{c_id}_{c_name}",
+                            "execution status": status,
+                            "log path": log_paths,
+                            "id": c_id,
+                            "name": c_name,
+                            "group": group_name_orig,
+                        }
+                    )
+
         # Handle collectors present in JSON but missing from the text summary
         requested_collector_ids = getattr(self, "requested_collector_ids", None)
-        await self._log("DEBUG", f"Requested collector IDs: {requested_collector_ids}")
 
         # Check if all collectors were filtered out - if so, don't add any from JSON
         has_all_collectors_filtered = any(
@@ -2286,13 +2348,19 @@ class HTMLReportService:
                 if collector_id and collector_id != "all_collectors_filtered":
                     executed_collector_ids.add(collector_id.upper())
 
-            await self._log(
-                "DEBUG", f"Executed collector IDs: {executed_collector_ids}"
-            )
-
             for group_name, cdict in node_json_data.items():
                 group_cap = self._normalize_group_name(group_name)
                 for collector_id, info_dict in cdict.items():
+                    # Skip collectors filtered out before execution
+                    if self._is_preexecution_filtered_reason(
+                        info_dict.get("reason", "")
+                    ):
+                        await self._log(
+                            "DEBUG",
+                            f"Skipping collector {collector_id} - filtered out before execution",
+                        )
+                        continue
+
                     # Only add this collector if it was requested to run AND actually executed
                     if requested_collector_ids and collector_id.upper() not in [
                         cid.upper() for cid in requested_collector_ids
@@ -2340,7 +2408,7 @@ class HTMLReportService:
         else:
             await self._log(
                 "DEBUG",
-                f"All collectors were filtered out, skipping JSON metadata additions",
+                "All collectors were filtered out, skipping JSON metadata additions",
             )
 
         # Merge error entries from text summary
@@ -2451,25 +2519,11 @@ class HTMLReportService:
             j_status = ""
             group_json = None
 
-            # Debug logging to see what we're looking for
-            await self._log(
-                "DEBUG",
-                f"Looking for collector {cid} in group {cg}, available groups: {list(node_json_data.keys())}",
-                node_name,
-            )
-
             for g_lc, c_map in node_json_data.items():
                 if g_lc.lower() == cg.lower():
                     group_json = c_map
                     break
             if group_json:
-                # Debug logging to see what collectors are available in this group
-                await self._log(
-                    "DEBUG",
-                    f"Found group {cg}, available collectors: {list(group_json.keys())}",
-                    node_name,
-                )
-
                 for c_lc, c_info in group_json.items():
                     if c_lc.lower() == cid.lower():
                         j_exec_time = c_info.get("execution_time_seconds", 0.0)
@@ -2480,37 +2534,42 @@ class HTMLReportService:
                             j_status = "Error"
                         else:
                             j_status = c_info.get("status", "NotRan")
-                        # Debug logging
-                        await self._log(
-                            "DEBUG",
-                            f"Found collector {cid} in group {cg}: exec_time={j_exec_time}, status={j_status}",
-                            node_name,
-                        )
                         break
 
             worst_status = self._combine_statuses(worst_status, j_status)
             if cg.lower() == "error":
                 worst_status = "Error"
-            await self._log(
-                "DEBUG",
-                f"Collector {cid} j_exec_time: {j_exec_time} (type: {type(j_exec_time)})",
-                node_name,
-            )
             final_exec_time = max(0.0, j_exec_time)
-            await self._log(
-                "DEBUG",
-                f"Collector {cid} final_exec_time: {final_exec_time}",
-                node_name,
-            )
             collector_exec_time_str = self._format_time(final_exec_time)
-            await self._log(
-                "DEBUG",
-                f"Collector {cid} formatted time: {collector_exec_time_str}",
-                node_name,
-            )
 
             if worst_status.lower() in ("notran", "n/a", "skipped") and j_reason:
                 log_paths_collected.insert(0, f"{j_reason}")
+
+            # Skip collectors filtered out due to baseboard constraints
+            is_baseboard_filtered = self._is_baseboard_filtered_reason(j_reason)
+            if not is_baseboard_filtered:
+                for log_path in log_paths_collected:
+                    if isinstance(log_path, str) and self._is_baseboard_filtered_reason(
+                        log_path
+                    ):
+                        is_baseboard_filtered = True
+                        break
+
+            if is_baseboard_filtered:
+                continue
+
+            # Skip collectors that were filtered out before execution
+            is_preexecution_filtered = self._is_preexecution_filtered_reason(j_reason)
+            if not is_preexecution_filtered:
+                for log_path in log_paths_collected:
+                    if isinstance(log_path, str) and self._is_preexecution_filtered_reason(
+                        log_path
+                    ):
+                        is_preexecution_filtered = True
+                        break
+
+            if is_preexecution_filtered:
+                continue
 
             all_node_statuses.append(worst_status)
             status_class = self._get_status_class(worst_status)
@@ -2558,9 +2617,9 @@ class HTMLReportService:
             <td>{escape(cg)}</td>
             <td>{escape(cid.upper())}</td>
             <td>{escape(cname)}</td>
-            <td>{escape(collector_exec_time_str)}</td>
+            <td data-sort="{final_exec_time}">{escape(collector_exec_time_str)}</td>
             <td class="{status_class}">{escape(worst_status)}</td>
-            <td>{log_size_str}</td>
+            <td data-sort="{log_size}">{log_size_str}</td>
             <td>{log_path_display}</td>
             </tr>
             """
@@ -2612,6 +2671,15 @@ class HTMLReportService:
             node_path
         )  # No group_name for all checks
 
+        # Write dependencies.txt for this DUT (plain-text summary)
+        dependencies_text = self._build_dependency_text_table(node_path)
+        if dependencies_text:
+            try:
+                dependencies_path = node_path / "dependencies.txt"
+                dependencies_path.write_text(dependencies_text, encoding="utf-8")
+            except Exception:
+                pass
+
         # Build right column content with all tables
         main_content = f"""
         <div class="row">
@@ -2649,9 +2717,23 @@ class HTMLReportService:
             int: Total size in bytes
         """
         total = 0
+        # Track dirs and files separately to avoid double counting
+        dir_paths: List[str] = []
+        file_paths: List[str] = []
         for log_path in log_paths:
-            # Skip if the path is a reason message (starts with a non-path character)
-            if log_path and not log_path[0].isalnum() and not log_path[0] in "./":
+            # Skip if the path is a reason message (not a valid file path)
+            if not log_path:
+                continue
+            # Skip paths that are too long (likely error messages)
+            if len(log_path) > 255:
+                continue
+            # Skip known error message prefixes
+            if log_path.startswith("Collector not executed") or log_path.startswith(
+                "Error:"
+            ):
+                continue
+            # Skip if the path starts with a non-path character
+            if not log_path[0].isalnum() and log_path[0] not in "./":
                 continue
 
             # Clean up the path
@@ -2662,20 +2744,36 @@ class HTMLReportService:
             full_path = node_path / clean_path
             if full_path.exists():
                 if full_path.is_file():
-                    try:
-                        total += full_path.stat().st_size
-                    except Exception:
-                        pass
+                    file_paths.append(os.path.abspath(str(full_path)))
                 elif full_path.is_dir():
-                    try:
-                        for root, _, files in os.walk(full_path):
-                            for f in files:
-                                try:
-                                    total += os.path.getsize(os.path.join(root, f))
-                                except Exception:
-                                    pass
-                    except Exception:
-                        pass
+                    dir_paths.append(os.path.abspath(str(full_path)))
+
+        # Collect files from directories
+        counted_files = set()
+        for dir_path in dir_paths:
+            try:
+                for root, _, files in os.walk(dir_path):
+                    for f in files:
+                        file_path = os.path.join(root, f)
+                        counted_files.add(os.path.abspath(file_path))
+            except Exception:
+                pass
+
+        # Add explicit files that are not already covered by a directory
+        for file_path in file_paths:
+            if any(
+                file_path.startswith(dir_path + os.sep) or file_path == dir_path
+                for dir_path in dir_paths
+            ):
+                continue
+            counted_files.add(file_path)
+
+        # Sum sizes (one pass, unique files only)
+        for file_path in counted_files:
+            try:
+                total += os.path.getsize(file_path)
+            except Exception:
+                pass
         return total
 
     def _build_preflight_status_cell(self, check_type: str, check_info: dict) -> tuple:
@@ -2734,6 +2832,8 @@ class HTMLReportService:
         # Build dependency status list
         dep_html = "<ul class='list-unstyled mb-0'>"
         for dep in dependencies:
+            if isinstance(dep, str):
+                dep = {"name": dep, "status": "Unknown"}
             dep_name = dep.get("name", "")
             dep_status = dep.get("status", "Unknown")
             dep_message = dep.get("message", "")
@@ -2995,6 +3095,118 @@ class HTMLReportService:
             await self._log("ERROR", f"Error reading dependency_check.json: {e}")
             return ""
 
+    def _build_dependency_text_table(
+        self, node_path: Path, group_name: str = None
+    ) -> str:
+        """
+        Build plain-text table for dependency checks.
+
+        Args:
+            node_path: DUT directory path.
+            group_name: Optional group filter (redfish/ipmi/ssh/host/health_check).
+
+        Returns:
+            Plain-text table string.
+        """
+        dependency_json = None
+        for metadata_dir_name in ["metadata", ".metadata"]:
+            potential_path = node_path / metadata_dir_name / "dependency_check.json"
+            if potential_path.exists():
+                dependency_json = potential_path
+                break
+
+        if not dependency_json:
+            return "Dependency check data not found.\n"
+
+        try:
+            with dependency_json.open("r") as f:
+                data = json.load(f)
+
+            collectors = data.get("collectors", {})
+            if not collectors:
+                return "No dependency data available.\n"
+
+            node_name = node_path.name
+            node_execution_data = self.node_collector_json.get(node_name, {})
+
+            def _was_executed(collector_id: str) -> bool:
+                for group_data in node_execution_data.values():
+                    if collector_id in group_data:
+                        status = group_data[collector_id].get("status", "")
+                        if status and status.lower() not in ["notran", "n/a", ""]:
+                            return True
+                return False
+
+            collectors_with_deps = {}
+            if group_name:
+                group_prefix = group_name[0].lower()
+                for cid, info in collectors.items():
+                    if cid.startswith(group_prefix) and info.get("dependencies"):
+                        if _was_executed(cid):
+                            collectors_with_deps[cid] = info
+            else:
+                for cid, info in collectors.items():
+                    if info.get("dependencies"):
+                        if _was_executed(cid):
+                            collectors_with_deps[cid] = info
+
+            if not collectors_with_deps:
+                return (
+                    "No dependencies found. None of the collectors for this node/group "
+                    "have any dependencies to check.\n"
+                )
+
+            def _status_text(status: str) -> str:
+                if status.lower() == "passed":
+                    return "OK"
+                if status.lower() == "skipped":
+                    return "SKIPPED"
+                if status.lower() == "not_applicable":
+                    return "N/A"
+                if status.lower() == "failed":
+                    return "MISSING"
+                return "UNKNOWN"
+
+            headers = ["Collector", "Name", "Dependencies (status)"]
+            rows = []
+            for collector_id, collector_info in sorted(collectors_with_deps.items()):
+                collector_name = collector_info.get("name", "")
+                dependencies = collector_info.get("dependencies", [])
+                dep_items = []
+                for dep in dependencies:
+                    if isinstance(dep, str):
+                        dep = {"name": dep, "status": "Unknown"}
+                    dep_name = dep.get("name", "")
+                    dep_status = dep.get("status", "Unknown")
+                    dep_required = dep.get("required", True)
+                    requirement = "required" if dep_required else "optional"
+                    dep_items.append(
+                        f"{dep_name} ({requirement}): {_status_text(dep_status)}"
+                    )
+                dep_text = "; ".join(dep_items) if dep_items else "None"
+                rows.append([collector_id.upper(), collector_name, dep_text])
+
+            widths = [len(h) for h in headers]
+            for row in rows:
+                for idx, value in enumerate(row):
+                    widths[idx] = max(widths[idx], len(value))
+
+            def _separator() -> str:
+                parts = ["-" * (width + 2) for width in widths]
+                return f"+{'+'.join(parts)}+"
+
+            def _format_row(values: List[str]) -> str:
+                padded = [values[i].ljust(widths[i]) for i in range(len(values))]
+                return f"| {' | '.join(padded)} |"
+
+            lines = [_separator(), _format_row(headers), _separator()]
+            for row in rows:
+                lines.append(_format_row(row))
+            lines.append(_separator())
+            return "\n".join(lines) + "\n"
+        except Exception:
+            return "Error reading dependency_check.json.\n"
+
     async def _build_group_preflight_table(
         self, node_path: Path, group_name: str
     ) -> str:
@@ -3192,6 +3404,117 @@ class HTMLReportService:
             await self._log("ERROR", f"Error reading dependency_check.json: {e}")
             return ""
 
+    async def _scan_collectors_from_disk(
+        self, group_path: Path, node_path: Path, include_files: bool = True
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Scans a collector group directory and returns information about collectors found on disk.
+
+        Args:
+            group_path: Path to the collector group directory
+            node_path: Path to the node/DUT directory
+            include_files: Whether to include file paths and generate file views
+
+        Returns:
+            Dictionary mapping collector_id (lowercase) to collector info:
+            {
+                "collector_id_orig": str,  # Original case collector ID
+                "collector_name_orig": str,  # Original collector name
+                "paths": List[Tuple[str, str]] or List[str],  # File paths (with or without views)
+            }
+        """
+        if not group_path.is_dir():
+            return {}
+
+        try:
+            items = list(group_path.iterdir())
+        except (PermissionError, OSError) as e:
+            await self._log(
+                "WARNING",
+                f"Failed to scan directory {group_path}: {e}",
+            )
+            return {}
+        collectors = [
+            x
+            for x in items
+            if (x.is_dir() or x.is_file())
+            and not any(pattern.match(x.name) for pattern in self.log_ignore_patterns)
+        ]
+
+        requested_collector_ids = getattr(self, "requested_collector_ids", None)
+        disk_dict = {}
+
+        for it in collectors:
+            name_parts = it.name.split("_")
+            c_id = "N/A"
+            c_name = "N/A"
+
+            # Look for standard collector ID pattern (e.g., R1, H2, S3)
+            collector_id_pattern = re.compile(r"^[A-Z]+\d+$")
+            for i, part in enumerate(name_parts):
+                if collector_id_pattern.match(part):
+                    c_id = part
+                    # Everything after the ID is the collector name
+                    if i + 1 < len(name_parts):
+                        c_name = "_".join(name_parts[i + 1 :])
+                    break
+
+            # Fallback parsing if no standard pattern found
+            if c_id == "N/A":
+                if len(name_parts) == 1:
+                    c_id, c_name = ("N/A", name_parts[0])
+                elif len(name_parts) == 2:
+                    c_id, c_name = (name_parts[1], "N/A")
+                else:
+                    c_id, c_name = (name_parts[1], "_".join(name_parts[2:]))
+
+            # Only process collectors that were requested to run
+            if requested_collector_ids and c_id.upper() not in [
+                cid.upper() for cid in requested_collector_ids
+            ]:
+                continue
+
+            # Collect file paths
+            files_list = []
+            try:
+                if it.is_dir():
+                    for subf in it.rglob("*"):
+                        if subf.is_file():
+                            try:
+                                relp = str(subf.relative_to(node_path))
+                                if include_files:
+                                    fv = await self._generate_file_view(subf)
+                                    files_list.append((relp, fv))
+                                else:
+                                    files_list.append(relp)
+                            except (PermissionError, OSError) as e:
+                                await self._log(
+                                    "DEBUG",
+                                    f"Skipping file {subf}: {e}",
+                                )
+                                continue
+                else:
+                    relp = str(it.relative_to(node_path))
+                    if include_files:
+                        fv = await self._generate_file_view(it)
+                        files_list.append((relp, fv))
+                    else:
+                        files_list.append(relp)
+            except (PermissionError, OSError) as e:
+                await self._log(
+                    "WARNING",
+                    f"Failed to scan collector {it.name}: {e}",
+                )
+                continue
+
+            disk_dict[c_id.lower()] = {
+                "collector_id_orig": c_id,
+                "collector_name_orig": c_name,
+                "paths": files_list,
+            }
+
+        return disk_dict
+
     async def _generate_collector_group_report(
         self, group_path: Path, node_path: Path, group_report_path: Path
     ) -> None:
@@ -3252,73 +3575,10 @@ class HTMLReportService:
         {preflight_table}
         """
 
-        items = []
-        if group_path.is_dir():
-            items = list(group_path.iterdir())
-
-        collectors = [
-            x
-            for x in items
-            if (x.is_dir() or x.is_file())
-            and not any(pattern.match(x.name) for pattern in self.log_ignore_patterns)
-        ]
-        # Get requested collector IDs for filtering
-        requested_collector_ids = getattr(self, "requested_collector_ids", None)
-
-        disk_dict = {}
-        for it in collectors:
-            name_parts = it.name.split("_")
-            # Try to find collector ID by looking for pattern like C1, H2, R1, etc.
-            # Collector IDs are typically uppercase letter(s) followed by digit(s)
-            import re
-
-            c_id = "N/A"
-            c_name = "N/A"
-
-            # Look for standard collector ID pattern in the parts
-            collector_id_pattern = re.compile(r"^[A-Z]+\d+$")
-            for i, part in enumerate(name_parts):
-                if collector_id_pattern.match(part):
-                    c_id = part
-                    # Everything after the ID is the collector name
-                    if i + 1 < len(name_parts):
-                        c_name = "_".join(name_parts[i + 1 :])
-                    break
-
-            # Fallback to old logic if no match found
-            if c_id == "N/A":
-                if len(name_parts) == 1:
-                    c_id, c_name = ("N/A", name_parts[0])
-                elif len(name_parts) == 2:
-                    c_id, c_name = (name_parts[1], "N/A")
-                else:
-                    c_id, c_name = (name_parts[1], "_".join(name_parts[2:]))
-
-            # Only process collectors that were requested to run
-            if requested_collector_ids and c_id.upper() not in [
-                cid.upper() for cid in requested_collector_ids
-            ]:
-                continue
-
-            files_list = []
-            if it.is_dir():
-                for subf in it.rglob("*"):
-                    if subf.is_file():
-                        # Use path relative to node_path (group_path.parent) for consistency with metadata
-                        relp = str(subf.relative_to(node_path))
-                        fv = await self._generate_file_view(subf)
-                        files_list.append((relp, fv))
-            else:
-                fv = await self._generate_file_view(it)
-                # Use path relative to node_path for consistency
-                relp = str(it.relative_to(node_path))
-                files_list.append((relp, fv))
-
-            disk_dict[c_id.lower()] = {
-                "collector_id_orig": c_id,
-                "collector_name_orig": c_name,
-                "paths": files_list,
-            }
+        # Scan disk for collectors in this group
+        disk_dict = await self._scan_collectors_from_disk(
+            group_path, node_path, include_files=True
+        )
 
         node_json = self.node_collector_json.get(node_name, {})
         group_json = node_json.get(group_name_orig, {})
@@ -3354,6 +3614,7 @@ class HTMLReportService:
             except Exception as e:
                 await self._log("WARNING", f"Error reading execution summary: {e}")
 
+        valid_collectors = set()
         for cid_key, jinfo in group_json.items():
             # Only process collectors that were requested to run AND actually executed
             if requested_collector_ids and cid_key.upper() not in [
@@ -3365,11 +3626,20 @@ class HTMLReportService:
                 )
                 continue
 
-            # Only process collectors that were actually executed
-            if cid_key.upper() not in executed_collector_ids:
+            # Only process collectors that were actually executed when list is available
+            if executed_collector_ids and cid_key.upper() not in executed_collector_ids:
                 await self._log(
                     "DEBUG",
                     f"Group report: Skipping collector {cid_key} - not in executed list",
+                )
+                continue
+
+            # Skip collectors that were filtered out before execution
+            jreason_check = jinfo.get("reason", "")
+            if self._is_preexecution_filtered_reason(jreason_check):
+                await self._log(
+                    "DEBUG",
+                    f"Group report: Skipping collector {cid_key} - filtered out before execution",
                 )
                 continue
 
@@ -3379,6 +3649,7 @@ class HTMLReportService:
             )
 
             cid_l = cid_key.lower()
+            valid_collectors.add(cid_l)
             jstat = jinfo.get("status", "NotRan")
             jreason = jinfo.get("reason", "")
             jtime = jinfo.get("execution_time_seconds", 0.0)
@@ -3436,6 +3707,11 @@ class HTMLReportService:
         if not merged_dict:
             content_right += "<p>No collectors found in this group.</p>"
         else:
+            # If we have a non-empty set of valid collectors, drop any others from merged_dict
+            if valid_collectors:
+                merged_dict = {
+                    k: v for k, v in merged_dict.items() if k in valid_collectors
+                }
             sorted_keys = sorted(
                 merged_dict.keys(),
                 key=lambda x: self._natural_sort_key_for_id(x),
@@ -3467,6 +3743,7 @@ class HTMLReportService:
                 creason = rowdata["reason"]
                 ftime_str = self._format_time(ctime)
                 status_class = self._get_status_class(cstatus)
+                row_id = self._generate_safe_id("collector", cid_real)
 
                 # Skip entries with N/A status if hide_na_status is True
                 if self.hide_na_status and cstatus.lower() == self.na_string.lower():
@@ -3518,7 +3795,7 @@ class HTMLReportService:
                 )
 
                 content_right += f"""
-                <tr>
+                <tr id=\"{row_id}\">
                     <td>{escape(cid_real)}</td>
                     <td>{escape(cname_real)}</td>
                     <td>{escape(ftime_str)}</td>
@@ -3784,7 +4061,7 @@ class HTMLReportService:
                     </table>
                 </div>
             </div>
-            
+
             <script>
             // Add sorting functionality to the timing table
             document.addEventListener('DOMContentLoaded', function() {{
@@ -3797,16 +4074,16 @@ class HTMLReportService:
                     }});
                 }}
             }});
-            
+
             function sortTable(table, columnIndex) {{
                 const tbody = table.querySelector('tbody');
                 const rows = Array.from(tbody.querySelectorAll('tr'));
                 const isNumeric = columnIndex >= 3; // Time columns are numeric
-                
+
                 rows.sort((a, b) => {{
                     let aVal = a.cells[columnIndex].textContent.trim();
                     let bVal = b.cells[columnIndex].textContent.trim();
-                    
+
                     if (isNumeric) {{
                         // Extract numeric value from time strings (e.g., "2.345s" -> 2.345)
                         aVal = parseFloat(aVal.replace('s', '')) || 0;
@@ -3816,7 +4093,7 @@ class HTMLReportService:
                         return aVal.localeCompare(bVal);
                     }}
                 }});
-                
+
                 // Clear and re-append sorted rows
                 rows.forEach(row => tbody.appendChild(row));
             }}
@@ -3840,17 +4117,56 @@ class HTMLReportService:
         safe_name = "n" + safe_name if not safe_name[0].isalpha() else safe_name
         return f"{prefix}_{safe_name}"
 
+    def _is_baseboard_filtered_reason(self, reason: Optional[str]) -> bool:
+        """
+        Determine whether a reason string indicates baseboard-based filtering.
+        """
+        if not reason:
+            return False
+        reason_lower = reason.lower()
+        if "baseboardconstraint" in reason_lower:
+            return True
+        if "baseboard" in reason_lower and "not applicable" in reason_lower:
+            return True
+        return False
+
+    def _is_preexecution_filtered_reason(self, reason: Optional[str]) -> bool:
+        """
+        Determine whether a reason string indicates the collector was filtered
+        out before execution (e.g., due to preflight failures or collection
+        level filtering).
+        """
+        if not reason:
+            return False
+        reason_lower = reason.lower()
+        if "filtered out" in reason_lower and (
+            "before execution" in reason_lower
+            or "not executed" in reason_lower
+        ):
+            return True
+        return False
+
     def _create_execution_summary_from_metadata(self, node_name: str) -> List[Dict]:
         """
         Create execution summary entries from metadata for nvdebug.
+        Only includes collectors that were requested to run.
         """
         execution_summary = []
 
         # Get collector data from metadata
         node_data = self.node_collector_json.get(node_name, {})
 
+        # Get the list of requested collector IDs to filter entries
+        requested_collector_ids = getattr(self, "requested_collector_ids", None)
+
         for group_name, collectors in node_data.items():
             for collector_id, collector_info in collectors.items():
+                # Skip collectors that weren't requested to run
+                if requested_collector_ids and collector_id.upper() not in [
+                    cid.upper() for cid in requested_collector_ids
+                ]:
+                    continue
+
                 # Create execution summary entry
                 entry = {
                     "collection name": f"{group_name}_{collector_id}_{collector_info.get('name', 'N/A')}",
@@ -3858,7 +4174,7 @@ class HTMLReportService:
                     "log path": [
                         f"{group_name.lower()}/{collector_id}_{collector_info.get('name', 'N/A')}"
                     ],
-                    "id": collector_id,
+                    "collector_id": collector_id,  # Use "collector_id" to match what other code expects
                     "name": collector_info.get("name", "N/A"),
                     "group_name": group_name,
                 }
@@ -4050,12 +4366,12 @@ class HTMLReportService:
             cleanup_time = component_timing.get("cleanup", {}).get("total_time", 0)
 
             # Prepare data for JavaScript
-            timeline_data_json = json.dumps(all_collectors, indent=2)
-            dut_summaries_json = json.dumps(dut_summaries, indent=2)
-            service_stats_json = json.dumps(service_stats, indent=2)
+            timeline_data_json = self._json_for_script(all_collectors, indent=2)
+            dut_summaries_json = self._json_for_script(dut_summaries, indent=2)
+            service_stats_json = self._json_for_script(service_stats, indent=2)
 
             # Add stage and component timing
-            stage_timing_json = json.dumps(
+            stage_timing_json = self._json_for_script(
                 {
                     "validation": total_validation_time,
                     "execution": total_execution_time,
@@ -4064,7 +4380,7 @@ class HTMLReportService:
                 indent=2,
             )
 
-            component_timing_json = json.dumps(
+            component_timing_json = self._json_for_script(
                 {
                     "tool_initialization": tool_init_time,
                     "configuration_loading": config_loading_time,
@@ -4081,6 +4397,26 @@ class HTMLReportService:
             total_duts = len(timing_data_by_dut)
             total_collectors_executed = len(all_collectors)
             total_completed = sum(s["completed"] for s in dut_summaries.values())
+
+            # Aggregate overall collector statuses for cards
+            total_collectors_overall = 0
+            total_success = 0
+            total_failed = 0
+            total_partial = 0
+            total_skipped = 0
+
+            for timing_data in timing_data_by_dut.values():
+                for c in timing_data.get("collectors", {}).values():
+                    total_collectors_overall += 1
+                    status = str(c.get("status", "")).lower()
+                    if status in ("complete", "success", "completed"):
+                        total_success += 1
+                    elif status in ("error", "failed", "fail"):
+                        total_failed += 1
+                    elif status == "partial":
+                        total_partial += 1
+                    elif status in ("skipped", "skip"):
+                        total_skipped += 1
 
             # Calculate actual wall-clock time (parallel execution, not sum)
             all_start_times = [
@@ -4192,7 +4528,7 @@ class HTMLReportService:
             margin-right: 8px;
         }}
         /* Timing page uses same service colors as base */
-        
+
         /* Fullscreen modal styles */
         .modal-fullscreen {{
             position: fixed;
@@ -4232,7 +4568,7 @@ class HTMLReportService:
             margin-left: 5px;
         }}
     </style>
-    
+
     <!-- Sidebar Navigation -->
     <div class="sidebar-nav">
         <h6>Navigation</h6>
@@ -4245,7 +4581,7 @@ class HTMLReportService:
         <a href="#collector-timing">Collector Timing</a>
         <a href="#collector-log">Collector Log</a>
     </div>
-    
+
     <div class="container-fluid">
         <!-- Executive Summary -->
         <div class="section" id="summary">
@@ -4276,8 +4612,38 @@ class HTMLReportService:
                     </div>
                 </div>
             </div>
+            <div class="row mb-4">
+                <div class="col-md-3">
+                    <div class="stat-card" style="background: linear-gradient(135deg, #28a745 0%, #43e97b 100%);">
+                        <div class="stat-number">{total_success}</div>
+                        <div class="stat-label">Passed Collectors</div>
+                        <div class="stat-label">of {total_collectors_overall} total</div>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="stat-card" style="background: linear-gradient(135deg, #f5576c 0%, #ff4b2b 100%);">
+                        <div class="stat-number">{total_failed}</div>
+                        <div class="stat-label">Failed Collectors</div>
+                        <div class="stat-label">of {total_collectors_overall} total</div>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="stat-card" style="background: linear-gradient(315deg, #ffd54f 0%, #fff176 100%); color: #ffffff;">
+                        <div class="stat-number">{total_partial}</div>
+                        <div class="stat-label">Partial Collectors</div>
+                        <div class="stat-label">of {total_collectors_overall} total</div>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="stat-card" style="background: linear-gradient(135deg, #ff9800 0%, #ffc107 100%); color: #ffffff;">
+                        <div class="stat-number">{total_skipped}</div>
+                        <div class="stat-label">Skipped Collectors</div>
+                        <div class="stat-label">of {total_collectors_overall} total</div>
+                    </div>
+                </div>
+            </div>
         </div>
-        
+
         <!-- Per-DUT Performance -->
         <div class="section" id="dut-performance">
             <h2>Per-DUT Performance</h2>
@@ -4285,7 +4651,7 @@ class HTMLReportService:
                 <canvas id="dutPerformanceChart"></canvas>
             </div>
         </div>
-        
+
         <!-- Service Breakdown -->
         <div class="section" id="service-breakdown">
             <h2>Service-Level Breakdown</h2>
@@ -4302,7 +4668,7 @@ class HTMLReportService:
                 </div>
             </div>
         </div>
-        
+
         <!-- Collector Stage Breakdown -->
         <div class="section" id="stage-breakdown">
             <h2>Collector Stage Breakdown</h2>
@@ -4311,7 +4677,7 @@ class HTMLReportService:
                 <canvas id="stageBreakdownChart"></canvas>
             </div>
         </div>
-        
+
         <!-- Execution Timeline -->
         <div class="section" id="timeline">
             <div class="d-flex justify-content-between align-items-center mb-3">
@@ -4359,14 +4725,14 @@ class HTMLReportService:
                 <div id="timelineChart"></div>
             </div>
         </div>
-        
+
         <!-- Collector Summary by DUT -->
         <div class="section" id="dut-details">
             <h2>Collector Summary by DUT</h2>
             <p class="text-muted">Detailed breakdown of collector execution for each DUT.</p>
             <div id="dutDetailsContent"></div>
         </div>
-        
+
         <!-- Detailed Collector Timing -->
         <div class="section" id="collector-timing">
             <h2>Detailed Collector Timing</h2>
@@ -4388,7 +4754,7 @@ class HTMLReportService:
                 </table>
             </div>
         </div>
-        
+
         <!-- Detailed Collector Execution Log -->
         <div class="section" id="collector-log">
             <h2>Detailed Collector Execution Log</h2>
@@ -4398,7 +4764,7 @@ class HTMLReportService:
             <div id="collectorList"></div>
         </div>
     </div>
-    
+
     <!-- Fullscreen Timeline Modal -->
     <div id="fullscreenModal" class="modal-fullscreen">
         <div class="modal-fullscreen-header">
@@ -4421,7 +4787,7 @@ class HTMLReportService:
             </div>
         </div>
     </div>
-    
+
     <script>
         // Navbar search stub functions (not used on this page but required by navbar)
         function globalSearchHandler(value) {{
@@ -4430,14 +4796,14 @@ class HTMLReportService:
         function clearSearch() {{
             // Not applicable for timing analysis page
         }}
-        
+
         // Data from Python
         const timelineData = {timeline_data_json};
         const dutSummaries = {dut_summaries_json};
         const serviceStats = {service_stats_json};
         const stageTiming = {stage_timing_json};
         const componentTiming = {component_timing_json};
-        
+
         // Consistent service color mapping
         function getServiceColor(serviceName) {{
             const colors = {{
@@ -4453,7 +4819,7 @@ class HTMLReportService:
             const key = serviceName.toLowerCase().replace(/[^a-z_]/g, '_');
             return colors[key] || 'rgba(108, 117, 125, 0.8)'; // Default gray
         }}
-        
+
         function getServiceBorderColor(serviceName) {{
             const colors = {{
                 'redfish': 'rgba(220, 105, 118, 1)',
@@ -4468,12 +4834,12 @@ class HTMLReportService:
             const key = serviceName.toLowerCase().replace(/[^a-z_]/g, '_');
             return colors[key] || 'rgba(108, 117, 125, 1)';
         }}
-        
+
         // Per-DUT Performance Chart
         const dutLabels = Object.keys(dutSummaries);
         const dutDurations = dutLabels.map(dut => dutSummaries[dut].duration);
         const dutCompleted = dutLabels.map(dut => dutSummaries[dut].completed);
-        
+
         new Chart(document.getElementById('dutPerformanceChart'), {{
             type: 'bar',
             data: {{
@@ -4522,15 +4888,15 @@ class HTMLReportService:
                 }}
             }}
         }});
-        
+
         // Service Distribution Chart
         const serviceLabels = Object.keys(serviceStats);
         const serviceCollectorCounts = serviceLabels.map(s => serviceStats[s].total_collectors);
-        
+
         // Generate colors for each service
         const serviceColors = serviceLabels.map(service => getServiceColor(service));
         const serviceBorderColors = serviceLabels.map(service => getServiceBorderColor(service));
-        
+
         new Chart(document.getElementById('serviceDistributionChart'), {{
             type: 'doughnut',
             data: {{
@@ -4557,10 +4923,10 @@ class HTMLReportService:
                 }}
             }}
         }});
-        
+
         // Service Time Chart
         const serviceTimes = serviceLabels.map(s => serviceStats[s].total_duration);
-        
+
         new Chart(document.getElementById('serviceTimeChart'), {{
             type: 'bar',
             data: {{
@@ -4593,12 +4959,12 @@ class HTMLReportService:
                 }}
             }}
         }});
-        
+
         // Collector Stage Breakdown Chart (using real data from metadata.json)
         const stageCtx = document.getElementById('stageBreakdownChart');
         if (stageCtx) {{
             const stageDataAvailable = stageTiming.validation > 0 || stageTiming.execution > 0 || stageTiming.post_processing > 0;
-            
+
             new Chart(stageCtx, {{
                 type: 'bar',
                 data: {{
@@ -4647,13 +5013,13 @@ class HTMLReportService:
                 }}
             }});
         }}
-        
+
         // Timeline Chart (HTML/CSS Gantt Chart - Simple and Reliable)
         let dutList = [];
         let earliestStart = 0;
         let latestEnd = 0;
         let chartData = []; // Make chartData accessible to fullscreen function
-        
+
         // Color map for statuses (handle both cases)
         function getStatusColor(status) {{
             const statusUpper = status.toUpperCase();
@@ -4665,11 +5031,11 @@ class HTMLReportService:
                 default: return '#808080';
             }}
         }}
-        
+
         if (timelineData && timelineData.length > 0) {{
             earliestStart = Math.min(...timelineData.map(d => new Date(d.start_time).getTime()));
             latestEnd = Math.max(...timelineData.map(d => new Date(d.end_time).getTime()));
-            
+
             // Group by DUT
             const dutGroups = {{}};
             timelineData.forEach(item => {{
@@ -4678,23 +5044,23 @@ class HTMLReportService:
                 }}
                 dutGroups[item.dut_id].push(item);
             }});
-            
+
             // Create datasets - one per collector, positioned by DUT row and time
             dutList = Object.keys(dutGroups).sort();
-            
+
             // Build chart data structure
             chartData = [];
-            
+
             dutList.forEach((dutId, dutIndex) => {{
                 const collectors = dutGroups[dutId];
-                
+
                 // Sort collectors by start time
                 collectors.sort((a, b) => new Date(a.start_time) - new Date(b.start_time));
-                
+
                 collectors.forEach(collector => {{
                     const startOffset = (new Date(collector.start_time).getTime() - earliestStart) / 1000;
                     const duration = collector.duration;
-                    
+
                     chartData.push({{
                         x: startOffset,
                         y: dutIndex,
@@ -4705,18 +5071,18 @@ class HTMLReportService:
                     }});
                 }});
             }});
-            
+
             // Create HTML/CSS Gantt Chart with lane assignment for overlapping collectors
             const container = document.getElementById('timelineChart');
             if (container) {{
                 // Calculate dimensions
                 const totalDuration = (latestEnd - earliestStart) / 1000;
-                
+
                 // NEW APPROACH: Start with fit-to-width, allow zoom to expand
                 const leftLabelWidth = 200;
                 const containerWidth = container.parentElement.clientWidth - leftLabelWidth - 40; // Account for padding and labels
                 const minChartWidth = Math.max(800, containerWidth); // Minimum width for fit-to-width view
-                
+
                 // Calculate "detailed" scale for zoom (when user wants to see more detail)
                 let detailedPixelsPerSecond;
                 if (totalDuration <= 120) detailedPixelsPerSecond = 15;      // < 2 min: 15px/s (very detailed)
@@ -4724,30 +5090,30 @@ class HTMLReportService:
                 else if (totalDuration <= 1800) detailedPixelsPerSecond = 5; // < 30 min: 5px/s (moderate)
                 else detailedPixelsPerSecond = 2;                             // > 30 min: 2px/s (compact, relies on zoom)
                 const detailedChartWidth = Math.max(1200, totalDuration * detailedPixelsPerSecond);
-                
+
                 // Start with fit-to-width (compressed view showing entire timeline)
                 let chartWidth = minChartWidth;
-                
+
                 // Store both widths for zoom functionality
                 window.timelineWidths = {{
                     fit: minChartWidth,
                     detailed: detailedChartWidth,
                     current: minChartWidth
                 }};
-                
+
                 const baseLaneHeight = 22; // Height per lane/track
                 const laneGap = 4; // Gap between lanes
                 const dutPadding = 15; // Padding top/bottom for each DUT row
-                
+
                 // Assign lanes to collectors to avoid overlap
                 function assignLanes(collectors) {{
                     // Sort by start time
                     const sorted = collectors.sort((a, b) => a.x - b.x);
                     const lanes = [];
-                    
+
                     sorted.forEach(collector => {{
                         const collectorEnd = collector.x + collector.duration;
-                        
+
                         // Find first available lane
                         let assignedLane = -1;
                         for (let i = 0; i < lanes.length; i++) {{
@@ -4758,27 +5124,27 @@ class HTMLReportService:
                                 break;
                             }}
                         }}
-                        
+
                         // If no lane found, create new one
                         if (assignedLane === -1) {{
                             assignedLane = lanes.length;
                             lanes.push([]);
                         }}
-                        
+
                         collector.lane = assignedLane;
                         lanes[assignedLane].push(collector);
                     }});
-                    
+
                     return Math.max(1, lanes.length);
                 }}
-                
+
                 // Group collectors by DUT and assign lanes
                 const dutLanes = {{}};
                 dutList.forEach((dutId, dutIndex) => {{
                     const dutCollectors = chartData.filter(d => d.y === dutIndex);
                     dutLanes[dutId] = assignLanes(dutCollectors);
                 }});
-                
+
                 // Calculate row heights based on lane count
                 const dutRowHeights = {{}};
                 let chartHeight = 0;
@@ -4788,7 +5154,7 @@ class HTMLReportService:
                     dutRowHeights[dutId] = rowHeight;
                     chartHeight += rowHeight;
                 }});
-                
+
                 // Create chart HTML
                 let chartHTML = `
                     <div style="display: flex; background: white; border: 1px solid #dee2e6; border-radius: 8px; overflow: hidden;">
@@ -4798,7 +5164,7 @@ class HTMLReportService:
                                 DUT
                             </div>
                 `;
-                
+
                 dutList.forEach(dutId => {{
                     chartHTML += `
                         <div style="height: ${{dutRowHeights[dutId]}}px; padding: 15px 10px; border-bottom: 1px solid #dee2e6; font-weight: 600; color: #2c3e50; display: flex; align-items: center; font-size: 13px;">
@@ -4806,7 +5172,7 @@ class HTMLReportService:
                         </div>
                     `;
                 }});
-                
+
                 chartHTML += `
                         </div>
                         <!-- Right: Timeline -->
@@ -4815,7 +5181,7 @@ class HTMLReportService:
                                 <!-- Timeline Header -->
                                 <div style="height: 40px; background: #e9ecef; border-bottom: 2px solid #dee2e6; position: relative;">
                 `;
-                
+
                 // Add time markers with adaptive granularity based on total duration
                 // Aim for 10-20 markers total for good visibility, prefer round numbers
                 let markerInterval;
@@ -4831,7 +5197,7 @@ class HTMLReportService:
                 else if (totalDuration <= 14400) markerInterval = 900;  // 4h: every 15m
                 else if (totalDuration <= 28800) markerInterval = 1800; // 8h: every 30m
                 else markerInterval = 3600;                              // >8h: every 1h
-                
+
                 for (let t = 0; t <= totalDuration; t += markerInterval) {{
                     const xPos = (t / totalDuration) * chartWidth;
                     // Format time display based on duration (hours, minutes, seconds)
@@ -4860,10 +5226,10 @@ class HTMLReportService:
                         </div>
                     `;
                 }}
-                
+
                 chartHTML += `
                                 </div>
-                                
+
                                 <!-- Timeline Overview Bar -->
                                 <div style="height: 30px; background: #f8f9fa; border-bottom: 1px solid #dee2e6; position: relative; display: flex; align-items: center; padding: 0 10px;">
                                     <div style="flex: 1; position: relative; height: 12px; background: #e9ecef; border-radius: 6px; overflow: hidden; box-shadow: inset 0 1px 3px rgba(0,0,0,0.1);">
@@ -4879,11 +5245,11 @@ class HTMLReportService:
                                         Total: ${{totalDuration.toFixed(1)}}s
                                     </div>
                                 </div>
-                                
+
                                 <!-- Timeline Rows -->
                                 <div style="position: relative; height: ${{chartHeight}}px;">
                 `;
-                
+
                 // Draw grid lines for each DUT row
                 let cumulativeHeight = 0;
                 dutList.forEach(dutId => {{
@@ -4893,7 +5259,7 @@ class HTMLReportService:
                     `;
                     cumulativeHeight += rowHeight;
                 }});
-                
+
                 // Draw vertical grid lines matching the time markers
                 for (let t = 0; t <= totalDuration; t += markerInterval) {{
                     const xPos = (t / totalDuration) * chartWidth;
@@ -4901,34 +5267,34 @@ class HTMLReportService:
                         <div style="position: absolute; left: ${{xPos}}px; top: 0; width: 1px; height: 100%; background: #e3e6ea; opacity: 0.5;"></div>
                     `;
                 }}
-                
+
                 // Draw collector bars with lane positioning
                 cumulativeHeight = 0;
                 dutList.forEach((dutId, dutIndex) => {{
                     const dutCollectors = chartData.filter(d => d.y === dutIndex);
                     const rowHeight = dutRowHeights[dutId];
-                    
+
                     dutCollectors.forEach(dataPoint => {{
                         const lane = dataPoint.lane;
                         const yPos = cumulativeHeight + dutPadding + (lane * (baseLaneHeight + laneGap));
                         const xStart = (dataPoint.x / totalDuration) * chartWidth;
                         const width = Math.max(2, (dataPoint.duration / totalDuration) * chartWidth); // Minimum 2px width for visibility
                         const color = getStatusColor(dataPoint.info.status);
-                        
+
                         const info = dataPoint.info;
                         const startTime = new Date(info.start_time).toLocaleTimeString();
                         const endTime = new Date(info.end_time).toLocaleTimeString();
-                        
+
                         // Format duration like Chrome DevTools (e.g., "2.5s", "123ms")
                         const duration = info.duration;
-                        const durationText = duration >= 1 
+                        const durationText = duration >= 1
                             ? `${{duration.toFixed(duration >= 10 ? 1 : 2)}}s`
                             : `${{Math.round(duration * 1000)}}ms`;
-                        
+
                         // Determine if we can fit text inside the bar
                         const canFitName = width > 80;
                         const canFitDuration = width > 40;
-                        
+
                         // Build bar content
                         let barContent = '';
                         if (canFitName) {{
@@ -4936,9 +5302,9 @@ class HTMLReportService:
                         }} else if (canFitDuration) {{
                             barContent = durationText;
                         }}
-                        
+
                         chartHTML += `
-                            <div class="gantt-bar" 
+                            <div class="gantt-bar"
                                  data-dut="${{info.dut_id}}"
                                  data-collector="${{info.collector_name}}"
                                  data-service="${{info.group}}"
@@ -4946,12 +5312,12 @@ class HTMLReportService:
                                  data-duration="${{info.duration.toFixed(2)}}"
                                  data-start="${{startTime}}"
                                  data-end="${{endTime}}"
-                                 style="position: absolute; 
-                                        left: ${{xStart}}px; 
-                                        top: ${{yPos}}px; 
-                                        width: ${{width}}px; 
-                                        height: ${{baseLaneHeight}}px; 
-                                        background: ${{color}}; 
+                                 style="position: absolute;
+                                        left: ${{xStart}}px;
+                                        top: ${{yPos}}px;
+                                        width: ${{width}}px;
+                                        height: ${{baseLaneHeight}}px;
+                                        background: ${{color}};
                                         border: 1px solid ${{color}}dd;
                                         border-radius: 4px;
                                         cursor: pointer;
@@ -4968,14 +5334,14 @@ class HTMLReportService:
                                 </span>
                             </div>
                             ${{!canFitDuration ? `
-                                <div style="position: absolute; 
-                                           left: ${{xStart + width + 4}}px; 
-                                           top: ${{yPos}}px; 
-                                           height: ${{baseLaneHeight}}px; 
-                                           display: flex; 
-                                           align-items: center; 
-                                           font-size: 10px; 
-                                           color: #6c757d; 
+                                <div style="position: absolute;
+                                           left: ${{xStart + width + 4}}px;
+                                           top: ${{yPos}}px;
+                                           height: ${{baseLaneHeight}}px;
+                                           display: flex;
+                                           align-items: center;
+                                           font-size: 10px;
+                                           color: #6c757d;
                                            font-weight: 600;
                                            background: rgba(255,255,255,0.9);
                                            padding: 0 4px;
@@ -4986,22 +5352,22 @@ class HTMLReportService:
                             ` : ''}}
                         `;
                     }});
-                    
+
                     cumulativeHeight += rowHeight;
                 }});
-                
+
                 chartHTML += `
                                 </div>
                             </div>
                         </div>
                     </div>
                 `;
-                
+
                 // Wrap in a transformable container for pan/zoom
-                container.innerHTML = '<div id="mainTimelineZoomable" style="transform-origin: top left; transition: transform 0.1s ease-out;">' + 
-                                     chartHTML + 
+                container.innerHTML = '<div id="mainTimelineZoomable" style="transform-origin: top left; transition: transform 0.1s ease-out;">' +
+                                     chartHTML +
                                      '</div>';
-                
+
                 // Add hover effects and tooltips
                 const bars = container.querySelectorAll('.gantt-bar');
                 bars.forEach(bar => {{
@@ -5010,7 +5376,7 @@ class HTMLReportService:
                         this.style.transform = 'scaleY(1.1)';
                         this.style.zIndex = '10';
                         this.style.boxShadow = '0 4px 8px rgba(0,0,0,0.2)';
-                        
+
                         // Show tooltip
                         const tooltip = document.createElement('div');
                         tooltip.className = 'gantt-tooltip';
@@ -5027,7 +5393,7 @@ class HTMLReportService:
                             box-shadow: 0 4px 12px rgba(0,0,0,0.3);
                             line-height: 1.6;
                         `;
-                        
+
                         tooltip.innerHTML = `
                             <div style="font-weight: bold; margin-bottom: 6px; color: #4fc3f7; font-size: 13px;">DUT: ${{this.dataset.dut}}</div>
                             <div><strong>Collector:</strong> ${{this.dataset.collector}}</div>
@@ -5037,31 +5403,31 @@ class HTMLReportService:
                             <div><strong>Start:</strong> ${{this.dataset.start}}</div>
                             <div><strong>End:</strong> ${{this.dataset.end}}</div>
                         `;
-                        
+
                         document.body.appendChild(tooltip);
                         this._tooltip = tooltip;
                     }});
-                    
+
                     bar.addEventListener('mousemove', function(e) {{
                         if (this._tooltip) {{
                             this._tooltip.style.left = (e.clientX + 15) + 'px';
                             this._tooltip.style.top = (e.clientY + 15) + 'px';
                         }}
                     }});
-                    
+
                     bar.addEventListener('mouseleave', function() {{
                         this.style.filter = '';
                         this.style.transform = '';
                         this.style.zIndex = '';
                         this.style.boxShadow = '';
-                        
+
                         if (this._tooltip) {{
                             this._tooltip.remove();
                             this._tooltip = null;
                         }}
                     }});
                 }});
-                
+
                 // Store for fullscreen and zoom
                 window.timelineChartData = {{
                     dutList: dutList,
@@ -5070,7 +5436,7 @@ class HTMLReportService:
                     latestEnd: latestEnd,
                     totalDuration: totalDuration
                 }};
-                
+
                 // Setup pan/zoom for main timeline
                 setupMainTimelinePanZoom(container);
             }}
@@ -5080,12 +5446,12 @@ class HTMLReportService:
                 container.innerHTML = '<p class="text-muted text-center p-4">No timeline data available</p>';
             }}
         }}
-        
+
         // Zoom control functions - actually resize the chart (like Google Maps)
         window.currentTimelineZoomLevel = 0; // 0 = fit-to-width, positive = zoomed in
         const minZoomLevel = -5; // Can zoom out from fit-to-width
         const maxZoomLevel = 25; // Maximum zoom in (30 total levels for smooth zooming)
-        
+
         window.zoomTimelineIn = function() {{
             if (!window.timelineWidths || !timelineData || timelineData.length === 0) return;
             if (window.currentTimelineZoomLevel < maxZoomLevel) {{
@@ -5093,7 +5459,7 @@ class HTMLReportService:
                 rerenderTimeline();
             }}
         }};
-        
+
         window.zoomTimelineOut = function() {{
             if (!window.timelineWidths || !timelineData || timelineData.length === 0) return;
             if (window.currentTimelineZoomLevel > minZoomLevel) {{
@@ -5101,28 +5467,28 @@ class HTMLReportService:
                 rerenderTimeline();
             }}
         }};
-        
+
         window.resetTimelineZoom = function() {{
             if (!window.timelineWidths || !timelineData || timelineData.length === 0) return;
             window.currentTimelineZoomLevel = 0;
             rerenderTimeline();
         }};
-        
+
         // Re-render timeline with new zoom level
         function rerenderTimeline() {{
             if (!window.timelineWidths || !timelineData || timelineData.length === 0) return;
-            
+
             // Calculate new chart width based on zoom level - GOOGLE MAPS style
             const zoomLevel = window.currentTimelineZoomLevel;
             const fitWidth = window.timelineWidths.fit;
-            
+
             // Smooth exponential zoom like Google Maps: each level multiplies by 1.15 (15% change)
             // With 30 levels (-5 to 25), this gives a ~55x total zoom range
             const zoomMultiplier = Math.pow(1.15, zoomLevel);
             const newChartWidth = fitWidth * zoomMultiplier;
-            
+
             console.log('Zoom Debug - Level:', zoomLevel, 'Multiplier:', zoomMultiplier.toFixed(2), 'Width:', Math.round(newChartWidth), 'px');
-            
+
             // Update zoom label
             let zoomLabel;
             if (zoomLevel === 0) {{
@@ -5131,31 +5497,31 @@ class HTMLReportService:
                 const percentage = Math.round(zoomMultiplier * 100);
                 zoomLabel = `${{percentage}}%`;
             }}
-            
+
             // Update zoom level display
             const zoomLevelElement = document.getElementById('zoomLevel');
             if (zoomLevelElement) {{
                 zoomLevelElement.textContent = zoomLabel;
             }}
-            
+
             // Re-render the timeline with new width
             const container = document.getElementById('timelineChart');
             if (!container) return;
-            
+
             const totalDuration = window.timelineChartData.totalDuration;
             const earliestStart = window.timelineChartData.earliestStart;
             const latestEnd = window.timelineChartData.latestEnd;
             const dutList = window.timelineChartData.dutList;
             const chartData = window.timelineChartData.chartData;
-            
+
             const chartWidth = newChartWidth;
             window.timelineWidths.current = chartWidth;
-            
+
             const baseLaneHeight = 22;
             const laneGap = 4;
             const dutPadding = 15;
             const leftLabelWidth = 200;
-            
+
             // Re-assign lanes (same logic as before)
             function assignLanes(collectors) {{
                 const sorted = collectors.sort((a, b) => a.x - b.x);
@@ -5183,13 +5549,13 @@ class HTMLReportService:
                 }});
                 return Math.max(1, lanes.length);
             }}
-            
+
             const dutLanes = {{}};
             dutList.forEach((dutId, dutIndex) => {{
                 const dutCollectors = chartData.filter(d => d.y === dutIndex);
                 dutLanes[dutId] = assignLanes(dutCollectors);
             }});
-            
+
             const dutRowHeights = {{}};
             let chartHeight = 0;
             dutList.forEach(dutId => {{
@@ -5198,25 +5564,25 @@ class HTMLReportService:
                 dutRowHeights[dutId] = rowHeight;
                 chartHeight += rowHeight;
             }});
-            
+
             // Regenerate chart HTML (abbreviated version of original code)
             let chartHTML = `
                 <div style="display: flex; background: white; border: 1px solid #dee2e6; border-radius: 8px; overflow: hidden;">
                     <div style="width: ${{leftLabelWidth}}px; background: #f8f9fa; border-right: 2px solid #dee2e6; flex-shrink: 0;">
                         <div style="height: 40px; padding: 10px; font-weight: bold; border-bottom: 2px solid #dee2e6; background: #e9ecef;">DUT</div>
             `;
-            
+
             dutList.forEach(dutId => {{
                 chartHTML += `<div style="height: ${{dutRowHeights[dutId]}}px; padding: 15px 10px; border-bottom: 1px solid #dee2e6; font-weight: 600; color: #2c3e50; display: flex; align-items: center; font-size: 13px;">${{dutId}}</div>`;
             }});
-            
+
             chartHTML += `
                     </div>
                     <div style="flex: 1; overflow-x: auto;">
                         <div style="width: ${{chartWidth}}px;">
                             <div style="height: 40px; background: #e9ecef; border-bottom: 2px solid #dee2e6; position: relative;">
             `;
-            
+
             // Time markers (same logic as before)
             let markerInterval;
             if (totalDuration <= 30) markerInterval = 5;
@@ -5231,7 +5597,7 @@ class HTMLReportService:
             else if (totalDuration <= 14400) markerInterval = 900;
             else if (totalDuration <= 28800) markerInterval = 1800;
             else markerInterval = 3600;
-            
+
             for (let t = 0; t <= totalDuration; t += markerInterval) {{
                 const xPos = (t / totalDuration) * chartWidth;
                 let timeDisplay;
@@ -5251,7 +5617,7 @@ class HTMLReportService:
                 }}
                 chartHTML += `<div style="position: absolute; left: ${{xPos}}px; top: 0; height: 100%; border-left: 1px solid #adb5bd; padding: 8px 4px; font-size: 11px; color: #6c757d; font-weight: 500; white-space: nowrap;">${{timeDisplay}}</div>`;
             }}
-            
+
             chartHTML += `
                             </div>
                             <div style="height: 30px; background: #f8f9fa; border-bottom: 1px solid #dee2e6; position: relative; display: flex; align-items: center; padding: 0 10px;">
@@ -5264,7 +5630,7 @@ class HTMLReportService:
                             </div>
                             <div style="position: relative; height: ${{chartHeight}}px;">
             `;
-            
+
             // Draw grid lines and bars (abbreviated - same logic)
             let cumulativeHeight = 0;
             dutList.forEach(dutId => {{
@@ -5272,13 +5638,13 @@ class HTMLReportService:
                 chartHTML += `<div style="position: absolute; left: 0; top: ${{cumulativeHeight}}px; width: 100%; height: ${{rowHeight}}px; border-bottom: 1px solid #e9ecef;"></div>`;
                 cumulativeHeight += rowHeight;
             }});
-            
+
             // Vertical grid lines
             for (let t = 0; t <= totalDuration; t += markerInterval) {{
                 const xPos = (t / totalDuration) * chartWidth;
                 chartHTML += `<div style="position: absolute; left: ${{xPos}}px; top: 0; width: 1px; height: 100%; background: #e3e6ea; opacity: 0.5;"></div>`;
             }}
-            
+
             // Draw bars
             cumulativeHeight = 0;
             dutList.forEach((dutId, dutIndex) => {{
@@ -5300,7 +5666,7 @@ class HTMLReportService:
                     if (canFitName) barContent = `${{info.collector_name}} <span style="opacity: 0.7; margin-left: 6px;">(${{durationText}})</span>`;
                     else if (canFitDuration) barContent = durationText;
                     chartHTML += `
-                        <div class="gantt-bar" 
+                        <div class="gantt-bar"
                              data-dut="${{info.dut_id}}"
                              data-collector="${{info.collector_name}}"
                              data-service="${{info.group}}"
@@ -5315,16 +5681,16 @@ class HTMLReportService:
                 }});
                 cumulativeHeight += rowHeight;
             }});
-            
+
             chartHTML += `
                             </div>
                         </div>
                     </div>
                 </div>
             `;
-            
+
             container.innerHTML = '<div id="mainTimelineZoomable" style="transform-origin: top left; transition: transform 0.1s ease-out;">' + chartHTML + '</div>';
-            
+
             // Re-attach event listeners for bars (same tooltip logic)
             const bars = container.querySelectorAll('.gantt-bar');
             bars.forEach(bar => {{
@@ -5365,14 +5731,14 @@ class HTMLReportService:
                     }}
                 }});
             }});
-            
+
             // Re-setup pan/zoom
             setupMainTimelinePanZoom(container);
         }}
-        
+
         // Remove old Chart.js code - using HTML/CSS instead
         window.timelineChartInstance = null; // Placeholder for compatibility
-        
+
         // Skip the old Chart.js implementation
         if (false) {{
             window.timelineChartInstance = new Chart(ctx, {{
@@ -5392,30 +5758,30 @@ class HTMLReportService:
                         const rect = canvas.getBoundingClientRect();
                         const x = event.native.clientX - rect.left;
                         const y = event.native.clientY - rect.top;
-                        
+
                         // Check if hovering over any bar
                         hoveredBarIndex = null;
                         const chart = this;
                         const yAxis = chart.scales.y;
                         const xAxis = chart.scales.x;
-                        
+
                         chartData.forEach((dataPoint, idx) => {{
                             const yPos = yAxis.getPixelForValue(dataPoint.y);
                             const xStart = xAxis.getPixelForValue(dataPoint.x);
                             const xEnd = xAxis.getPixelForValue(dataPoint.x + dataPoint.duration);
                             const barHeight = Math.abs(yAxis.getPixelForValue(0) - yAxis.getPixelForValue(1)) * 0.85;
-                            
-                            if (x >= xStart && x <= xEnd && 
+
+                            if (x >= xStart && x <= xEnd &&
                                 y >= yPos - barHeight/2 && y <= yPos + barHeight/2) {{
                                 hoveredBarIndex = idx;
                                 canvas.style.cursor = 'pointer';
                             }}
                         }});
-                        
+
                         if (hoveredBarIndex === null) {{
                             canvas.style.cursor = 'default';
                         }}
-                        
+
                         chart.update('none');
                     }},
                     plugins: {{
@@ -5428,7 +5794,7 @@ class HTMLReportService:
                                 if (hoveredBarIndex !== null) {{
                                     const dataPoint = chartData[hoveredBarIndex];
                                     const info = dataPoint.info;
-                                    
+
                                     let tooltipEl = document.getElementById('chartjs-tooltip');
                                     if (!tooltipEl) {{
                                         tooltipEl = document.createElement('div');
@@ -5447,10 +5813,10 @@ class HTMLReportService:
                                         `;
                                         document.body.appendChild(tooltipEl);
                                     }}
-                                    
+
                                     const startTime = new Date(info.start_time).toLocaleTimeString();
                                     const endTime = new Date(info.end_time).toLocaleTimeString();
-                                    
+
                                     tooltipEl.innerHTML = `
                                         <div style="font-weight: bold; margin-bottom: 5px; color: #4fc3f7;">DUT: ${{info.dut_id}}</div>
                                         <div><strong>Collector:</strong> ${{info.collector_name}}</div>
@@ -5460,7 +5826,7 @@ class HTMLReportService:
                                         <div><strong>Start:</strong> ${{startTime}}</div>
                                         <div><strong>End:</strong> ${{endTime}}</div>
                                     `;
-                                    
+
                                     const position = context.chart.canvas.getBoundingClientRect();
                                     tooltipEl.style.left = position.left + window.pageXOffset + context.tooltip.caretX + 'px';
                                     tooltipEl.style.top = position.top + window.pageYOffset + context.tooltip.caretY + 'px';
@@ -5550,7 +5916,7 @@ class HTMLReportService:
                         const ctx = chart.ctx;
                         const yAxis = chart.scales.y;
                         const xAxis = chart.scales.x;
-                        
+
                         // Draw horizontal grid lines for each DUT row
                         ctx.save();
                         ctx.strokeStyle = 'rgba(0, 0, 0, 0.08)';
@@ -5563,7 +5929,7 @@ class HTMLReportService:
                             ctx.stroke();
                         }}
                         ctx.restore();
-                        
+
                         // Draw bars
                         chartData.forEach((dataPoint, idx) => {{
                             const yPos = yAxis.getPixelForValue(dataPoint.y);
@@ -5571,19 +5937,19 @@ class HTMLReportService:
                             const xEnd = xAxis.getPixelForValue(dataPoint.x + dataPoint.duration);
                             const barHeight = Math.abs(yAxis.getPixelForValue(0) - yAxis.getPixelForValue(1)) * 0.85;
                             const width = xEnd - xStart;
-                            
+
                             // Highlight hovered bar
                             const isHovered = hoveredBarIndex === idx;
-                            
+
                             // Draw bar
                             ctx.fillStyle = isHovered ? dataPoint.color.replace('0.8', '0.95') : dataPoint.color;
                             ctx.fillRect(xStart, yPos - barHeight/2, width, barHeight);
-                            
+
                             // Draw border
                             ctx.strokeStyle = isHovered ? '#000' : dataPoint.color.replace('0.8', '1');
                             ctx.lineWidth = isHovered ? 2 : 1;
                             ctx.strokeRect(xStart, yPos - barHeight/2, width, barHeight);
-                            
+
                             // Draw collector name on wider bars
                             if (width > 40 && barHeight > 15) {{
                                 ctx.save();
@@ -5591,10 +5957,10 @@ class HTMLReportService:
                                 ctx.font = isHovered ? 'bold 11px sans-serif' : '10px sans-serif';
                                 ctx.textAlign = 'left';
                                 ctx.textBaseline = 'middle';
-                                
+
                                 const text = dataPoint.label;
                                 const textWidth = ctx.measureText(text).width;
-                                
+
                                 if (textWidth < width - 6) {{
                                     ctx.fillText(text, xStart + 3, yPos);
                                 }}
@@ -5605,7 +5971,7 @@ class HTMLReportService:
                 }}]
             }});
         }}
-        
+
         // Populate DUT Details Section (as table)
         const dutDetailsContent = document.getElementById('dutDetailsContent');
         if (dutDetailsContent) {{
@@ -5626,7 +5992,7 @@ class HTMLReportService:
                     </thead>
                     <tbody>
             `;
-            
+
             for (const [dutId, summary] of Object.entries(dutSummaries)) {{
                 const dutCollectors = timelineData.filter(c => c.dut_id === dutId);
                 // Match status strings from timing.json
@@ -5634,7 +6000,7 @@ class HTMLReportService:
                 const errorCount = dutCollectors.filter(c => c.status.toUpperCase() === 'ERROR').length;
                 const partialCount = dutCollectors.filter(c => c.status.toUpperCase() === 'PARTIAL').length;
                 const skippedCount = dutCollectors.filter(c => c.status.toUpperCase() === 'SKIPPED').length;
-                
+
                 tableHTML += `
                     <tr>
                         <td><strong>${{dutId}}</strong></td>
@@ -5649,27 +6015,27 @@ class HTMLReportService:
                     </tr>
                 `;
             }}
-            
+
             tableHTML += `
                     </tbody>
                 </table>
             `;
             dutDetailsContent.innerHTML = tableHTML;
         }}
-        
+
         // Populate Collector Timing Table
         const collectorTimingBody = document.getElementById('collectorTimingBody');
         if (collectorTimingBody) {{
             let tableHTML = '';
             timelineData.forEach(item => {{
                 const statusUpper = item.status.toUpperCase();
-                const statusClass = statusUpper === 'SUCCESS' ? 'table-success' : 
-                                  statusUpper === 'ERROR' ? 'table-danger' : 
+                const statusClass = statusUpper === 'SUCCESS' ? 'table-success' :
+                                  statusUpper === 'ERROR' ? 'table-danger' :
                                   statusUpper === 'SKIPPED' ? 'table-warning' : '';
-                
+
                 // Map service to color class
                 const serviceClass = 'badge service-badge service-' + item.group.toLowerCase().replace(/[^a-z0-9]/g, '_');
-                
+
                 tableHTML += `
                     <tr class="${{statusClass}}">
                         <td>${{item.dut_id}}</td>
@@ -5684,62 +6050,62 @@ class HTMLReportService:
             }});
             collectorTimingBody.innerHTML = tableHTML;
         }}
-        
+
         // Table sorting function
         let sortDirection = {{}};
         function sortTable(columnIndex) {{
             const table = document.getElementById('collectorTimingTable');
             const tbody = table.getElementsByTagName('tbody')[0];
             const rows = Array.from(tbody.getElementsByTagName('tr'));
-            
+
             // Toggle sort direction
             sortDirection[columnIndex] = !sortDirection[columnIndex];
             const isAscending = sortDirection[columnIndex];
-            
+
             rows.sort((a, b) => {{
                 let aValue = a.getElementsByTagName('td')[columnIndex].textContent;
                 let bValue = b.getElementsByTagName('td')[columnIndex].textContent;
-                
+
                 // Handle numeric sorting for duration
                 if (columnIndex === 4) {{
                     aValue = parseFloat(aValue);
                     bValue = parseFloat(bValue);
                 }}
-                
+
                 if (aValue < bValue) return isAscending ? -1 : 1;
                 if (aValue > bValue) return isAscending ? 1 : -1;
                 return 0;
             }});
-            
+
             // Clear tbody and append sorted rows
             tbody.innerHTML = '';
             rows.forEach(row => tbody.appendChild(row));
         }}
-        
+
         // Populate detailed collector list
         const collectorList = document.getElementById('collectorList');
         const searchInput = document.getElementById('collectorSearch');
-        
+
         function renderCollectorList(filter = '') {{
-            const filteredData = filter 
-                ? timelineData.filter(item => 
+            const filteredData = filter
+                ? timelineData.filter(item =>
                     item.collector_name.toLowerCase().includes(filter.toLowerCase()) ||
                     item.dut_id.toLowerCase().includes(filter.toLowerCase()) ||
                     item.group.toLowerCase().includes(filter.toLowerCase())
                   )
                 : timelineData;
-            
+
             collectorList.innerHTML = filteredData.map(item => {{
                 const statusUpper = item.status.toUpperCase();
-                const statusClass = statusUpper === 'SUCCESS' ? 'status-success' : 
-                                  statusUpper === 'ERROR' ? 'status-error' : 
-                                  statusUpper === 'SKIPPED' ? 'status-skipped' : 
+                const statusClass = statusUpper === 'SUCCESS' ? 'status-success' :
+                                  statusUpper === 'ERROR' ? 'status-error' :
+                                  statusUpper === 'SKIPPED' ? 'status-skipped' :
                                   'status-partial';
                 // Map service to color class (consistent with table)
                 const serviceClass = 'badge service-badge service-' + item.group.toLowerCase().replace(/[^a-z0-9]/g, '_');
                 const startTime = new Date(item.start_time);
                 const endTime = new Date(item.end_time);
-                
+
                 return `
                     <div class="collector-row ${{statusClass}}">
                         <span class="${{serviceClass}}">${{item.group}}</span>
@@ -5753,7 +6119,7 @@ class HTMLReportService:
                 `;
             }}).join('');
         }}
-        
+
         // Initialize the list after DOM is ready
         if (collectorList && searchInput) {{
             searchInput.addEventListener('input', (e) => renderCollectorList(e.target.value));
@@ -5761,38 +6127,38 @@ class HTMLReportService:
         }} else {{
             console.error('Collector list elements not found');
         }}
-        
+
         // Log data for debugging
         console.log('Timeline data loaded:', timelineData.length, 'collectors');
         console.log('DUT summaries:', Object.keys(dutSummaries).length, 'DUTs');
         console.log('Service stats:', Object.keys(serviceStats).length, 'services');
-        
+
         // Sidebar navigation active state and smooth scrolling
         document.querySelectorAll('.sidebar-nav a').forEach(link => {{
             link.addEventListener('click', function(e) {{
                 e.preventDefault();
                 const targetId = this.getAttribute('href').substring(1);
                 const targetElement = document.getElementById(targetId);
-                
+
                 if (targetElement) {{
                     // Smooth scroll to section
                     targetElement.scrollIntoView({{
                         behavior: 'smooth',
                         block: 'start'
                     }});
-                    
+
                     // Update active state
                     document.querySelectorAll('.sidebar-nav a').forEach(l => l.classList.remove('active'));
                     this.classList.add('active');
                 }}
             }});
         }});
-        
+
         // Highlight active section on scroll
         window.addEventListener('scroll', () => {{
             const sections = ['summary', 'dut-performance', 'service-breakdown', 'stage-breakdown', 'timeline', 'dut-details', 'collector-timing', 'collector-log'];
             let currentSection = '';
-            
+
             sections.forEach(sectionId => {{
                 const section = document.getElementById(sectionId);
                 if (section) {{
@@ -5802,7 +6168,7 @@ class HTMLReportService:
                     }}
                 }}
             }});
-            
+
             if (currentSection) {{
                 document.querySelectorAll('.sidebar-nav a').forEach(link => {{
                     link.classList.remove('active');
@@ -5812,36 +6178,36 @@ class HTMLReportService:
                 }});
             }}
         }});
-        
+
         // Main Timeline Pan & Zoom
         let mainZoom = 1.0;
         let mainPanX = 0;
         let mainPanY = 0;
         let mainPanning = false;
-        
+
         function setupMainTimelinePanZoom(container) {{
             const zoomable = container.querySelector('#mainTimelineZoomable');
             if (!zoomable) return;
-            
+
             // Smooth zoom with limits - handle trackpad smooth scrolling
             let lastWheelTime = 0;
             const wheelCooldown = 250; // Minimum time between zoom actions (ms) - higher for trackpads
-            
+
             // Mouse wheel zoom - smooth and gradual
             container.addEventListener('wheel', function(e) {{
                 e.preventDefault();
-                
+
                 const now = Date.now();
                 if (now - lastWheelTime < wheelCooldown) {{
                     return; // Ignore rapid scroll events (trackpads generate many events per gesture)
                 }}
                 lastWheelTime = now;
-                
+
                 // Get current zoom level and limits
                 const currentLevel = window.currentTimelineZoomLevel || 0;
                 const minZoom = -5; // Can zoom out from fit-to-width
                 const maxZoom = 25; // Maximum zoom in (30 total levels)
-                
+
                 // Small delta = one zoom step
                 if (e.deltaY < 0 && currentLevel < maxZoom) {{
                     // Scroll up = zoom in (but not past max)
@@ -5851,11 +6217,11 @@ class HTMLReportService:
                     if (window.zoomTimelineOut) window.zoomTimelineOut();
                 }}
             }}, {{ passive: false }});
-            
+
             // Note: Panning is now handled by native scrolling (overflow-x: auto on the timeline container)
             // No need for custom drag-to-pan logic
         }}
-        
+
         // Fullscreen Timeline Functionality with Pan & Zoom
         let fullscreenChart = null;
         let currentZoom = 1.0;
@@ -5864,32 +6230,32 @@ class HTMLReportService:
         let isPanning = false;
         let startPanX = 0;
         let startPanY = 0;
-        
+
         function setupPanZoom(container) {{
             const zoomable = container.querySelector('#zoomableTimeline');
             if (!zoomable) return;
-            
+
             // Mouse wheel zoom
             container.addEventListener('wheel', function(e) {{
                 e.preventDefault();
-                
+
                 const rect = container.getBoundingClientRect();
                 const mouseX = e.clientX - rect.left;
                 const mouseY = e.clientY - rect.top;
-                
+
                 // Zoom factor
                 const zoomFactor = e.deltaY < 0 ? 1.1 : 0.9;
                 const oldZoom = currentZoom;
                 currentZoom = Math.max(0.5, Math.min(5, currentZoom * zoomFactor));
-                
+
                 // Adjust pan to zoom towards mouse position
                 const zoomChange = currentZoom / oldZoom;
                 panX = mouseX - (mouseX - panX) * zoomChange;
                 panY = mouseY - (mouseY - panY) * zoomChange;
-                
+
                 updateTransform(zoomable);
             }});
-            
+
             // Mouse drag pan
             container.addEventListener('mousedown', function(e) {{
                 // Only pan if not clicking on a bar
@@ -5901,7 +6267,7 @@ class HTMLReportService:
                     e.preventDefault();
                 }}
             }});
-            
+
             container.addEventListener('mousemove', function(e) {{
                 if (isPanning) {{
                     panX = e.clientX - startPanX;
@@ -5910,14 +6276,14 @@ class HTMLReportService:
                     e.preventDefault();
                 }}
             }});
-            
+
             container.addEventListener('mouseup', function() {{
                 if (isPanning) {{
                     isPanning = false;
                     container.style.cursor = 'default';
                 }}
             }});
-            
+
             container.addEventListener('mouseleave', function() {{
                 if (isPanning) {{
                     isPanning = false;
@@ -5925,21 +6291,21 @@ class HTMLReportService:
                 }}
             }});
         }}
-        
+
         function updateTransform(element) {{
             if (!element) return;
             element.style.transform = `translate(${{panX}}px, ${{panY}}px) scale(${{currentZoom}})`;
         }}
-        
+
         function openFullscreenTimeline() {{
             const modal = document.getElementById('fullscreenModal');
             modal.classList.add('active');
-            
+
             // Reset zoom and pan
             currentZoom = 1.0;
             panX = 0;
             panY = 0;
-            
+
             // Use HTML/CSS version for fullscreen
             const container = document.getElementById('timelineChartFullscreen');
             if (container && window.timelineChartData) {{
@@ -5947,13 +6313,13 @@ class HTMLReportService:
                 const mainTimeline = document.getElementById('timelineChart');
                 if (mainTimeline) {{
                     // Wrap in a transformable container
-                    container.innerHTML = '<div id="zoomableTimeline" style="transform-origin: top left; transition: transform 0.2s ease-out;">' + 
-                                         mainTimeline.innerHTML + 
+                    container.innerHTML = '<div id="zoomableTimeline" style="transform-origin: top left; transition: transform 0.2s ease-out;">' +
+                                         mainTimeline.innerHTML +
                                          '</div>';
-                    
+
                     // Setup pan and zoom handlers
                     setupPanZoom(container);
-                    
+
                     // Re-attach event listeners
                     const bars = container.querySelectorAll('.gantt-bar');
                     bars.forEach(bar => {{
@@ -5962,7 +6328,7 @@ class HTMLReportService:
                             this.style.transform = 'scaleY(1.1)';
                             this.style.zIndex = '10';
                             this.style.boxShadow = '0 4px 8px rgba(0,0,0,0.2)';
-                            
+
                             const tooltip = document.createElement('div');
                             tooltip.className = 'gantt-tooltip-fs';
                             tooltip.style.cssText = `
@@ -5978,7 +6344,7 @@ class HTMLReportService:
                                 box-shadow: 0 4px 12px rgba(0,0,0,0.3);
                                 line-height: 1.6;
                             `;
-                            
+
                             tooltip.innerHTML = `
                                 <div style="font-weight: bold; margin-bottom: 6px; color: #4fc3f7; font-size: 13px;">DUT: ${{this.dataset.dut}}</div>
                                 <div><strong>Collector:</strong> ${{this.dataset.collector}}</div>
@@ -5988,24 +6354,24 @@ class HTMLReportService:
                                 <div><strong>Start:</strong> ${{this.dataset.start}}</div>
                                 <div><strong>End:</strong> ${{this.dataset.end}}</div>
                             `;
-                            
+
                             document.body.appendChild(tooltip);
                             this._tooltip = tooltip;
                         }});
-                        
+
                         bar.addEventListener('mousemove', function(e) {{
                             if (this._tooltip) {{
                                 this._tooltip.style.left = (e.clientX + 15) + 'px';
                                 this._tooltip.style.top = (e.clientY + 15) + 'px';
                             }}
                         }});
-                        
+
                         bar.addEventListener('mouseleave', function() {{
                             this.style.filter = '';
                             this.style.transform = '';
                             this.style.zIndex = '';
                             this.style.boxShadow = '';
-                            
+
                             if (this._tooltip) {{
                                 this._tooltip.remove();
                                 this._tooltip = null;
@@ -6014,11 +6380,11 @@ class HTMLReportService:
                     }});
                 }}
             }}
-            
+
             // Old Chart.js version - skip it
             if (false) {{
                 let hoveredBarIndexFS = null;
-                
+
                 fullscreenChart = new Chart(ctx, {{
                     type: 'scatter',
                     data: {{
@@ -6036,29 +6402,29 @@ class HTMLReportService:
                             const rect = canvas.getBoundingClientRect();
                             const x = event.native.clientX - rect.left;
                             const y = event.native.clientY - rect.top;
-                            
+
                             hoveredBarIndexFS = null;
                             const chart = this;
                             const yAxis = chart.scales.y;
                             const xAxis = chart.scales.x;
-                            
+
                             chartData.forEach((dataPoint, idx) => {{
                                 const yPos = yAxis.getPixelForValue(dataPoint.y);
                                 const xStart = xAxis.getPixelForValue(dataPoint.x);
                                 const xEnd = xAxis.getPixelForValue(dataPoint.x + dataPoint.duration);
                                 const barHeight = Math.abs(yAxis.getPixelForValue(0) - yAxis.getPixelForValue(1)) * 0.85;
-                                
-                                if (x >= xStart && x <= xEnd && 
+
+                                if (x >= xStart && x <= xEnd &&
                                     y >= yPos - barHeight/2 && y <= yPos + barHeight/2) {{
                                     hoveredBarIndexFS = idx;
                                     canvas.style.cursor = 'pointer';
                                 }}
                             }});
-                            
+
                             if (hoveredBarIndexFS === null) {{
                                 canvas.style.cursor = 'default';
                             }}
-                            
+
                             chart.update('none');
                         }},
                         plugins: {{
@@ -6071,7 +6437,7 @@ class HTMLReportService:
                                     if (hoveredBarIndexFS !== null) {{
                                         const dataPoint = chartData[hoveredBarIndexFS];
                                         const info = dataPoint.info;
-                                        
+
                                         let tooltipEl = document.getElementById('chartjs-tooltip-fs');
                                         if (!tooltipEl) {{
                                             tooltipEl = document.createElement('div');
@@ -6090,10 +6456,10 @@ class HTMLReportService:
                                             `;
                                             document.body.appendChild(tooltipEl);
                                         }}
-                                        
+
                                         const startTime = new Date(info.start_time).toLocaleTimeString();
                                         const endTime = new Date(info.end_time).toLocaleTimeString();
-                                        
+
                                         tooltipEl.innerHTML = `
                                             <div style="font-weight: bold; margin-bottom: 5px; color: #4fc3f7;">DUT: ${{info.dut_id}}</div>
                                             <div><strong>Collector:</strong> ${{info.collector_name}}</div>
@@ -6103,7 +6469,7 @@ class HTMLReportService:
                                             <div><strong>Start:</strong> ${{startTime}}</div>
                                             <div><strong>End:</strong> ${{endTime}}</div>
                                         `;
-                                        
+
                                         const position = context.chart.canvas.getBoundingClientRect();
                                         tooltipEl.style.left = position.left + window.pageXOffset + context.tooltip.caretX + 'px';
                                         tooltipEl.style.top = position.top + window.pageYOffset + context.tooltip.caretY + 'px';
@@ -6193,7 +6559,7 @@ class HTMLReportService:
                             const ctx = chart.ctx;
                             const yAxis = chart.scales.y;
                             const xAxis = chart.scales.x;
-                            
+
                             // Draw horizontal grid lines
                             ctx.save();
                             ctx.strokeStyle = 'rgba(0, 0, 0, 0.08)';
@@ -6206,7 +6572,7 @@ class HTMLReportService:
                                 ctx.stroke();
                             }}
                             ctx.restore();
-                            
+
                             // Draw bars
                             chartData.forEach((dataPoint, idx) => {{
                                 const yPos = yAxis.getPixelForValue(dataPoint.y);
@@ -6214,26 +6580,26 @@ class HTMLReportService:
                                 const xEnd = xAxis.getPixelForValue(dataPoint.x + dataPoint.duration);
                                 const barHeight = Math.abs(yAxis.getPixelForValue(0) - yAxis.getPixelForValue(1)) * 0.85;
                                 const width = xEnd - xStart;
-                                
+
                                 const isHovered = hoveredBarIndexFS === idx;
-                                
+
                                 ctx.fillStyle = isHovered ? dataPoint.color.replace('0.8', '0.95') : dataPoint.color;
                                 ctx.fillRect(xStart, yPos - barHeight/2, width, barHeight);
-                                
+
                                 ctx.strokeStyle = isHovered ? '#000' : dataPoint.color.replace('0.8', '1');
                                 ctx.lineWidth = isHovered ? 2 : 1;
                                 ctx.strokeRect(xStart, yPos - barHeight/2, width, barHeight);
-                                
+
                                 if (width > 40 && barHeight > 15) {{
                                     ctx.save();
                                     ctx.fillStyle = '#000';
                                     ctx.font = isHovered ? 'bold 11px sans-serif' : '10px sans-serif';
                                     ctx.textAlign = 'left';
                                     ctx.textBaseline = 'middle';
-                                    
+
                                     const text = dataPoint.label;
                                     const textWidth = ctx.measureText(text).width;
-                                    
+
                                     if (textWidth < width - 6) {{
                                         ctx.fillText(text, xStart + 3, yPos);
                                     }}
@@ -6245,46 +6611,46 @@ class HTMLReportService:
                 }});
             }} // End of skipped Chart.js fullscreen code
         }}
-        
+
         function closeFullscreenTimeline() {{
             const modal = document.getElementById('fullscreenModal');
             modal.classList.remove('active');
             currentZoom = 1.0;
         }}
-        
+
         function zoomTimeline(factor) {{
             const zoomable = document.querySelector('#zoomableTimeline');
             if (!zoomable) return;
-            
+
             const container = document.getElementById('timelineChartFullscreen');
             const rect = container.getBoundingClientRect();
-            
+
             // Zoom towards center
             const centerX = rect.width / 2;
             const centerY = rect.height / 2;
-            
+
             const oldZoom = currentZoom;
             currentZoom = Math.max(0.5, Math.min(5, currentZoom * factor));
-            
+
             // Adjust pan to zoom towards center
             const zoomChange = currentZoom / oldZoom;
             panX = centerX - (centerX - panX) * zoomChange;
             panY = centerY - (centerY - panY) * zoomChange;
-            
+
             updateTransform(zoomable);
         }}
-        
+
         function resetZoom() {{
             const zoomable = document.querySelector('#zoomableTimeline');
             if (!zoomable) return;
-            
+
             currentZoom = 1.0;
             panX = 0;
             panY = 0;
-            
+
             updateTransform(zoomable);
         }}
-        
+
         // Close fullscreen on Escape key
         document.addEventListener('keydown', (e) => {{
             if (e.key === 'Escape') {{
@@ -6333,42 +6699,231 @@ class HTMLReportService:
         # Sort node_reports by node name
         node_reports_sorted = sorted(node_reports, key=lambda p: p.parent.name.lower())
 
-        # Calculate executive summary stats
+        # Calculate executive summary stats (prefer collection_status.json for alignment)
         total_duts = len(node_reports)
         total_log_size = 0
         total_collectors_pass = 0
         total_collectors_fail = 0
         total_collectors_partial = 0
-        total_collectors_skipped = 0
-        total_collectors = 0
+        total_collectors_skipped = 0  # runtime-skipped only
+        total_collectors_to_run = 0  # collectors_to_run (excludes filtered-out)
+        total_collectors_all = 0  # includes filtered-out
+        total_filtered_out = 0
+        # Collect per-status details for executive-summary modals
+        status_collectors = {
+            "pass": defaultdict(list),
+            "fail": defaultdict(list),
+            "partial": defaultdict(list),
+            "skipped": defaultdict(list),
+        }
 
+        # Build a per-DUT map of collector-group aliases to their report filenames
+        node_group_report_map: Dict[str, Dict[str, str]] = {}
+        for rep in node_reports_sorted:
+            _dut_name = rep.parent.name
+            _dut_path = self.root_dir / _dut_name
+            alias_map: Dict[str, str] = {}
+            try:
+                for group_folder in self._get_collector_groups(_dut_path):
+                    folder_name = group_folder.name
+                    report_filename = f"{folder_name}_report.html"
+                    aliases = set()
+                    aliases.add(folder_name)
+                    aliases.add(folder_name.lower())
+                    aliases.add(folder_name.replace("_", "").lower())
+                    norm_name = self._normalize_group_name(folder_name)
+                    if norm_name:
+                        aliases.add(norm_name)
+                        aliases.add(norm_name.lower())
+                        aliases.add(norm_name.replace(" ", "_").lower())
+                        aliases.add(norm_name.replace("_", "").lower())
+                    # Special-case to tolerate healthcheck/health_check
+                    if folder_name.lower() == "health_check":
+                        aliases.add("healthcheck")
+                        aliases.add("health_check")
+                    for a in aliases:
+                        alias_map[a] = report_filename
+            except Exception:
+                alias_map = {}
+            node_group_report_map[_dut_name] = alias_map
+
+        # Aggregate log sizes and compute counts from per-DUT collection_status.json when present
         for report_html in node_reports_sorted:
             node_name = report_html.parent.name
             node_path = self.root_dir / node_name
             log_size = self._get_total_log_size(node_path)
             total_log_size += log_size
 
-            # Count collectors from node_statuses_all
-            statuses_for_node = self.node_statuses_all.get(node_name, [])
-            for status in statuses_for_node:
-                status_text = status.split()[0].lower()
-                total_collectors += 1
-                if status_text in ["complete", "success"]:
-                    total_collectors_pass += 1
-                elif status_text == "error":
-                    total_collectors_fail += 1
-                elif status_text == "partial":
-                    total_collectors_partial += 1
-                elif status_text == "skipped":
-                    total_collectors_skipped += 1
+            # Prefer per-DUT JSON if available
+            dut_json = node_path / ".metadata" / "collection_status.json"
+            if dut_json.exists():
+                try:
+                    with open(dut_json, "r", encoding="utf-8") as f:
+                        dut_status = json.load(f)
+                    collectors = dut_status.get("collectors", {})
+                    total_collectors_all += len(collectors)
+                    for _key, entry in collectors.items():
+                        status_text = (entry.get("status") or "").lower()
+                        start_time = entry.get("start_time")
+                        # Capture details for the tables
+                        collector_id = (
+                            entry.get("collector_id") or _key.split(":", 1)[-1]
+                        )
+                        collector_name = (
+                            entry.get("collector_name") or entry.get("name") or "N/A"
+                        )
+                        group_name_raw = entry.get(
+                            "group"
+                        ) or self._normalize_group_name(
+                            self._get_group_from_collector_id(collector_id)
+                        )
+                        # Resolve report file using alias map for this DUT
+                        report_file = None
+                        if group_name_raw and str(group_name_raw).strip():
+                            gm = node_group_report_map.get(node_name, {})
+                            g = str(group_name_raw)
+                            candidates = [
+                                g,
+                                g.lower(),
+                                g.replace(" ", "_"),
+                                g.replace("_", "").lower(),
+                            ]
+                            gn = self._normalize_group_name(g)
+                            if gn:
+                                candidates.extend(
+                                    [
+                                        gn,
+                                        gn.lower(),
+                                        gn.replace(" ", "_").lower(),
+                                        gn.replace("_", "").lower(),
+                                    ]
+                                )
+                            if g.lower() == "healthcheck":
+                                candidates.append("health_check")
+                            for cand in candidates:
+                                if cand in gm:
+                                    report_file = gm[cand]
+                                    break
+                        anchor_id = self._generate_safe_id("collector", collector_id)
+                        if status_text in ["complete", "success"]:
+                            total_collectors_pass += 1
+                            if report_file:
+                                status_collectors["pass"][node_name].append(
+                                    (
+                                        collector_id,
+                                        collector_name,
+                                        report_file,
+                                        anchor_id,
+                                    )
+                                )
+                        elif status_text == "error":
+                            total_collectors_fail += 1
+                            if report_file:
+                                status_collectors["fail"][node_name].append(
+                                    (
+                                        collector_id,
+                                        collector_name,
+                                        report_file,
+                                        anchor_id,
+                                    )
+                                )
+                        elif status_text == "partial":
+                            total_collectors_partial += 1
+                            if report_file:
+                                status_collectors["partial"][node_name].append(
+                                    (
+                                        collector_id,
+                                        collector_name,
+                                        report_file,
+                                        anchor_id,
+                                    )
+                                )
+                        elif status_text == "skipped":
+                            if start_time is None:
+                                total_filtered_out += 1
+                            else:
+                                total_collectors_skipped += 1
+                                if report_file:
+                                    status_collectors["skipped"][node_name].append(
+                                        (
+                                            collector_id,
+                                            collector_name,
+                                            report_file,
+                                            anchor_id,
+                                        )
+                                    )
+                except Exception:
+                    # Fallback to node_statuses_all if JSON parsing fails
+                    statuses_for_node = self.node_statuses_all.get(node_name, [])
+                    for status in statuses_for_node:
+                        status_text = status.split()[0].lower()
+                        total_collectors_all += 1
+                        if status_text in ["complete", "success"]:
+                            total_collectors_pass += 1
+                        elif status_text == "error":
+                            total_collectors_fail += 1
+                        elif status_text == "partial":
+                            total_collectors_partial += 1
+                        elif status_text == "skipped":
+                            total_collectors_skipped += 1
+            else:
+                # Fallback path when JSON is missing
+                statuses_for_node = self.node_statuses_all.get(node_name, [])
+                for status in statuses_for_node:
+                    status_text = status.split()[0].lower()
+                    total_collectors_all += 1
+                    if status_text in ["complete", "success"]:
+                        total_collectors_pass += 1
+                    elif status_text == "error":
+                        total_collectors_fail += 1
+                    elif status_text == "partial":
+                        total_collectors_partial += 1
+                    elif status_text == "skipped":
+                        total_collectors_skipped += 1
+
+        # Helper to build status tables for modal bodies
+        def build_status_table(data: Dict[str, List[Tuple[str, str, str, str]]]) -> str:
+            if not data or not any(data.values()):
+                return '<p class="text-muted mb-0">No collectors found.</p>'
+            rows = []
+            # Sort DUTs by name
+            for dut in sorted(data.keys(), key=lambda x: x.lower()):
+                collectors_for_dut = data.get(dut, [])
+                if not collectors_for_dut:
+                    continue
+                # Sort collectors by ID
+                collectors_for_dut_sorted = sorted(
+                    collectors_for_dut, key=lambda t: (t[0] or "").lower()
+                )
+                links = "<br>".join(
+                    f'<a href="{escape(dut)}/{escape(report_file)}#{escape(anchor_id)}">{escape(collector_id)} - {escape(collector_name)}</a>'
+                    for collector_id, collector_name, report_file, anchor_id in collectors_for_dut_sorted
+                )
+                rows.append(f"<tr><td>{escape(dut)}</td><td>{links}</td></tr>")
+            if not rows:
+                return '<p class="text-muted mb-0">No collectors found.</p>'
+            return (
+                '<div class="table-responsive">'
+                '<table class="table table-sm table-striped">'
+                '<thead class="table-dark"><tr><th>DUT ID</th><th>Collectors</th></tr></thead>'
+                f"<tbody>{''.join(rows)}</tbody>"
+                "</table>"
+                "</div>"
+            )
+
+        # Exclude filtered-out from denominator used in charts
+        total_collectors_to_run = max(total_collectors_all - total_filtered_out, 0)
 
         # Generate executive summary cards
+        overall_percent = 0
+        if total_collectors_to_run > 0:
+            overall_percent = total_collectors_pass / total_collectors_to_run * 100
         executive_summary = f"""
         <div class="mb-3">
             <h2 class="mb-4">Executive Summary</h2>
             <div class="row mb-3">
-                <div class="col-md-3">
-                    <div class="card text-white bg-primary mb-3" style="cursor: pointer;" data-bs-toggle="modal" data-bs-target="#dutModal">
+                <div class="col-md-4">
+                    <div class="card text-white bg-primary mb-3 h-100" style="cursor: pointer;" data-bs-toggle="modal" data-bs-target="#dutModal">
                         <div class="card-body text-center">
                             <h5 class="card-title">Total DUTs</h5>
                             <p class="display-4">{total_duts}</p>
@@ -6376,30 +6931,59 @@ class HTMLReportService:
                         </div>
                     </div>
                 </div>
-                <div class="col-md-3">
-                    <div class="card text-white bg-success mb-3" style="cursor: pointer;" data-bs-toggle="modal" data-bs-target="#passedModal">
-                        <div class="card-body text-center">
-                            <h5 class="card-title">Passed Collectors</h5>
-                            <p class="display-4">{total_collectors_pass}</p>
-                            <small>of {total_collectors} total</small>
-                        </div>
-                    </div>
-                </div>
-                <div class="col-md-3">
-                    <div class="card text-white bg-danger mb-3" style="cursor: pointer;" data-bs-toggle="modal" data-bs-target="#failedModal">
-                        <div class="card-body text-center">
-                            <h5 class="card-title">Failed Collectors</h5>
-                            <p class="display-4">{total_collectors_fail}</p>
-                            <small>Partial: {total_collectors_partial}</small>
-                        </div>
-                    </div>
-                </div>
-                <div class="col-md-3">
-                    <div class="card text-white bg-info mb-3" style="cursor: pointer;" data-bs-toggle="modal" data-bs-target="#logSizeModal">
+                <div class="col-md-4">
+                    <div class="card text-white bg-info mb-3 h-100" style="cursor: pointer;" data-bs-toggle="modal" data-bs-target="#logSizeModal">
                         <div class="card-body text-center">
                             <h5 class="card-title">Total Log Size</h5>
                             <p class="display-4" style="font-size: 2rem;">{self._format_bytes(total_log_size)}</p>
                             <small><i class="bi bi-hand-index"></i> Click for details</small>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-4">
+                    <div class="card mb-3 h-100" style="cursor: default; background: linear-gradient(135deg, #6f42c1 0%, #b28dff 100%); color: #ffffff;">
+                        <div class="card-body text-center">
+                            <h5 class="card-title">Overall Collection %</h5>
+                            <p class="display-4">{overall_percent:.1f}%</p>
+                            <small>Passed / Collectors to run</small>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="row mb-3">
+                <div class="col-md-3">
+                    <div class="card text-white bg-success mb-3 h-100" style="cursor: pointer;" data-bs-toggle="modal" data-bs-target="#passedModal">
+                        <div class="card-body text-center">
+                            <h5 class="card-title">Passed Collectors</h5>
+                            <p class="display-4">{total_collectors_pass}</p>
+                            <small>of {total_collectors_to_run} to run</small>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="card text-white bg-danger mb-3 h-100" style="cursor: pointer;" data-bs-toggle="modal" data-bs-target="#failedModal">
+                        <div class="card-body text-center">
+                            <h5 class="card-title">Failed Collectors</h5>
+                            <p class="display-4">{total_collectors_fail}</p>
+                            <small>of {total_collectors_to_run} to run</small>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="card mb-3 h-100" style="cursor: pointer; background: linear-gradient(315deg, #ffd54f 0%, #fff176 100%); color: #ffffff;" data-bs-toggle="modal" data-bs-target="#partialModal">
+                        <div class="card-body text-center">
+                            <h5 class="card-title">Partial Collectors</h5>
+                            <p class="display-4">{total_collectors_partial}</p>
+                            <small>of {total_collectors_to_run} to run</small>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="card mb-3 h-100" style="cursor: pointer; background: linear-gradient(135deg, #ff9800 0%, #ffc107 100%); color: #ffffff;" data-bs-toggle="modal" data-bs-target="#skippedModal">
+                        <div class="card-body text-center">
+                            <h5 class="card-title">Skipped Collectors</h5>
+                            <p class="display-4">{total_collectors_skipped}</p>
+                            <small>of {total_collectors_to_run} to run</small>
                         </div>
                     </div>
                 </div>
@@ -6438,21 +7022,26 @@ class HTMLReportService:
                     <div class="card mb-3">
                         <div class="card-body">
                             <h5 class="card-title">Collection Status</h5>
-                            <div class="progress" style="height: 30px;">
-                                <div class="progress-bar bg-success" role="progressbar" style="width: {(total_collectors_pass/total_collectors*100) if total_collectors > 0 else 0:.1f}%" 
-                                     aria-valuenow="{total_collectors_pass}" aria-valuemin="0" aria-valuemax="{total_collectors}">
+                                <div class="progress" style="height: 30px;">
+                                <div class="progress-bar bg-success" role="progressbar" style="width: {(total_collectors_pass/total_collectors_to_run*100) if total_collectors_to_run > 0 else 0:.1f}%"
+                                     aria-valuenow="{total_collectors_pass}" aria-valuemin="0" aria-valuemax="{total_collectors_to_run}">
                                     {total_collectors_pass} Pass
                                 </div>
-                                <div class="progress-bar bg-danger" role="progressbar" style="width: {(total_collectors_fail/total_collectors*100) if total_collectors > 0 else 0:.1f}%" 
-                                     aria-valuenow="{total_collectors_fail}" aria-valuemin="0" aria-valuemax="{total_collectors}">
+                                <div class="progress-bar bg-danger" role="progressbar" style="width: {(total_collectors_fail/total_collectors_to_run*100) if total_collectors_to_run > 0 else 0:.1f}%"
+                                     aria-valuenow="{total_collectors_fail}" aria-valuemin="0" aria-valuemax="{total_collectors_to_run}">
                                     {total_collectors_fail} Fail
                                 </div>
-                                <div class="progress-bar bg-warning" role="progressbar" style="width: {(total_collectors_skipped/total_collectors*100) if total_collectors > 0 else 0:.1f}%" 
-                                     aria-valuenow="{total_collectors_skipped}" aria-valuemin="0" aria-valuemax="{total_collectors}">
+                                <div class="progress-bar" role="progressbar" style="background-color: #fffacd; color: #000; width: {(total_collectors_partial/total_collectors_to_run*100) if total_collectors_to_run > 0 else 0:.1f}%"
+                                     aria-valuenow="{total_collectors_partial}" aria-valuemin="0" aria-valuemax="{total_collectors_to_run}">
+                                    {total_collectors_partial} Partial
+                                </div>
+                                <div class="progress-bar bg-warning" role="progressbar" style="width: {(total_collectors_skipped/total_collectors_to_run*100) if total_collectors_to_run > 0 else 0:.1f}%"
+                                     aria-valuenow="{total_collectors_skipped}" aria-valuemin="0" aria-valuemax="{total_collectors_to_run}">
                                     {total_collectors_skipped} Skip
                                 </div>
                             </div>
-                            <small class="text-muted mt-2 d-block">Total: {total_collectors} collectors across {total_duts} DUTs</small>
+                            <small class="text-muted mt-2 d-block">Total: {total_collectors_all} collectors across {total_duts} DUTs</small>
+                            <small class="text-muted d-block">Collectors to run: {total_collectors_to_run} &nbsp;&nbsp; FilteredOut: {total_filtered_out}</small>
                             <hr>
                             <h6 class="text-muted mb-0">Total Runtime</h6>
                             <p class="h4 mb-0 mt-1">{self._format_time(self.total_runtime) if self.total_runtime is not None else 'N/A'}</p>
@@ -6461,7 +7050,7 @@ class HTMLReportService:
                 </div>
             </div>
         </div>
-        
+
         <!-- Modals for Executive Summary Cards -->
         <div class="modal fade" id="dutModal" tabindex="-1">
             <div class="modal-dialog modal-lg">
@@ -6495,17 +7084,17 @@ class HTMLReportService:
 
         # Calculate success rate for passed modal
         success_rate = (
-            (total_collectors_pass / total_collectors * 100)
-            if total_collectors > 0
+            (total_collectors_pass / total_collectors_to_run * 100)
+            if total_collectors_to_run > 0
             else 0
         )
         failure_rate = (
             (
                 (total_collectors_fail + total_collectors_partial)
-                / total_collectors
+                / total_collectors_to_run
                 * 100
             )
-            if total_collectors > 0
+            if total_collectors_to_run > 0
             else 0
         )
 
@@ -6516,7 +7105,7 @@ class HTMLReportService:
                 </div>
             </div>
         </div>
-        
+
         <div class="modal fade" id="passedModal" tabindex="-1">
             <div class="modal-dialog modal-lg">
                 <div class="modal-content">
@@ -6525,13 +7114,14 @@ class HTMLReportService:
                         <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
                     </div>
                     <div class="modal-body">
-                        <p class="lead">{total_collectors_pass} collectors passed out of {total_collectors} total</p>
+                        <p class="lead">{total_collectors_pass} collectors passed out of {total_collectors_to_run} total</p>
                         <p>Success Rate: {success_rate:.1f}%</p>
+                        {build_status_table(status_collectors["pass"]) }
                     </div>
                 </div>
             </div>
         </div>
-        
+
         <div class="modal fade" id="failedModal" tabindex="-1">
             <div class="modal-dialog modal-lg">
                 <div class="modal-content">
@@ -6540,13 +7130,46 @@ class HTMLReportService:
                         <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
                     </div>
                     <div class="modal-body">
-                        <p class="lead">Failed: {total_collectors_fail} | Partial: {total_collectors_partial}</p>
-                        <p>Combined failure rate: {failure_rate:.1f}%</p>
+                        <p class="lead">Failed: {total_collectors_fail} collectors failed out of {total_collectors_to_run} total</p>
+                        <p>Failure rate: {failure_rate:.1f}%</p>
+                        {build_status_table(status_collectors["fail"]) }
                     </div>
                 </div>
             </div>
         </div>
-        
+
+        <div class="modal fade" id="partialModal" tabindex="-1">
+            <div class="modal-dialog modal-lg">
+                <div class="modal-content">
+                    <div class="modal-header" style="background: linear-gradient(315deg, #ffd54f 0%, #fff176 100%); color: #ffffff;">
+                        <h5 class="modal-title">Partial Collectors</h5>
+                        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                    </div>
+                    <div class="modal-body">
+                        <p class="lead">Partial: {total_collectors_partial} collectors partially completed out of {total_collectors_all} total</p>
+                        <p>Partial rate: {((total_collectors_partial/total_collectors_to_run)*100) if total_collectors_to_run > 0 else 0:.1f}%</p>
+                        {build_status_table(status_collectors["partial"]) }
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="modal fade" id="skippedModal" tabindex="-1">
+            <div class="modal-dialog modal-lg">
+                <div class="modal-content">
+                    <div class="modal-header" style="background: linear-gradient(135deg, #ff9800 0%, #ffc107 100%); color: #ffffff;">
+                        <h5 class="modal-title">Skipped Collectors</h5>
+                        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                    </div>
+                    <div class="modal-body">
+                        <p class="lead">Skipped: {total_collectors_skipped} collectors skipped out of {total_collectors_all} total</p>
+                        <p>Skipped rate: {((total_collectors_skipped/total_collectors_to_run)*100) if total_collectors_to_run > 0 else 0:.1f}%</p>
+                        {build_status_table(status_collectors["skipped"]) }
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <div class="modal fade" id="logSizeModal" tabindex="-1">
             <div class="modal-dialog modal-lg">
                 <div class="modal-content">
@@ -6901,7 +7524,7 @@ class HTMLReportService:
         document.addEventListener('DOMContentLoaded', function() {{
             var modalElement = document.getElementById('fullscreenModal');
             fullscreenModal = new bootstrap.Modal(modalElement);
-            
+
             // Handle modal hidden event
             modalElement.addEventListener('hidden.bs.modal', function () {{
                 if (chartInstances.fullscreen) {{
@@ -6913,7 +7536,7 @@ class HTMLReportService:
 
         function openFullscreenModal(modalId) {{
             console.log('openFullscreenModal called with ID:', modalId);
-            
+
             // Check if this is a chart modal
             if (modalId === 'statusChart' || modalId === 'timeChart' || modalId === 'sizeChart') {{
                 console.log('Handling chart modal');
@@ -6921,33 +7544,33 @@ class HTMLReportService:
                     var modalElement = document.getElementById('fullscreenModal');
                     fullscreenModal = new bootstrap.Modal(modalElement);
                 }}
-                
+
                 var fullscreenCanvas = document.getElementById('fullscreenChart');
                 var ctx = fullscreenCanvas.getContext('2d');
-                
+
                 // Destroy existing chart if it exists
                 if (chartInstances.fullscreen) {{
                     chartInstances.fullscreen.destroy();
                 }}
-                
+
                 // Get the original chart
                 var originalChart = chartInstances[modalId];
                 if (!originalChart) {{
                     console.error('Chart not found:', modalId);
                     return;
                 }}
-                
+
                 // Create new configuration
                 var newConfig = {{
                     type: originalChart.config.type,
                     data: JSON.parse(JSON.stringify(originalChart.config.data)),
                     options: JSON.parse(JSON.stringify(originalChart.config.options))
                 }};
-                
+
                 // Adjust options for fullscreen
                 newConfig.options.responsive = true;
                 newConfig.options.maintainAspectRatio = false;
-                
+
                 // Add click handler for pie chart in fullscreen
                 if (modalId === 'statusChart') {{
                     newConfig.options.onClick = function(evt, elements) {{
@@ -6959,10 +7582,10 @@ class HTMLReportService:
                         }}
                     }};
                 }}
-                
+
                 // Create new chart in fullscreen canvas
                 chartInstances.fullscreen = new Chart(ctx, newConfig);
-                
+
                 // Update modal title with more descriptive text
                 var titleMap = {{
                     'statusChart': 'Execution Status Summary',
@@ -6970,7 +7593,7 @@ class HTMLReportService:
                     'sizeChart': 'Log Size per Node'
                 }};
                 document.getElementById('fullscreenModalLabel').textContent = titleMap[modalId] || 'Chart View';
-                
+
                 fullscreenModal.show();
             }} else {{
                 // Handle regular modals (like firmware)
@@ -7002,6 +7625,132 @@ class HTMLReportService:
         // Add resize event listener
         window.addEventListener('resize', handleResize);
 
+        const statusPercentagePlugin = {{
+            id: 'statusPercentagePlugin',
+            afterDatasetsDraw(chart, _args, pluginOptions) {{
+                const dataset = chart.data.datasets[0];
+                if (!dataset || dataset.data.length === 0) {{
+                    return;
+                }}
+                const meta = chart.getDatasetMeta(0);
+                if (!meta || !meta.data || chart.config.type !== 'pie') {{
+                    return;
+                }}
+                const total = dataset.data.reduce((sum, value) => {{
+                    const numericValue = typeof value === 'number' ? value : Number(value);
+                    return sum + (Number.isFinite(numericValue) ? numericValue : 0);
+                }}, 0);
+                if (!total) {{
+                    return;
+                }}
+
+                const cfg = Object.assign({{
+                    labelOffset: 24,
+                    leaderLineLength: 26,
+                    textPadding: 6,
+                    labelBackgroundPadding: 4,
+                    canvasPadding: 8,
+                    drawLabelBackground: true,
+                    backgroundColor: '#ffffff',
+                    backgroundBorderColor: '#ced4da',
+                    lineColor: '#495057',
+                    textColor: '#212529',
+                    lineWidth: 1,
+                    decimals: 1,
+                    font: '12px "Segoe UI", system-ui, -apple-system, sans-serif'
+                }}, pluginOptions || {{}});
+
+                const ctx = chart.ctx;
+                ctx.save();
+                ctx.font = cfg.font;
+                ctx.fillStyle = cfg.textColor;
+                ctx.strokeStyle = cfg.lineColor;
+                ctx.lineWidth = cfg.lineWidth;
+
+                meta.data.forEach((arc, index) => {{
+                    const rawValue = typeof dataset.data[index] === 'number'
+                        ? dataset.data[index]
+                        : Number(dataset.data[index]);
+                    if (!rawValue || !Number.isFinite(rawValue)) {{
+                        return;
+                    }}
+
+                    const angle = (arc.startAngle + arc.endAngle) / 2;
+                    const sinAngle = Math.sin(angle);
+                    const cosAngle = Math.cos(angle);
+                    const radius = arc.outerRadius;
+
+                    const percentValue = (rawValue / total) * 100;
+                    const formattedPercent = (percentValue % 1 === 0)
+                        ? percentValue.toFixed(0)
+                        : percentValue.toFixed(cfg.decimals);
+                    const text = `${{formattedPercent}}%`;
+                    const metrics = ctx.measureText(text);
+                    const textWidth = metrics.width;
+                    const textHeight = (metrics.actualBoundingBoxAscent || 8) + (metrics.actualBoundingBoxDescent || 2);
+                    const totalPadding = cfg.labelBackgroundPadding * 2;
+                    const chartArea = chart.chartArea || {{
+                        left: 0,
+                        right: chart.width,
+                        top: 0,
+                        bottom: chart.height
+                    }};
+                    const isRightSide = cosAngle >= 0;
+
+                    const startX = arc.x + cosAngle * radius * 0.92;
+                    const startY = arc.y + sinAngle * radius * 0.92;
+                    const elbowX = arc.x + cosAngle * (radius + cfg.labelOffset);
+                    const elbowY = arc.y + sinAngle * (radius + cfg.labelOffset);
+
+                    const minX = chartArea.left + cfg.canvasPadding;
+                    const maxX = chartArea.right - textWidth - cfg.canvasPadding;
+                    const minY = chartArea.top + cfg.canvasPadding + textHeight / 2;
+                    const maxY = chartArea.bottom - cfg.canvasPadding - textHeight / 2;
+                    let textY = Math.min(Math.max(elbowY, minY), maxY);
+
+                    const leaderTargetX = elbowX + (isRightSide ? cfg.leaderLineLength : -cfg.leaderLineLength);
+                    let textX = isRightSide
+                        ? leaderTargetX + cfg.textPadding
+                        : leaderTargetX - cfg.textPadding - textWidth;
+                    textX = Math.min(Math.max(textX, minX), maxX);
+
+                    const horizontalEndX = isRightSide
+                        ? Math.min(textX - cfg.textPadding, chartArea.right - cfg.canvasPadding)
+                        : Math.max(textX + textWidth + cfg.textPadding, chartArea.left + cfg.canvasPadding);
+
+                    ctx.beginPath();
+                    ctx.moveTo(startX, startY);
+                    ctx.lineTo(elbowX, textY);
+                    ctx.lineTo(horizontalEndX, textY);
+                    ctx.stroke();
+
+                    if (cfg.drawLabelBackground) {{
+                        ctx.save();
+                        ctx.fillStyle = cfg.backgroundColor;
+                        ctx.strokeStyle = cfg.backgroundBorderColor;
+                        ctx.lineWidth = 1;
+                        ctx.beginPath();
+                        ctx.rect(
+                            textX - cfg.labelBackgroundPadding,
+                            textY - textHeight / 2 - cfg.labelBackgroundPadding,
+                            textWidth + totalPadding,
+                            textHeight + totalPadding
+                        );
+                        ctx.fill();
+                        ctx.stroke();
+                        ctx.restore();
+                    }}
+
+                    ctx.textAlign = 'left';
+                    ctx.textBaseline = 'middle';
+                    ctx.fillStyle = cfg.textColor;
+                    ctx.fillText(text, textX, textY);
+                }});
+
+                ctx.restore();
+            }}
+        }};
+
         var ctxStatus = document.getElementById('statusChart').getContext('2d');
         var statusChart = new Chart(ctxStatus,{{
             type:'pie',
@@ -7024,6 +7773,14 @@ class HTMLReportService:
                     return label+': '+value;
                     }}
                 }}
+                }},
+                statusPercentagePlugin:{{
+                    labelOffset: 28,
+                    leaderLineLength: 30,
+                    textPadding: 6,
+                    decimals: 1,
+                    lineColor: '#343a40',
+                    textColor: '#212529'
                 }}
             }},
             onClick: function(evt, elements) {{
@@ -7034,7 +7791,8 @@ class HTMLReportService:
                     window.location.href = 'status_' + status + '.html';
                 }}
             }}
-            }}
+            }},
+            plugins: [statusPercentagePlugin]
         }});
         chartInstances.statusChart = statusChart;
 
@@ -7202,7 +7960,7 @@ class HTMLReportService:
                 {timing_breakdown}
             </div>
         </div>
-        
+
         <style>
         .details-btn-topright {{
             position: absolute;
@@ -7389,7 +8147,7 @@ class HTMLReportService:
                 </div>
             </div>
         </div>
-        
+
         <h2>Global File Map - Table View</h2>
         <div class="mb-3 row">
             <div class="col-md-6">
@@ -7438,7 +8196,18 @@ class HTMLReportService:
             <td>{escape(node_val)}</td>
             <td>{escape(group_val)}</td>
             <td>{escape(cid_val)}</td>
-            <td><a href="{escape(link_val)}">{escape(row['File Path'])}</a></td>
+            <!--
+              NOTE: This page also includes a Tree View with normal <a> links.
+              Using <a href> here too creates duplicate href targets in the HTML.
+              To keep the Table View navigable while avoiding duplicate hrefs, we render
+              a button that navigates via JS.
+            -->
+            <td>
+              <button type="button" class="btn btn-link p-0 file-link"
+                      onclick='window.location.href={json.dumps(link_val)}'>
+                {escape(row['File Path'])}
+              </button>
+            </td>
             </tr>
             """
         table_html += "</tbody></table>"
@@ -7475,23 +8244,23 @@ class HTMLReportService:
             const table = document.getElementById('fileMapTable');
             const rows = table.getElementsByTagName('tbody')[0].getElementsByTagName('tr');
             let visibleCount = 0;
-            
+
             for (let row of rows) {
                 const cells = row.getElementsByTagName('td');
                 const node = cells[0].textContent;
                 const group = cells[1].textContent;
                 const collector = cells[2].textContent;
                 const filePath = cells[3].textContent;
-                
-                const matchesSearch = searchValue === '' || 
+
+                const matchesSearch = searchValue === '' ||
                     node.toLowerCase().includes(searchValue) ||
                     group.toLowerCase().includes(searchValue) ||
                     collector.toLowerCase().includes(searchValue) ||
                     filePath.toLowerCase().includes(searchValue);
-                
+
                 const matchesDut = dutFilter === '' || node === dutFilter;
                 const matchesGroup = groupFilter === '' || group === groupFilter;
-                
+
                 if (matchesSearch && matchesDut && matchesGroup) {
                     row.style.display = '';
                     visibleCount++;
@@ -7499,59 +8268,59 @@ class HTMLReportService:
                     row.style.display = 'none';
                 }
             }
-            
+
             document.getElementById('visibleCount').textContent = visibleCount;
         }
-        
+
         // Table sorting
         let sortDirection = {};
         function sortFileMapTable(columnIndex) {
             const table = document.getElementById('fileMapTable');
             const tbody = table.getElementsByTagName('tbody')[0];
             const rows = Array.from(tbody.getElementsByTagName('tr'));
-            
+
             sortDirection[columnIndex] = !sortDirection[columnIndex];
             const isAscending = sortDirection[columnIndex];
-            
+
             rows.sort(function(a, b) {
                 const aValue = a.getElementsByTagName('td')[columnIndex].textContent;
                 const bValue = b.getElementsByTagName('td')[columnIndex].textContent;
-                
+
                 if (aValue < bValue) return isAscending ? -1 : 1;
                 if (aValue > bValue) return isAscending ? 1 : -1;
                 return 0;
             });
-            
+
             tbody.innerHTML = '';
             rows.forEach(function(row) { tbody.appendChild(row); });
         }
-        
+
         // Tree view expand/collapse
         document.addEventListener('DOMContentLoaded', function() {
             console.log('Setting up tree view...');
-            
+
             // Get the root UL (direct child of #treeview)
             const rootUl = document.querySelector('#treeview > ul');
-            
+
             // Get all folders
             const folders = document.querySelectorAll('#treeview .folder > span');
             console.log('Found folders:', folders.length);
-            
+
             folders.forEach(function(folder, index) {
                 // Store original text without icon
                 const originalText = folder.textContent.trim();
                 folder.setAttribute('data-original-text', originalText);
-                
+
                 // Find the UL - it should be the next sibling
                 let ul = folder.nextElementSibling;
                 // Skip text nodes
                 while (ul && ul.nodeType !== 1) {
                     ul = ul.nextSibling;
                 }
-                
+
                 // Check if this is a top-level DUT folder (parent is root UL)
                 const isTopLevel = folder.parentElement.parentElement === rootUl;
-                
+
                 if (ul && ul.tagName === 'UL') {
                     if (isTopLevel) {
                         // Top-level DUT folders: expand by default
@@ -7567,20 +8336,20 @@ class HTMLReportService:
                 } else {
                     console.log('Folder', index, ':', originalText, '- NO UL found!', ul);
                 }
-                
+
                 folder.style.cursor = 'pointer';
                 folder.style.fontWeight = 'bold';
-                
+
                 // Add click handler
                 folder.addEventListener('click', function(e) {
                     e.stopPropagation(); // Prevent event bubbling
-                    
+
                     let ul = this.nextElementSibling;
                     // Skip text nodes
                     while (ul && ul.nodeType !== 1) {
                         ul = ul.nextSibling;
                     }
-                    
+
                     if (ul && ul.tagName === 'UL') {
                         const originalText = this.getAttribute('data-original-text');
                         if (ul.style.display === 'none' || ul.style.display === '') {
@@ -7593,7 +8362,7 @@ class HTMLReportService:
                     }
                 });
             });
-            
+
             // Add file icons
             const files = document.querySelectorAll('#treeview .file a');
             files.forEach(function(link) {
@@ -7942,11 +8711,23 @@ class HTMLReportService:
         else:
             return self._generate_download_view(file_path, display_name)
 
-    def _generate_download_view(self, file_path: Path, display_name: str = None) -> str:
+    def _generate_download_view(
+        self, file_path: Path, display_name: str = None, message: str = None
+    ) -> str:
         """
-        Generates an HTML page that offers a direct download link for non-text files.
+        Generates an HTML page that offers a direct download link for files.
+
+        Args:
+            file_path: Path to the file
+            display_name: Display name for the file
+            message: Custom message to show (default: generic message)
         """
         display_name = display_name or file_path.name
+
+        # Default message if none provided
+        if message is None:
+            message = "Unable to parse this file. Please download to view."
+
         download_html_name = f"{file_path.name}_download.html"
         html_file_path = self._get_html_output_path(
             file_path.parent, download_html_name
@@ -7955,12 +8736,25 @@ class HTMLReportService:
         relative_file = os.path.relpath(
             file_path, os.path.dirname(html_file_path)
         ).replace("\\", "/")
+
+        # Get file size for display
+        try:
+            file_size = file_path.stat().st_size
+            file_size_str = self._format_bytes(file_size)
+        except Exception:
+            file_size_str = "Unknown size"
+
         content = f"""
         <div class="card">
             <div class="card-body">
                 <h2>File: {escape(display_name)}</h2>
-                <p>Unable to parse this file. Please download to view.</p>
-                <p><a href="{escape(relative_file)}" download class="btn btn-primary">Download {escape(display_name)}</a></p>
+                <div class="alert alert-info" role="alert">
+                    <i class="bi bi-info-circle"></i> {escape(message)}
+                </div>
+                <p><strong>File Size:</strong> {file_size_str}</p>
+                <p><a href="{escape(relative_file)}" download class="btn btn-primary btn-lg">
+                    <i class="bi bi-download"></i> Download {escape(display_name)}
+                </a></p>
             </div>
         </div>
         """
@@ -7974,11 +8768,46 @@ class HTMLReportService:
         )
         return link
 
+    def _download_view_if_too_large(
+        self, file_path: Path, display_name: str
+    ) -> Optional[str]:
+        """
+        If file exceeds max_parseable_file_size, return a download-only HTML link; otherwise None.
+
+        Args:
+            file_path: Path to the file to check
+            display_name: Label to display in the generated page
+
+        Returns:
+            Link to the generated download view, or None if size is acceptable or check fails
+        """
+        try:
+            file_size = file_path.stat().st_size
+            if file_size > self.max_parseable_file_size:
+                file_size_mb = file_size / (1024 * 1024)
+                message = (
+                    f"This file is too large ({file_size_mb:.1f} MB) to parse and display in the browser. "
+                    f"Files larger than {self.max_parseable_file_size / (1024 * 1024):.0f} MB are download-only for performance. "
+                    f"Please download the file to view it locally."
+                )
+                return self._generate_download_view(file_path, display_name, message)
+        except Exception:
+            # If size check fails, just fall through and attempt to parse
+            pass
+        return None
+
     def _generate_json_view(self, file_path: Path, display_name: str = None) -> str:
         """
         Generates an HTML page with JSON syntax highlighting, or fallback to download if unreadable.
+        Large files (>50MB) are automatically set to download-only for performance.
         """
         display_name = display_name or file_path.name
+
+        # Check file size - if too large, create download view instead
+        maybe = self._download_view_if_too_large(file_path, display_name)
+        if maybe:
+            return maybe
+
         try:
             with file_path.open("r", encoding="utf-8", errors="strict") as f:
                 data = json.load(f)
@@ -8055,8 +8884,15 @@ class HTMLReportService:
     ) -> str:
         """
         Generates an HTML page with text/log syntax highlighting, or fallback to download if unreadable.
+        Large files (>50MB) are automatically set to download-only for performance.
         """
         display_name = display_name or file_path.name
+
+        # Check file size - if too large, create download view instead
+        maybe = self._download_view_if_too_large(file_path, display_name)
+        if maybe:
+            return maybe
+
         try:
             with file_path.open("r", encoding="utf-8") as f:
                 text_data = f.read()
@@ -8131,7 +8967,7 @@ class HTMLReportService:
             <div class="card-body">
                 <h2>Runtime Log Viewer: {escape(display_name)}</h2>
                 <p class="text-muted">Interactive log viewer with filtering and syntax highlighting</p>
-                
+
                 <!-- Filter Controls -->
                 <div class="row mb-3">
                     <div class="col-md-4">
@@ -8153,7 +8989,7 @@ class HTMLReportService:
                         </select>
                     </div>
                 </div>
-                
+
                 <!-- Stats -->
                 <div class="d-flex gap-3 mb-3">
                     <span class="badge bg-secondary">Total: <span id="totalLines">0</span> lines</span>
@@ -8168,14 +9004,14 @@ class HTMLReportService:
                         <i class="bi bi-text-wrap"></i> Toggle Wrap
                     </button>
                 </div>
-                
+
                 <!-- Log Content -->
                 <div id="logContainer" class="border rounded" style="background: #1e1e1e !important; max-height: 600px; overflow: auto;">
                     <pre id="logView" style="margin: 0; padding: 15px; color: #f0f0f0 !important; background: #1e1e1e !important; font-family: 'Consolas', 'Monaco', 'Courier New', monospace; font-size: 13px; line-height: 1.5; text-shadow: none !important; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;"><code class="language-nvdebug" style="background: #1e1e1e !important; color: #f0f0f0 !important; text-shadow: none !important;">{escape(text_data)}</code></pre>
                 </div>
             </div>
         </div>
-        
+
         <style>
         /* Log viewer custom styles - Force dark theme and crisp rendering */
         /* Override Prism.js default styles completely */
@@ -8269,7 +9105,7 @@ class HTMLReportService:
             text-shadow: none !important;
         }}
         </style>
-        
+
         <script>
         // Define custom Prism language for nvdebug logs
         Prism.languages.nvdebug = {{
@@ -8282,44 +9118,44 @@ class HTMLReportService:
             'separator': /^[=+\\-]{{2,}}.*$/m,
             'string': /"(?:\\\\.|[^"\\\\])*"/
         }};
-        
+
         // Parse and render logs with structure
         document.addEventListener('DOMContentLoaded', function() {{
             parseAndRenderLogs();
-            
+
             document.getElementById('logSearch').addEventListener('input', filterLogs);
             document.getElementById('levelFilter').addEventListener('change', filterLogs);
             document.getElementById('componentFilter').addEventListener('change', filterLogs);
-            
+
             // Apply Prism highlighting after DOM is ready
             Prism.highlightAll();
         }});
-        
+
         let logLines = [];
         let wrapEnabled = false;
         let renderChunkSize = 500; // Render 500 lines at a time for performance
         let currentRenderIndex = 0;
         let isRendering = false;
-        
+
         function parseAndRenderLogs() {{
             const logView = document.getElementById('logView');
             const code = logView.querySelector('code');
             const text = code.textContent;
             const lines = text.split('\\n');
-            
+
             // Show loading indicator for large logs
             if (lines.length > 5000) {{
                 code.innerHTML = '<span style="color: #0dcaf0;">Parsing ' + lines.length + ' log lines...</span>';
             }}
-            
+
             // Parse in chunks to avoid blocking UI
             const chunkSize = 1000;
             let chunkIndex = 0;
-            
+
             function parseChunk() {{
                 const start = chunkIndex * chunkSize;
                 const end = Math.min(start + chunkSize, lines.length);
-                
+
                 for (let i = start; i < end; i++) {{
                     const line = lines[i];
                     const match = line.match(/\\[([^\\]]+)\\]\\s+\\[([^\\]]+)\\]\\s+\\[([^\\]]+)\\]\\s+(.*)/);
@@ -8343,9 +9179,9 @@ class HTMLReportService:
                         }});
                     }}
                 }}
-                
+
                 chunkIndex++;
-                
+
                 if (end < lines.length) {{
                     // Continue parsing in next frame
                     setTimeout(parseChunk, 0);
@@ -8355,65 +9191,65 @@ class HTMLReportService:
                     renderLogs();
                 }}
             }}
-            
+
             parseChunk();
         }}
-        
+
         function filterLogs() {{
             const search = document.getElementById('logSearch').value.toLowerCase();
             const levelFilter = document.getElementById('levelFilter').value;
             const componentFilter = document.getElementById('componentFilter').value;
-            
+
             logLines.forEach(log => {{
                 let visible = true;
-                
+
                 // Apply search filter
                 if (search && !log.raw.toLowerCase().includes(search)) {{
                     visible = false;
                 }}
-                
+
                 // Apply level filter
                 if (levelFilter && log.level !== levelFilter) {{
                     visible = false;
                 }}
-                
+
                 // Apply component filter
                 if (componentFilter && log.component !== componentFilter) {{
                     visible = false;
                 }}
-                
+
                 log.visible = visible;
             }});
-            
+
             renderLogs();
             updateStats();
-            
+
             // Highlight search terms
             if (search) {{
                 highlightSearch(search);
             }}
         }}
-        
+
         function renderLogs() {{
             const logView = document.getElementById('logView');
             const code = logView.querySelector('code');
-            
+
             // Filter visible logs
             const visibleLogs = logLines.filter(log => log.visible);
-            
+
             // For large logs (>2000 lines), render in chunks
             if (visibleLogs.length > 2000) {{
                 code.innerHTML = '<span style="color: #0dcaf0;">Rendering ' + visibleLogs.length + ' log lines...</span>';
-                
+
                 // Render in chunks to avoid UI freeze
                 let rendered = [];
                 let chunkIdx = 0;
                 const chunkSize = 500;
-                
+
                 function renderChunk() {{
                     const start = chunkIdx * chunkSize;
                     const end = Math.min(start + chunkSize, visibleLogs.length);
-                    
+
                     for (let i = start; i < end; i++) {{
                         const log = visibleLogs[i];
                         if (log.timestamp) {{
@@ -8425,9 +9261,9 @@ class HTMLReportService:
                             rendered.push(`<span class="log-message">${{log.raw}}</span>`);
                         }}
                     }}
-                    
+
                     chunkIdx++;
-                    
+
                     if (end < visibleLogs.length) {{
                         // Update progress and continue
                         const progress = Math.round((end / visibleLogs.length) * 100);
@@ -8438,7 +9274,7 @@ class HTMLReportService:
                         code.innerHTML = rendered.join('\\n');
                     }}
                 }}
-                
+
                 renderChunk();
             }} else {{
                 // Small log, render immediately
@@ -8452,32 +9288,32 @@ class HTMLReportService:
                         return `<span class="log-message">${{log.raw}}</span>`;
                     }}
                 }}).join('\\n');
-                
+
                 code.innerHTML = html;
             }}
         }}
-        
+
         function highlightSearch(search) {{
             const logView = document.getElementById('logView');
             const code = logView.querySelector('code');
             const regex = new RegExp(`(${{search}})`, 'gi');
             code.innerHTML = code.innerHTML.replace(regex, '<mark>$1</mark>');
         }}
-        
+
         function updateStats() {{
             const total = logLines.length;
             const visible = logLines.filter(l => l.visible).length;
             document.getElementById('totalLines').textContent = total;
             document.getElementById('visibleLines').textContent = visible;
         }}
-        
+
         function copyLog() {{
             const filtered = logLines.filter(l => l.visible).map(l => l.raw).join('\\n');
             navigator.clipboard.writeText(filtered).then(() => {{
                 alert('Filtered log copied to clipboard!');
             }});
         }}
-        
+
         function downloadLog() {{
             const filtered = logLines.filter(l => l.visible).map(l => l.raw).join('\\n');
             const blob = new Blob([filtered], {{ type: 'text/plain' }});
@@ -8488,7 +9324,7 @@ class HTMLReportService:
             a.click();
             URL.revokeObjectURL(url);
         }}
-        
+
         function toggleWrap() {{
             const pre = document.getElementById('logView');
             wrapEnabled = !wrapEnabled;
@@ -8883,7 +9719,7 @@ class HTMLReportService:
                         available_columns.add(key)
 
             # Build the table header based on available columns
-            modal_content = f"""
+            modal_content = """
             <table class="table table-striped table-bordered table-shadow">
                 <thead class="table-dark">
                     <tr>
@@ -9015,10 +9851,6 @@ class HTMLReportService:
                 main_task,
                 completed=10,
                 description="Scanning directory contents...",
-            )
-            await self._log(
-                "DEBUG",
-                f"Scanning directory contents: {list(self.root_dir.iterdir())}",
             )
 
             # Count total nodes to process

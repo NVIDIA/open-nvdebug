@@ -23,26 +23,24 @@ DUTs with support for various access methods (Redfish, IPMI, SSH, HMC).
 """
 
 import asyncio
+import getpass
+import grp
 import json
 import logging
 import os
 import platform
-import random
 import re
+import secrets
 import shlex
 import ssl
-import string
-import subprocess
 import tarfile
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import aiohttp
 import asyncssh
-import paramiko
-import yaml
 from rich.console import Console
 from rich.progress import (
     BarColumn,
@@ -58,11 +56,189 @@ from ..services.dynamic_discovery_service import DynamicDiscoveryService
 from ..services.hmc_service import HMCService
 from ..services.platform_detection_service import PlatformDetectionService
 from ..services.ssh_proxy_service import SSHProxyService
+from ..utils.tar_utils import get_tar_command
 from ..utils.yaml_manager import YAMLManager
 from .async_logger import AsyncSafeLogger
 from .baseboard_manager import BaseboardManager
 
 logger = logging.getLogger(__name__)
+
+REDFISH_PREFLIGHT_REQUEST_TIMEOUT = 20
+REDFISH_PREFLIGHT_CONNECT_TIMEOUT = 5
+REDFISH_PREFLIGHT_SOCK_READ_TIMEOUT = 18
+REDFISH_PREFLIGHT_MAX_RETRIES = 2
+REDFISH_PREFLIGHT_RETRY_DELAY = 1
+REDFISH_PREFLIGHT_RETRY_BUDGET = (
+    (REDFISH_PREFLIGHT_MAX_RETRIES + 1) * REDFISH_PREFLIGHT_REQUEST_TIMEOUT
+    + REDFISH_PREFLIGHT_MAX_RETRIES * REDFISH_PREFLIGHT_RETRY_DELAY
+)
+REDFISH_PREFLIGHT_WAIT_FOR_TIMEOUT = REDFISH_PREFLIGHT_RETRY_BUDGET + 5
+
+INTERNAL_CONFIG_KEYS = {"__explicit_fields"}
+
+DUT_TOOL_OVERRIDE_FIELDS = {
+    "FW_INVENTORY_TABLE_PROPERTIES",
+    "ADDITIONAL_OOB_URI_COLLECTION",
+    "NVLINK_OOB_URI",
+    "CUSTOM_DUMP_SERVICES",
+    "POST_CODES_URI",
+    "BMC_TEMP_DIR",
+    "TASK_ID_PREFIX",
+    "TOOL_TEMP_DIR",
+    "REDFISH_DUMP_TIMEOUT",
+    "REDFISH_DEVICE_DUMP_SLEEP_DURATION",
+    "NVOS_TECH_DUMP_TIMEOUT",
+    "SKIP_BMC_SSH_LOGS",
+    "SKIP_HOST_LOGS",
+    "SKIP_REDFISH_OOB_LOGS",
+    "SKIP_IPMI_LOGS",
+    "SKIP_PORT_FW",
+    "COLLECTOR_TO_SKIP",
+    "SYSTEM_ID_TO_SKIP",
+    "CHASSIS_ID_TO_SKIP",
+    "MANAGER_ID_TO_SKIP",
+    "SYSTEM_ID_OVERRIDE",
+    "MANAGER_ID_OVERRIDE",
+    "CHASSIS_ID_OVERRIDE",
+    "EXTRA_LOG_COLLECTION",
+    "EXPAND_QUERY_CHASSIS_LEVEL",
+    "EXPAND_QUERY_FIRMWARE_INVENTORY_LEVEL",
+    "EXPAND_QUERY_MANAGER_LEVEL",
+    "EXPAND_QUERY_SYSTEM_LEVEL",
+    "i2c_config",
+}
+
+
+def _strip_internal_config_keys(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a copy without internal merge bookkeeping fields."""
+    return {
+        key: value
+        for key, value in dict(config).items()
+        if key not in INTERNAL_CONFIG_KEYS
+    }
+
+
+def _explicit_key_map(config: Dict[str, Any]) -> Dict[str, bool]:
+    """Return explicit-field metadata preserved from config loading."""
+    if not isinstance(config, dict):
+        return {}
+
+    raw = config.get("__explicit_fields")
+    if raw is None:
+        return {key: True for key in config.keys() if key not in INTERNAL_CONFIG_KEYS}
+    if isinstance(raw, dict):
+        return {key: bool(value) for key, value in raw.items()}
+    if isinstance(raw, (list, tuple, set)):
+        return {key: True for key in raw}
+    return {}
+
+
+def _drop_implicit_tool_like_defaults(
+    config: Dict[str, Any], explicit_keys: Dict[str, bool]
+) -> Dict[str, Any]:
+    """Remove DUTConfig defaults that should not override tool-level config."""
+    cleaned = _strip_internal_config_keys(config)
+    for field in DUT_TOOL_OVERRIDE_FIELDS:
+        if not explicit_keys.get(field) or cleaned.get(field) is None:
+            cleaned.pop(field, None)
+    return cleaned
+
+
+def _is_truthy(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def _normalize_execution_mode(value: Any, *, local: Any = False) -> str:
+    if _is_truthy(local):
+        return "local"
+
+    if hasattr(value, "value"):
+        value = value.value
+
+    normalized = str(value or "remote").strip().lower()
+    compact = normalized.replace("_", "").replace("-", "").replace(" ", "")
+    if compact == "local":
+        return "local"
+    if compact in {"remote", "remoteclient"}:
+        return "remote"
+    return normalized
+
+
+def _resolve_execution_mode(config: Dict[str, Any]) -> str:
+    return _normalize_execution_mode(
+        config.get("ExecutionMode") or config.get("execution_mode"),
+        local=config.get("local", False),
+    )
+
+
+def _strip_leading_sudo(command: str) -> str:
+    stripped = command.lstrip()
+    leading = command[: len(command) - len(stripped)]
+
+    for prefix in ("sudo -S ", "sudo -n ", "sudo "):
+        if stripped.startswith(prefix):
+            return f"{leading}{stripped[len(prefix):]}"
+
+    return command
+
+
+def _build_sudo_command(command: str, *, local_execution: bool) -> str:
+    if not local_execution:
+        if command.strip().startswith("sudo"):
+            return command
+        return f"sudo -S {command}"
+
+    command_without_sudo = _strip_leading_sudo(command)
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        return command_without_sudo
+    return f"sudo -n {command_without_sudo}"
+
+
+async def _communicate_subprocess(
+    process: asyncio.subprocess.Process,
+    timeout: Optional[float] = None,
+    input_data: Optional[bytes] = None,
+) -> Tuple[bytes, bytes]:
+    """Communicate with a subprocess and drain pipes before event-loop shutdown."""
+    try:
+        communicate = (
+            process.communicate()
+            if input_data is None
+            else process.communicate(input=input_data)
+        )
+        if timeout is None:
+            stdout, stderr = await communicate
+        else:
+            stdout, stderr = await asyncio.wait_for(communicate, timeout=timeout)
+        return stdout, stderr
+    except asyncio.TimeoutError:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+
+        # Draining communicate() after kill closes stdout/stderr transports.
+        # Waiting alone can leave BaseSubprocessTransport cleanup until __del__.
+        try:
+            await process.communicate()
+        except Exception:
+            if process.returncode is None:
+                await process.wait()
+        raise
+    finally:
+        if process.returncode is None:
+            try:
+                await process.wait()
+            except Exception:
+                pass
+        await asyncio.sleep(0)
+
+
+async def _wait_closed(conn: Any) -> None:
+    """Drain asyncssh connection shutdown for deterministic fd cleanup."""
+    await conn.wait_closed()
 
 
 class RedfishSessionPool:
@@ -119,7 +295,9 @@ class RedfishSessionPool:
         )
         self.session_timeout = self.session_config.get("session_timeout", 300)
         self.keepalive_timeout = self.session_config.get("keepalive_timeout", 300)
-        self.ssl = self.session_config.get("ssl", False)
+        self.ssl_verify = self.session_config.get(
+            "ssl_verify", self.session_config.get("ssl", False)
+        )
         self.ttl_dns_cache = self.session_config.get("ttl_dns_cache", 300)
         self.use_dns_cache = self.session_config.get("use_dns_cache", True)
         self.force_close = self.session_config.get("force_close", False)
@@ -165,7 +343,7 @@ class RedfishSessionPool:
 
             # Create connector with fully configurable settings
             self.connector = aiohttp.TCPConnector(
-                ssl=self.ssl,  # Configurable SSL verification
+                ssl=self.ssl_verify,  # Configurable SSL verification
                 limit=self.connection_pool_limit,  # Configurable total connection pool size
                 limit_per_host=self.connection_pool_limit_per_host,  # Configurable connections per host
                 ttl_dns_cache=self.ttl_dns_cache,  # Configurable DNS cache TTL
@@ -187,14 +365,17 @@ class RedfishSessionPool:
             # Setup authentication
             username = self.connection_info["username"]
             password = self.connection_info["password"]
-            self.auth = aiohttp.BasicAuth(username, password)
+            if self.connection_info.get("auth_enabled", True) and username and password:
+                self.auth = aiohttp.BasicAuth(username, password)
+            else:
+                self.auth = None
 
             # Test the session with a simple request
             protocol = "https" if self.connection_info["use_https"] else "http"
             test_url = f"{protocol}://{self.connection_info['host']}:{self.connection_info['port']}/redfish/v1"
 
             async with self.session.get(
-                test_url, auth=self.auth, ssl=False
+                test_url, auth=self.auth, ssl=self.ssl_verify
             ) as response:
                 if response.status == 200:
                     self._initialized = True
@@ -387,6 +568,7 @@ class DUTCredentials:
         use_port_forwarding: bool = False,
         rf_hmc_access_method: Optional[str] = None,
         execution_mode: str = "remote",
+        hmc_ip_candidates: Optional[List[str]] = None,
         # SSH Proxy Configuration
         ssh_proxy_host: Optional[str] = None,
         ssh_proxy_port: int = 22,
@@ -438,6 +620,7 @@ class DUTCredentials:
             use_port_forwarding: Use port forwarding.
             rf_hmc_access_method: Redfish HMC access method.
             execution_mode: Execution mode.
+            hmc_ip_candidates: Ordered list of potential HMC IP/hostname values.
             ssh_proxy_host: SSH proxy host.
             ssh_proxy_port: SSH proxy port.
             ssh_proxy_username: SSH proxy username.
@@ -484,7 +667,9 @@ class DUTCredentials:
         self.hmc_use_https = hmc_use_https
         self.use_port_forwarding = use_port_forwarding
         self.rf_hmc_access_method = rf_hmc_access_method
-        self.execution_mode = execution_mode
+        self.execution_mode = _normalize_execution_mode(execution_mode)
+        self.hmc_ip_candidates = list(hmc_ip_candidates) if hmc_ip_candidates else []
+        self.hmc_ip_validated = False
         # SSH Proxy Configuration
         self.ssh_proxy_host = ssh_proxy_host
         self.ssh_proxy_port = ssh_proxy_port
@@ -634,6 +819,8 @@ class DUT:
         dut_manager: DUT manager.
     """
 
+    REDFISH_CACHE_MAX_ENTRIES = 500  # Max cached responses per DUT
+
     def __init__(
         self,
         dut_id: str,
@@ -669,6 +856,16 @@ class DUT:
         self.redfish_auth = None
         self.redfish_connector = None
         self.redfish_session_pool = None  # Will be initialized when needed
+        self.redfish_session_config: Dict[str, Any] = {}
+        self.redfish_ssl = False
+        self.redfish_session_timeout = 300
+        self.redfish_keepalive_timeout = 300
+        self.redfish_ttl_dns_cache = 300
+        self.redfish_use_dns_cache = True
+        self.redfish_force_close = False
+        self.redfish_enable_cleanup_closed = True
+        self.redfish_fallback_connection_pool_limit = 15
+        self.redfish_fallback_connection_pool_limit_per_host = 6
 
         # Redfish caching
         self.__redfish_cache = {}
@@ -676,6 +873,12 @@ class DUT:
         # Redfish prefix configuration
         self.redfish_default_prefix = self.config.get(
             "RF_DEFAULT_PREFIX", "/redfish/v1"
+        )
+        # HMC-specific prefix for URIs containing HGX_* resource segments.
+        # When set, response-body URIs (pagination, task links, etc.) that target
+        # HMC resources are normalized with this prefix instead of redfish_default_prefix.
+        self.redfish_hmc_default_prefix = (
+            self.config.get("RF_HMC_DEFAULT_PREFIX") or None
         )
 
         # Track which config keys were explicitly set in the DUT YAML (not from defaults)
@@ -708,6 +911,13 @@ class DUT:
         if self.is_hmc_platform:
             self._configure_hmc_settings()
 
+        if self.config.get("dry_run"):
+            await self._log_runtime(
+                "INFO",
+                "Dry-run mode - skipping Redfish session pool initialization",
+            )
+            return
+
         # Initialize Redfish session pool for better concurrency
         await self.initialize_redfish_session_pool()
 
@@ -739,7 +949,7 @@ class DUT:
 
     async def create_redfish_session(self) -> bool:
         """
-        Create persistent Redfish session - uses session pool.
+        Create persistent Redfish session (like legacy nvdebug) - Now uses session pool.
 
         Args:
             level: Log level.
@@ -757,7 +967,10 @@ class DUT:
             # Setup authentication for session pool
             username = connection_info["username"]
             password = connection_info["password"]
-            self.redfish_auth = aiohttp.BasicAuth(username, password)
+            if connection_info.get("auth_enabled", True) and username and password:
+                self.redfish_auth = aiohttp.BasicAuth(username, password)
+            else:
+                self.redfish_auth = None
 
             # Test the session pool with a simple request
             protocol = "https" if connection_info["use_https"] else "http"
@@ -770,7 +983,7 @@ class DUT:
                 if session_obj:
                     try:
                         async with session_obj["session"].get(
-                            test_url, auth=session_obj["auth"], ssl=False
+                            test_url, auth=session_obj["auth"], ssl=self.redfish_ssl
                         ) as response:
                             if response.status == 200:
                                 await self._log_runtime(
@@ -839,7 +1052,7 @@ class DUT:
             test_url = f"{protocol}://{connection_info['host']}:{connection_info['port']}/redfish/v1"
 
             async with self.redfish_session.get(
-                test_url, auth=self.redfish_auth, ssl=False
+                test_url, auth=self.redfish_auth, ssl=self.redfish_ssl
             ) as response:
                 if response.status == 200:
                     await self._log_runtime(
@@ -908,7 +1121,7 @@ class DUT:
 
     async def close_redfish_session(self) -> None:
         """
-        Close Redfish session.
+        Close Redfish session (like legacy nvdebug logout).
 
         Args:
             level: Log level.
@@ -936,7 +1149,14 @@ class DUT:
 
     def normalize_redfish_uri(self, uri: str, ignore_prefix: bool = False) -> str:
         """
-        Normalize Redfish URI with prefix handling.
+        Normalize Redfish URI with prefix handling (like legacy nvdebug).
+
+        On arm64 / aggregation platforms where ``RF_HMC_DEFAULT_PREFIX`` differs
+        from ``RF_DEFAULT_PREFIX``, URIs containing an ``/HGX_`` resource segment
+        (returned in response bodies, pagination links, task status URIs, etc.) are
+        rewritten with ``redfish_hmc_default_prefix`` instead of the BMC prefix.
+        This ensures that follow-on requests derived from API responses are routed
+        to the correct HMC Redfish root.
 
         Args:
             uri: URI to normalize.
@@ -945,6 +1165,29 @@ class DUT:
         if ignore_prefix:
             return uri
 
+        # --- HMC URI: contains /HGX_ resource segment ---
+        if self.redfish_hmc_default_prefix and "/HGX_" in uri:
+            if not uri.startswith("/") and not uri.startswith("http"):
+                # Raw relative URI (e.g. "Systems/HGX_Baseboard_0/...") — prepend HMC prefix
+                uri = f"{self.redfish_hmc_default_prefix}/{uri}"
+                asyncio.create_task(
+                    self._log_runtime(
+                        "DEBUG", f"Added HMC prefix to relative URI: {uri}"
+                    )
+                )
+            elif (
+                not uri.startswith(self.redfish_hmc_default_prefix)
+                and "redfish/v1" in uri
+            ):
+                uri = re.sub(
+                    r"(\S)*redfish/v1", self.redfish_hmc_default_prefix, uri, 1
+                )
+                asyncio.create_task(
+                    self._log_runtime("DEBUG", f"Normalized HMC URI: {uri}")
+                )
+            return uri
+
+        # --- BMC URI ---
         # Handle relative URIs - add prefix if URI doesn't start with a slash or http
         if not uri.startswith("/") and not uri.startswith("http"):
             # This is a relative URI like "Managers" - add the prefix
@@ -957,7 +1200,7 @@ class DUT:
             and not uri.startswith(self.redfish_default_prefix)
             and "redfish/v1" in uri
         ):
-            # Handle prefix substitution
+            # Handle prefix substitution like legacy nvdebug
             # Substitute prefix up to /redfish/v1 with the configured prefix
             uri = re.sub(r"(\S)*redfish/v1", self.redfish_default_prefix, uri, 1)
             asyncio.create_task(self._log_runtime("DEBUG", f"Normalized URI: {uri}"))
@@ -966,7 +1209,7 @@ class DUT:
 
     def reset_redfish_cache(self) -> None:
         """
-        Reset Redfish cache.
+        Reset Redfish cache (like legacy nvdebug).
 
         Args:
             level: Log level.
@@ -977,7 +1220,7 @@ class DUT:
 
     def get_redfish_cache(self) -> Dict[str, Any]:
         """
-        Get Redfish cache.
+        Get Redfish cache (like legacy nvdebug).
 
         Args:
             level: Log level.
@@ -1002,6 +1245,13 @@ class DUT:
             uri: URI to cache response for.
             response: Response to cache.
         """
+        # Evict oldest entry if cache is full
+        if len(self.__redfish_cache) >= self.REDFISH_CACHE_MAX_ENTRIES:
+            try:
+                oldest_key = next(iter(self.__redfish_cache))
+                del self.__redfish_cache[oldest_key]
+            except (StopIteration, KeyError):
+                pass
         self.__redfish_cache[uri] = response
 
     async def setup_logging(self, base_log_dir: Path) -> None:
@@ -1049,6 +1299,19 @@ class DUT:
                 "DEBUG", f"execution_mode: {self.credentials.execution_mode}"
             )
 
+            use_hmc_path = self.is_hmc_platform
+            if (
+                not use_hmc_path
+                and self.credentials.use_port_forwarding
+                and self.credentials.hmc_ip
+            ):
+                use_hmc_path = await self._detect_hmc_platform()
+                self.is_hmc_platform = use_hmc_path
+                await self._log_runtime(
+                    "DEBUG",
+                    f"Early HMC preflight detection result: {use_hmc_path}",
+                )
+
             # Handle local mode
             if self.credentials.execution_mode == "local":
                 await self._log_runtime(
@@ -1062,14 +1325,14 @@ class DUT:
                     "Local mode - Redfish connection assumed successful",
                 )
 
-            # Handle HMC mode with port forwarding
-            if self.is_hmc_platform and self.credentials.hmc_ip:
+            # Handle HMC mode with port forwarding (like legacy nvdebug)
+            if use_hmc_path and self.credentials.hmc_ip:
                 await self._log_runtime("DEBUG", "Using HMC port forwarding path")
                 return await self._test_redfish_hmc_connection()
             else:
                 await self._log_runtime(
                     "DEBUG",
-                    f"Using standard BMC path (is_hmc_platform={self.is_hmc_platform}, hmc_ip={self.credentials.hmc_ip})",
+                    f"Using standard BMC path (is_hmc_platform={use_hmc_path}, hmc_ip={self.credentials.hmc_ip})",
                 )
 
             # Standard BMC connection
@@ -1098,6 +1361,8 @@ class DUT:
                             ssh_proxy_host=self.credentials.ssh_proxy_host,
                             ssh_proxy_username=self.credentials.ssh_proxy_username,
                             ssh_proxy_password=self.credentials.ssh_proxy_password,
+                            ssh_proxy_key_path=self.credentials.ssh_proxy_key_path,
+                            ssh_proxy_passwordless=self.credentials.ssh_proxy_passwordless,
                             ssh_proxy_port=self.credentials.ssh_proxy_port,
                             bmc_redfish_port=self.credentials.bmc_rf_port,
                             bmc_use_https=self.credentials.bmc_use_https,
@@ -1156,12 +1421,15 @@ class DUT:
 
             username = self.credentials.rf_username or self.credentials.bmc_username
             password = self.credentials.rf_password or self.credentials.bmc_password
+            use_auth = self.config.get("RF_AUTH", True) and bool(username and password)
+            redfish_auth = aiohttp.BasicAuth(username, password) if use_auth else None
 
-            # Use aiohttp with retry logic for reliability
+            # Use aiohttp with retry logic for reliability. BMC Redfish services
+            # can pause for several seconds while collectors are active.
             timeout = aiohttp.ClientTimeout(
-                total=6,  # Reduced timeout per attempt
-                connect=2,  # Connection timeout
-                sock_read=4,  # Read timeout
+                total=REDFISH_PREFLIGHT_REQUEST_TIMEOUT,
+                connect=REDFISH_PREFLIGHT_CONNECT_TIMEOUT,
+                sock_read=REDFISH_PREFLIGHT_SOCK_READ_TIMEOUT,
             )
 
             # Use connector with minimal connection pooling for preflight
@@ -1194,28 +1462,27 @@ class DUT:
                     f"Using HTTP (no SSL) for Redfish connection (port {self.credentials.bmc_rf_port})",
                 )
 
-            connector = aiohttp.TCPConnector(
-                ssl=ssl_context,
-                limit=1,  # Single connection limit
-                limit_per_host=1,  # Single connection per host
-                ttl_dns_cache=300,  # DNS cache TTL
-                use_dns_cache=True,
-                force_close=True,  # Force close after use
-                enable_cleanup_closed=True,  # Clean up closed connections
-            )
-
             # Retry logic for transient failures
-            max_retries = 2  # Try up to 3 times total (initial + 2 retries)
-            retry_delay = 1  # 1 second between retries
+            max_retries = REDFISH_PREFLIGHT_MAX_RETRIES
+            retry_delay = REDFISH_PREFLIGHT_RETRY_DELAY
 
             for attempt in range(max_retries + 1):
+                connector = aiohttp.TCPConnector(
+                    ssl=ssl_context,
+                    limit=1,  # Single connection limit
+                    limit_per_host=1,  # Single connection per host
+                    ttl_dns_cache=300,  # DNS cache TTL
+                    use_dns_cache=True,
+                    force_close=True,  # Force close after use
+                    enable_cleanup_closed=True,  # Clean up closed connections
+                )
                 try:
                     async with aiohttp.ClientSession(
                         timeout=timeout, connector=connector
                     ) as session:
                         async with session.get(
                             url,
-                            auth=aiohttp.BasicAuth(username, password),
+                            auth=redfish_auth,
                             headers={"User-Agent": "nvdebug-preflight/1.0"},
                         ) as response:
                             if response.status == 200:
@@ -1233,45 +1500,95 @@ class DUT:
                                     "validate_credentials_in_preflight", True
                                 )
 
-                                if validate_creds:
-                                    # Get the auth URI to test (default to /redfish/v1/Systems)
-                                    auth_uri = preflight_config.get(
-                                        "credential_validation_uri",
-                                        "/redfish/v1/Systems",
+                                if validate_creds and use_auth:
+                                    validation_uris = self._get_redfish_validation_uris(
+                                        preflight_config
                                     )
+                                    validation_failures = []
 
-                                    # Normalize the URI to respect prefix_override configuration
-                                    normalized_auth_uri = self.normalize_redfish_uri(
-                                        auth_uri
-                                    )
+                                    for auth_uri in validation_uris:
+                                        normalized_auth_uri = self.normalize_redfish_uri(
+                                            auth_uri
+                                        )
 
-                                    await self._log_runtime(
-                                        "DEBUG",
-                                        f"Validating credentials against authenticated endpoint: {auth_uri} (normalized: {normalized_auth_uri})",
-                                    )
+                                        await self._log_runtime(
+                                            "DEBUG",
+                                            f"Validating credentials against authenticated endpoint: {auth_uri} (normalized: {normalized_auth_uri})",
+                                        )
 
-                                    # Build the full URL for credential validation
-                                    if (
-                                        hasattr(self, "ssh_proxy_tunnel_ports")
-                                        and self.ssh_proxy_tunnel_ports
-                                    ):
-                                        tunnel_port = self.ssh_proxy_tunnel_ports[
-                                            "redfish_port"
-                                        ]
-                                        auth_url = f"{protocol}://localhost:{tunnel_port}{normalized_auth_uri}"
-                                    else:
-                                        auth_url = f"{protocol}://{self.credentials.bmc_ip}:{self.credentials.bmc_rf_port}{normalized_auth_uri}"
+                                        if (
+                                            hasattr(self, "ssh_proxy_tunnel_ports")
+                                            and self.ssh_proxy_tunnel_ports
+                                        ):
+                                            tunnel_port = self.ssh_proxy_tunnel_ports[
+                                                "redfish_port"
+                                            ]
+                                            auth_url = f"{protocol}://localhost:{tunnel_port}{normalized_auth_uri}"
+                                        else:
+                                            auth_url = f"{protocol}://{self.credentials.bmc_ip}:{self.credentials.bmc_rf_port}{normalized_auth_uri}"
 
-                                    # Test the authenticated endpoint
-                                    try:
-                                        async with session.get(
-                                            auth_url,
-                                            auth=aiohttp.BasicAuth(username, password),
-                                            headers={
-                                                "User-Agent": "nvdebug-preflight/1.0"
-                                            },
-                                        ) as auth_response:
-                                            if auth_response.status == 200:
+                                        try:
+                                            async with session.get(
+                                                auth_url,
+                                                auth=redfish_auth,
+                                                headers={
+                                                    "User-Agent": "nvdebug-preflight/1.0"
+                                                },
+                                            ) as auth_response:
+                                                response_text = await auth_response.text()
+                                                response_payload = None
+                                                if response_text:
+                                                    try:
+                                                        response_payload = json.loads(
+                                                            response_text
+                                                        )
+                                                    except json.JSONDecodeError:
+                                                        response_payload = None
+
+                                                if auth_response.status == 401:
+                                                    await self._log_runtime(
+                                                        "ERROR",
+                                                        f"Redfish credential validation failed: HTTP 401 Unauthorized at {normalized_auth_uri}",
+                                                    )
+                                                    if connector:
+                                                        await connector.close()
+                                                    return (
+                                                        False,
+                                                        "Redfish credentials invalid: HTTP 401 Unauthorized. Please verify BMC_USERNAME/BMC_PASSWORD or RF_User/RF_Pass are correct.",
+                                                    )
+
+                                                if auth_response.status == 403:
+                                                    validation_failures.append(
+                                                        f"{normalized_auth_uri} -> HTTP 403 Forbidden"
+                                                    )
+                                                    await self._log_runtime(
+                                                        "DEBUG",
+                                                        f"Redfish credential validation probe returned HTTP 403 Forbidden at {normalized_auth_uri}",
+                                                    )
+                                                    continue
+
+                                                if auth_response.status != 200:
+                                                    validation_failures.append(
+                                                        f"{normalized_auth_uri} -> HTTP {auth_response.status}"
+                                                    )
+                                                    await self._log_runtime(
+                                                        "DEBUG",
+                                                        f"Redfish credential validation probe failed at {normalized_auth_uri}: HTTP {auth_response.status}",
+                                                    )
+                                                    continue
+
+                                                if not self._is_valid_redfish_validation_payload(
+                                                    response_payload
+                                                ):
+                                                    validation_failures.append(
+                                                        f"{normalized_auth_uri} -> HTTP 200 with non-resource/error payload"
+                                                    )
+                                                    await self._log_runtime(
+                                                        "DEBUG",
+                                                        f"Redfish credential validation probe at {normalized_auth_uri} returned HTTP 200 but not a valid Redfish resource payload",
+                                                    )
+                                                    continue
+
                                                 self.connection_state.set_redfish_connected(
                                                     True, self.dut_id
                                                 )
@@ -1282,69 +1599,82 @@ class DUT:
                                                     "INFO",
                                                     f"Redfish credentials validated successfully against {normalized_auth_uri}",
                                                 )
-                                                # Explicitly close connector before returning
+                                                # Detect DGX only from an explicit Redfish member ID.
+                                                # Model-name heuristics are intentionally excluded here because
+                                                # some HGX/GB200 platforms report DGX-like model strings without
+                                                # exposing the DGX-specific Redfish endpoints.
+                                                try:
+                                                    systems_data = await auth_response.json(
+                                                        content_type=None
+                                                    )
+                                                    members = systems_data.get("Members", [])
+                                                    self.is_dgx = any(
+                                                        m.get("@odata.id", "")
+                                                        .rstrip("/")
+                                                        .split("/")[-1]
+                                                        == "DGX"
+                                                        for m in members
+                                                    )
+                                                    if self.is_dgx:
+                                                        await self._log_runtime(
+                                                            "INFO",
+                                                            "DGX platform detected via explicit /redfish/v1/Systems member 'DGX' — DGX-specific collectors will be activated",
+                                                        )
+                                                        self.is_dgx = any(
+                                                            "DGX" in m.get("@odata.id", "")
+                                                            for m in members
+                                                            if isinstance(m, dict)
+                                                        )
+                                                        if self.is_dgx:
+                                                            await self._log_runtime(
+                                                                "INFO",
+                                                                "DGX platform detected via /redfish/v1/Systems — DGX-specific collectors will be activated",
+                                                            )
+                                                        else:
+                                                            await self._log_runtime(
+                                                                "DEBUG",
+                                                                "No DGX entry found in /redfish/v1/Systems — DGX status remains undetermined until additional heuristics run",
+                                                            )
+                                                except Exception as dgx_err:
+                                                    await self._log_runtime(
+                                                        "INFO",
+                                                        "No explicit 'DGX' member found in /redfish/v1/Systems — DGX-specific collectors remain disabled",
+                                                    )
+                                                    self.is_dgx = False
+
                                                 if connector:
                                                     await connector.close()
                                                 return (
                                                     True,
                                                     "Redfish connection and credentials validated successfully",
                                                 )
-                                            elif auth_response.status == 401:
-                                                # Authentication failed
-                                                await self._log_runtime(
-                                                    "ERROR",
-                                                    f"Redfish credential validation failed: HTTP 401 Unauthorized at {normalized_auth_uri}",
-                                                )
-                                                # Explicitly close connector before returning
-                                                if connector:
-                                                    await connector.close()
-                                                return (
-                                                    False,
-                                                    f"Redfish credentials invalid: HTTP 401 Unauthorized. Please verify BMC_USERNAME/BMC_PASSWORD or RF_User/RF_Pass are correct.",
-                                                )
-                                            elif auth_response.status == 403:
-                                                # Forbidden - credentials might be valid but insufficient permissions
-                                                await self._log_runtime(
-                                                    "WARNING",
-                                                    f"Redfish credential validation returned HTTP 403 Forbidden at {normalized_auth_uri}. Credentials may be valid but have insufficient permissions.",
-                                                )
-                                                # Explicitly close connector before returning
-                                                if connector:
-                                                    await connector.close()
-                                                return (
-                                                    False,
-                                                    f"Redfish credentials may be valid but have insufficient permissions: HTTP 403 Forbidden at {normalized_auth_uri}",
-                                                )
-                                            else:
-                                                # Other error - log and fail
-                                                await self._log_runtime(
-                                                    "WARNING",
-                                                    f"Redfish credential validation returned unexpected status: HTTP {auth_response.status} at {normalized_auth_uri}",
-                                                )
-                                                # Explicitly close connector before returning
-                                                if connector:
-                                                    await connector.close()
-                                                return (
-                                                    False,
-                                                    f"Redfish credential validation failed: HTTP {auth_response.status} at {normalized_auth_uri}",
-                                                )
-                                    except Exception as cred_error:
-                                        await self._log_runtime(
-                                            "ERROR",
-                                            f"Redfish credential validation error: {str(cred_error)}",
-                                        )
-                                        # Explicitly close connector before returning
-                                        if connector:
-                                            await connector.close()
-                                        return (
-                                            False,
-                                            f"Redfish credential validation failed: {str(cred_error)}",
-                                        )
+                                        except Exception as cred_error:
+                                            validation_failures.append(
+                                                f"{normalized_auth_uri} -> error: {str(cred_error)}"
+                                            )
+                                            await self._log_runtime(
+                                                "DEBUG",
+                                                f"Redfish credential validation probe error at {normalized_auth_uri}: {str(cred_error)}",
+                                            )
+                                            continue
+
+                                    if connector:
+                                        await connector.close()
+                                    return (
+                                        False,
+                                        "Redfish credential validation failed for all candidate endpoints: "
+                                        + "; ".join(validation_failures),
+                                    )
                                 else:
                                     # Credential validation disabled, just check service availability
+                                    validation_reason = (
+                                        "RF_AUTH disabled"
+                                        if not use_auth
+                                        else "credential validation disabled in preflight_config"
+                                    )
                                     await self._log_runtime(
                                         "INFO",
-                                        "Credential validation disabled in preflight_config, only checking service availability",
+                                        f"{validation_reason}; only checking Redfish service availability",
                                     )
                                     self.connection_state.set_redfish_connected(
                                         True, self.dut_id
@@ -1369,6 +1699,8 @@ class DUT:
                                 )
                 except asyncio.TimeoutError:
                     if attempt < max_retries:
+                        if connector:
+                            await connector.close()
                         await asyncio.sleep(retry_delay)
                         continue
                     # Explicitly close connector before returning
@@ -1376,7 +1708,7 @@ class DUT:
                         await connector.close()
                     return (
                         False,
-                        "Redfish connection timeout after retries (18s total)",
+                        f"Redfish connection timeout after retries ({REDFISH_PREFLIGHT_RETRY_BUDGET}s total)",
                     )
                 except aiohttp.ClientConnectorError as e:
                     error_msg = str(e)
@@ -1395,6 +1727,8 @@ class DUT:
                     )
 
                     if attempt < max_retries:
+                        if connector:
+                            await connector.close()
                         await asyncio.sleep(retry_delay)
                         continue
                     # Explicitly close connector before returning
@@ -1430,6 +1764,8 @@ class DUT:
                     )
 
                     if attempt < max_retries:
+                        if connector:
+                            await connector.close()
                         await asyncio.sleep(retry_delay)
                         continue
                     # Explicitly close connector before returning
@@ -1443,12 +1779,67 @@ class DUT:
             # Explicitly close connector before returning
             if connector:
                 await connector.close()
-            return False, "Redfish connection timeout (10s)"
+            return (
+                False,
+                f"Redfish connection timeout ({REDFISH_PREFLIGHT_WAIT_FOR_TIMEOUT}s)",
+            )
         except Exception as e:
             # Explicitly close connector before returning
             if connector:
                 await connector.close()
             return False, f"Redfish connection error: {str(e)}"
+
+    def _get_redfish_validation_uris(
+        self, preflight_config: Optional[Dict[str, Any]] = None
+    ) -> List[str]:
+        """Return unique Redfish credential-validation URIs in probe order."""
+        preflight_config = preflight_config or {}
+
+        candidates: List[str] = []
+
+        configured_uri = preflight_config.get("credential_validation_uri")
+        if configured_uri:
+            configured_candidates = (
+                configured_uri
+                if isinstance(configured_uri, (list, tuple))
+                else [configured_uri]
+            )
+            return [
+                candidate
+                for candidate in configured_candidates
+                if candidate and str(candidate).strip()
+            ]
+        else:
+            default_auth_uri = "/redfish/v1/Systems"
+            if self.redfish_default_prefix != "/redfish/v1":
+                default_auth_uri = "/redfish/v1"
+            candidates.append(default_auth_uri)
+
+        candidates.extend(
+            ["/redfish/v1/Systems", "/redfish/v1/Chassis", "/redfish/v1/Managers"]
+        )
+
+        unique_candidates: List[str] = []
+        for candidate in candidates:
+            if candidate and candidate not in unique_candidates:
+                unique_candidates.append(candidate)
+
+        return unique_candidates
+
+    @staticmethod
+    def _is_valid_redfish_validation_payload(
+        payload: Optional[Dict[str, Any]],
+    ) -> bool:
+        """Accept only real Redfish resources or collections for auth validation."""
+        if not isinstance(payload, dict):
+            return False
+        if payload.get("error"):
+            return False
+        if payload.get("@odata.id"):
+            return True
+        if "Members" in payload:
+            return True
+        return False
 
     async def _test_redfish_hmc_connection(self) -> Tuple[bool, str]:
         """
@@ -1461,17 +1852,66 @@ class DUT:
         try:
             # Initialize HMC service with logger and DUT manager
             hmc_service = HMCService(logger=self.logger, dut_manager=self.dut_manager)
+            bmc_ssh_host = self.credentials.bmc_ip
+            bmc_ssh_port = self.credentials.bmc_ssh_port
+
+            if self.credentials.ssh_proxy_host:
+                await self._log_runtime(
+                    "INFO",
+                    f"Using SSH proxy {self.credentials.ssh_proxy_host} for HMC Redfish port forwarding",
+                )
+                if not hasattr(self, "ssh_proxy_service") or not self.ssh_proxy_service:
+                    ssh_proxy_service = SSHProxyService(
+                        logger=self.logger, dut_manager=self.dut_manager
+                    )
+
+                    success, tunnel_ports, message = (
+                        await ssh_proxy_service.setup_ssh_proxy_tunneling(
+                            dut_id=self.dut_id,
+                            bmc_ip=self.credentials.bmc_ip,
+                            host_ip=self.credentials.host_ip,
+                            ssh_proxy_host=self.credentials.ssh_proxy_host,
+                            ssh_proxy_username=self.credentials.ssh_proxy_username,
+                            ssh_proxy_password=self.credentials.ssh_proxy_password,
+                            ssh_proxy_key_path=self.credentials.ssh_proxy_key_path,
+                            ssh_proxy_passwordless=self.credentials.ssh_proxy_passwordless,
+                            ssh_proxy_port=self.credentials.ssh_proxy_port,
+                            bmc_redfish_port=self.credentials.bmc_rf_port,
+                            bmc_use_https=self.credentials.bmc_use_https,
+                            bmc_ipmi_port=623,
+                            host_ssh_port=self.credentials.host_ssh_port,
+                            force_setup=True,
+                        )
+                    )
+
+                    if not success:
+                        return (
+                            False,
+                            f"Failed to setup SSH proxy tunneling for HMC Redfish: {message}",
+                        )
+
+                    self.ssh_proxy_service = ssh_proxy_service
+                    self.ssh_proxy_tunnel_ports = tunnel_ports
+
+                bmc_ssh_host = "localhost"
+                bmc_ssh_port = self.ssh_proxy_tunnel_ports["bmc_ssh_port"]
+                await self._log_runtime(
+                    "INFO",
+                    f"Using BMC SSH tunnel for HMC forwarding: {bmc_ssh_host}:{bmc_ssh_port}",
+                )
 
             # Setup transparent HMC port forwarding
             success, bound_port, message = await hmc_service.setup_hmc_port_forwarding(
                 dut_id=self.dut_id,
-                bmc_ip=self.credentials.bmc_ip,
+                bmc_ip=bmc_ssh_host,
                 bmc_ssh_username=self.credentials.bmc_ssh_username,
                 bmc_ssh_password=self.credentials.bmc_ssh_password,
+                bmc_ssh_key_path=self.credentials.bmc_ssh_key_path,
+                bmc_ssh_passwordless=self.credentials.bmc_ssh_passwordless,
                 hmc_ip=self.credentials.hmc_ip,
                 hmc_username=self.credentials.hmc_username,
                 hmc_password=self.credentials.hmc_password,
-                bmc_ssh_port=self.credentials.bmc_ssh_port,
+                bmc_ssh_port=bmc_ssh_port,
                 hmc_http_port=self.credentials.hmc_http_port,
                 hmc_https_port=self.credentials.hmc_https_port,
                 hmc_use_https=self.credentials.hmc_use_https,
@@ -1507,6 +1947,17 @@ class DUT:
                     "https" if connection_info.get("use_https", False) else "http"
                 )
                 url = f"{protocol}://{connection_info['host']}:{connection_info['port']}/redfish/v1"
+                use_auth = self.config.get("RF_AUTH", True) and bool(
+                    self.credentials.hmc_username and self.credentials.hmc_password
+                )
+                auth = (
+                    aiohttp.BasicAuth(
+                        self.credentials.hmc_username,
+                        self.credentials.hmc_password,
+                    )
+                    if use_auth
+                    else None
+                )
 
                 # Debug logging
                 await self._log_runtime(
@@ -1519,11 +1970,8 @@ class DUT:
                 async with aiohttp.ClientSession(timeout=timeout_config) as session:
                     async with session.get(
                         url,
-                        auth=aiohttp.BasicAuth(
-                            self.credentials.hmc_username,
-                            self.credentials.hmc_password,
-                        ),
-                        ssl=False,
+                        auth=auth,
+                        ssl=self.redfish_ssl,
                     ) as response:
                         if response.status == 200:
                             self.connection_state.set_redfish_connected(
@@ -1534,7 +1982,7 @@ class DUT:
                             self.connection_state.set_hmc_connected(True, self.dut_id)
                             await self._log_runtime(
                                 "INFO",
-                                f"HMC Redfish connection successful via transparent forwarding",
+                                "HMC Redfish connection successful via transparent forwarding",
                             )
                             return (
                                 True,
@@ -1563,6 +2011,19 @@ class DUT:
             message: Log message.
         """
         try:
+            use_hmc_path = self.is_hmc_platform
+            if (
+                not use_hmc_path
+                and self.credentials.use_port_forwarding
+                and self.credentials.hmc_ip
+            ):
+                use_hmc_path = await self._detect_hmc_platform()
+                self.is_hmc_platform = use_hmc_path
+                await self._log_runtime(
+                    "DEBUG",
+                    f"Early HMC IPMI preflight detection result: {use_hmc_path}",
+                )
+
             # Handle local mode
             if self.credentials.execution_mode == "local":
                 await self._log_runtime(
@@ -1572,6 +2033,24 @@ class DUT:
                 self.connection_state.set_ipmi_connected(True, self.dut_id)
                 self.connection_state.last_ipmi_check = datetime.now()
                 return True, "Local mode - IPMI connection assumed successful"
+
+            if use_hmc_path:
+                await self._log_runtime(
+                    "INFO",
+                    "Using BMC-local IPMI preflight path for HMC platform",
+                )
+                exit_code, stdout, stderr = await self.dut_manager.execute_bmc_command(
+                    self.dut_id,
+                    "ipmitool mc info",
+                    timeout=20,
+                )
+                if exit_code == 0:
+                    self.connection_state.set_ipmi_connected(True, self.dut_id)
+                    self.connection_state.last_ipmi_check = datetime.now()
+                    return True, "IPMI connection successful via BMC-local ipmitool"
+
+                error_msg = self._process_command_output(stderr) or self._process_command_output(stdout)
+                return False, f"IPMI connection failed via BMC-local ipmitool: {error_msg}"
 
             # Check if SSH proxy is configured
             if self.credentials.ssh_proxy_host:
@@ -1594,6 +2073,8 @@ class DUT:
                             ssh_proxy_host=self.credentials.ssh_proxy_host,
                             ssh_proxy_username=self.credentials.ssh_proxy_username,
                             ssh_proxy_password=self.credentials.ssh_proxy_password,
+                            ssh_proxy_key_path=self.credentials.ssh_proxy_key_path,
+                            ssh_proxy_passwordless=self.credentials.ssh_proxy_passwordless,
                             ssh_proxy_port=self.credentials.ssh_proxy_port,
                             bmc_redfish_port=self.credentials.bmc_rf_port,
                             bmc_use_https=self.credentials.bmc_use_https,
@@ -1635,8 +2116,6 @@ class DUT:
                 "ipmitool",
                 "-I",
                 "lanplus",
-                "-H",
-                self.credentials.bmc_ip,
                 "-U",
                 self.credentials.bmc_username,
                 "-P",
@@ -1645,6 +2124,16 @@ class DUT:
                 "mc",
                 "info",
             ]
+
+            if hasattr(self, "ssh_proxy_tunnel_ports") and self.ssh_proxy_tunnel_ports:
+                cmd[3:3] = [
+                    "-H",
+                    "localhost",
+                    "-p",
+                    str(self.ssh_proxy_tunnel_ports["ipmi_port"]),
+                ]
+            else:
+                cmd[3:3] = ["-H", self.credentials.bmc_ip]
 
             # Use asyncio.create_subprocess_exec for true async execution
             process = await asyncio.create_subprocess_exec(
@@ -1655,13 +2144,8 @@ class DUT:
 
             # Wait for completion with timeout (increased for async environment)
             try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(), timeout=30
-                )
+                stdout, stderr = await _communicate_subprocess(process, timeout=30)
             except asyncio.TimeoutError:
-                # Kill the process if it times out
-                process.kill()
-                await process.wait()  # Wait for the process to be cleaned up
                 return False, "IPMI connection timeout (30s)"
 
             # Decode the output using robust method
@@ -1717,6 +2201,8 @@ class DUT:
                             ssh_proxy_host=self.credentials.ssh_proxy_host,
                             ssh_proxy_username=self.credentials.ssh_proxy_username,
                             ssh_proxy_password=self.credentials.ssh_proxy_password,
+                            ssh_proxy_key_path=self.credentials.ssh_proxy_key_path,
+                            ssh_proxy_passwordless=self.credentials.ssh_proxy_passwordless,
                             ssh_proxy_port=self.credentials.ssh_proxy_port,
                             bmc_redfish_port=self.credentials.bmc_rf_port,
                             bmc_use_https=self.credentials.bmc_use_https,
@@ -1831,11 +2317,22 @@ class DUT:
                 self.connection_state.last_host_check = datetime.now()
                 return True, "Local mode - Host connection assumed successful"
 
+            # Check if local mode is set in config
+            is_local_mode = self.config and self.config.get("local", False)
+
             if not self.credentials.host_ip:
-                # Assume local execution
-                self.connection_state.set_host_connected(True, self.dut_id)
-                self.connection_state.last_host_check = datetime.now()
-                return True, "Local host execution"
+                if is_local_mode:
+                    # Local mode explicitly requested - allow execution without host IP
+                    await self._log_runtime(
+                        "INFO",
+                        "Local mode enabled (--local flag), skipping host connection test",
+                    )
+                    self.connection_state.set_host_connected(True, self.dut_id)
+                    self.connection_state.last_host_check = datetime.now()
+                    return True, "Local host execution (--local flag)"
+                else:
+                    # No host IP and no local flag - this is a configuration error
+                    return False, "No host IP configured and --local flag not set"
 
             # Check if SSH proxy is configured
             if self.credentials.ssh_proxy_host:
@@ -1858,6 +2355,8 @@ class DUT:
                             ssh_proxy_host=self.credentials.ssh_proxy_host,
                             ssh_proxy_username=self.credentials.ssh_proxy_username,
                             ssh_proxy_password=self.credentials.ssh_proxy_password,
+                            ssh_proxy_key_path=self.credentials.ssh_proxy_key_path,
+                            ssh_proxy_passwordless=self.credentials.ssh_proxy_passwordless,
                             ssh_proxy_port=self.credentials.ssh_proxy_port,
                             bmc_redfish_port=self.credentials.bmc_rf_port,
                             bmc_use_https=self.credentials.bmc_use_https,
@@ -1975,7 +2474,7 @@ class DUT:
         if not self.credentials.use_port_forwarding:
             await self._log_runtime(
                 "DEBUG",
-                f"[HMC DEBUG] use_port_forwarding is False, returning False",
+                "[HMC DEBUG] use_port_forwarding is False, returning False",
             )
             return False
 
@@ -1983,14 +2482,14 @@ class DUT:
         if not self.config.get("supports_hmc", False):
             await self._log_runtime(
                 "DEBUG",
-                f"[HMC DEBUG] Baseboard does not support HMC, returning False",
+                "[HMC DEBUG] Baseboard does not support HMC, returning False",
             )
             return False
 
         # If we get here, USE_PORT_FORWARDING is True and baseboard supports HMC
         await self._log_runtime(
             "DEBUG",
-            f"[HMC DEBUG] use_port_forwarding is True and baseboard supports HMC, returning True",
+            "[HMC DEBUG] use_port_forwarding is True and baseboard supports HMC, returning True",
         )
         return True
 
@@ -2006,9 +2505,19 @@ class DUT:
         if not self.credentials.hmc_ip:
             # Try to get from baseboard platform_detection
             platform_detection = self.config.get("platform_detection", {})
-            hmc_ip = platform_detection.get("hmc_ip")
-            if hmc_ip:
-                self.credentials.hmc_ip = hmc_ip
+            hmc_ip_value = platform_detection.get("hmc_ip")
+            if isinstance(hmc_ip_value, list):
+                hmc_ip_candidates = [
+                    str(value).strip()
+                    for value in hmc_ip_value
+                    if isinstance(value, str) and value.strip()
+                ]
+                if hmc_ip_candidates:
+                    self.credentials.hmc_ip = hmc_ip_candidates[0]
+                    if not self.credentials.hmc_ip_candidates:
+                        self.credentials.hmc_ip_candidates = hmc_ip_candidates
+            elif hmc_ip_value:
+                self.credentials.hmc_ip = hmc_ip_value
             else:
                 # Fallback to default HMC IP
                 self.credentials.hmc_ip = "192.168.31.1"
@@ -2028,7 +2537,7 @@ class DUT:
         # Set HMC access method to port forwarding
         self.credentials.rf_hmc_access_method = "HostBmcTcpPortForwarding"
 
-        # Disable RF auth for HMC
+        # Disable RF auth for HMC (like legacy nvdebug)
         self.config["RF_AUTH"] = False
 
         # Use async logger for DUT-specific logging
@@ -2056,7 +2565,7 @@ class DUT:
 
         This allows existing Redfish service calls to work transparently
         """
-        # Check if HMC mode is active
+        # Check if HMC mode is active (like legacy nvdebug)
         if (
             self.is_hmc_platform
             and self.hmc_service
@@ -2073,6 +2582,7 @@ class DUT:
                 or self.credentials.hmc_username,
                 "password": connection_info.get("password")
                 or self.credentials.hmc_password,
+                "auth_enabled": self.config.get("RF_AUTH", True),
                 "is_hmc_forwarded": True,
             }
         else:
@@ -2084,11 +2594,12 @@ class DUT:
                     "port": self.ssh_proxy_tunnel_ports[
                         "redfish_port"
                     ],  # Use tunnel port
-                    "use_https": True,  # BMC typically uses HTTPS
+                    "use_https": self.credentials.bmc_use_https,
                     "username": self.credentials.rf_username
                     or self.credentials.bmc_username,
                     "password": self.credentials.rf_password
                     or self.credentials.bmc_password,
+                    "auth_enabled": self.config.get("RF_AUTH", True),
                     "is_hmc_forwarded": False,
                     "is_ssh_proxy_tunneled": True,
                 }
@@ -2097,11 +2608,12 @@ class DUT:
                 return {
                     "host": self.credentials.bmc_ip,
                     "port": self.credentials.bmc_rf_port,
-                    "use_https": True,  # BMC typically uses HTTPS
+                    "use_https": self.credentials.bmc_use_https,
                     "username": self.credentials.rf_username
                     or self.credentials.bmc_username,
                     "password": self.credentials.rf_password
                     or self.credentials.bmc_password,
+                    "auth_enabled": self.config.get("RF_AUTH", True),
                     "is_hmc_forwarded": False,
                     "is_ssh_proxy_tunneled": False,
                 }
@@ -2114,8 +2626,10 @@ class DUT:
             ip_address: IP address to ping.
         """
         try:
-            # Use ping with 2 packets and 5 second timeout
-            ping_cmd = ["ping", "-c", "2", "-W", "5", ip_address]
+            # Use ping with 2 packets and 5 second timeout (like legacy tool)
+            network_type = str(self.config.get("IP_NETWORK", "ipv4")).lower()
+            network_arg = "-6" if network_type == "ipv6" else "-4"
+            ping_cmd = ["ping", network_arg, "-c", "2", "-W", "5", ip_address]
 
             # Use asyncio.create_subprocess_exec for true async execution
             # Note: asyncio.create_subprocess_exec doesn't support text=True
@@ -2127,13 +2641,8 @@ class DUT:
 
             # Wait for completion with timeout
             try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(), timeout=10
-                )
+                stdout, stderr = await _communicate_subprocess(process, timeout=10)
             except asyncio.TimeoutError:
-                # Kill the process if it times out
-                process.kill()
-                await process.wait()  # Wait for the process to be cleaned up
                 return False
 
             return process.returncode == 0
@@ -2171,7 +2680,7 @@ class DUT:
                 try:
                     # Try latin1 as fallback - it can handle all byte values
                     return output.decode("latin1", errors="replace")
-                except Exception as e:
+                except Exception:
                     # Last resort - hex representation
                     return f"hex:{output.hex()}"
 
@@ -2248,6 +2757,7 @@ class DUTManager:
         debug_mode: bool = False,
         redfish_session_config: Optional[Dict[str, Any]] = None,
         tool_config: Optional[Dict[str, Any]] = None,
+        logger: Optional[AsyncSafeLogger] = None,
     ) -> None:
         """Initialize DUT manager.
 
@@ -2261,11 +2771,15 @@ class DUTManager:
             debug_mode: Debug mode.
             redfish_session_config: Redfish session configuration.
             tool_config: Tool configuration.
+            logger: Shared async logger. Reusing the orchestrator logger keeps
+                per-DUT runtime log writes serialized through one file handle.
         """
         self.dut_configs = dut_configs
         self.base_log_dir = Path(base_log_dir)
         self.duts: Dict[str, DUT] = {}
-        self.logger = AsyncSafeLogger(str(self.base_log_dir), debug_mode=debug_mode)
+        self.logger = logger or AsyncSafeLogger(
+            str(self.base_log_dir), debug_mode=debug_mode
+        )
         self.uri_config_manager = uri_config_manager
         self.tool_config = tool_config or {}
 
@@ -2277,9 +2791,6 @@ class DUTManager:
 
         # SSH implementation configuration with defaults
         self.ssh_config = ssh_config or {}
-        self.ssh_backend = self.ssh_config.get(
-            "backend", "asyncssh"
-        )  # Default to asyncssh
 
         # Redfish session configuration with defaults
         self.redfish_session_config = redfish_session_config or {}
@@ -2295,7 +2806,9 @@ class DUTManager:
         self.redfish_keepalive_timeout = self.redfish_session_config.get(
             "keepalive_timeout", 300
         )
-        self.redfish_ssl = self.redfish_session_config.get("ssl", False)
+        self.redfish_ssl = self.redfish_session_config.get(
+            "ssl_verify", self.redfish_session_config.get("ssl", False)
+        )
         self.redfish_ttl_dns_cache = self.redfish_session_config.get(
             "ttl_dns_cache", 300
         )
@@ -2314,12 +2827,15 @@ class DUTManager:
                 "fallback_connection_pool_limit_per_host", 6
             )
         )
-        self.ssh_fallback_enabled = self.ssh_config.get("fallback", {}).get(
-            "enabled", True
-        )
-        self.ssh_fallback_on_error_only = self.ssh_config.get("fallback", {}).get(
-            "on_error_only", True
-        )
+        # Warn about stale fallback config (paramiko removed)
+        if self.ssh_config.get("fallback"):
+            import warnings
+            warnings.warn(
+                "ssh_implementation.fallback config is deprecated — paramiko has been removed. "
+                "asyncssh is the sole SSH backend. Remove the fallback section from your config.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
 
         # Shared DynamicDiscoveryService instance
         self._discovery_service = None
@@ -2499,22 +3015,16 @@ class DUTManager:
                     ssh_key_path = dut.credentials.bmc_ssh_key_path
                     passwordless = dut.credentials.bmc_ssh_passwordless
 
-                # Create connection using existing logic
-                connect_kwargs = {
-                    "host": host,
-                    "port": port,
-                    "username": username,
-                    "connect_timeout": 30,
-                    "keepalive_interval": None,
-                    "known_hosts": None,
-                }
-
-                if ssh_key_path:
-                    connect_kwargs["client_keys"] = [ssh_key_path]
-                    if password:
-                        connect_kwargs["passphrase"] = password
-                elif not passwordless:
-                    connect_kwargs["password"] = password
+                connect_kwargs = self._build_ssh_connect_kwargs(
+                    host=host,
+                    port=port,
+                    username=username,
+                    password=password,
+                    ssh_key_path=ssh_key_path,
+                    passwordless=passwordless,
+                    connect_timeout=30,
+                    keepalive_interval=None,
+                )
 
                 conn = await asyncssh.connect(**connect_kwargs)
                 self.ssh_connections[connection_key] = conn
@@ -2535,6 +3045,63 @@ class DUTManager:
                     f"Failed to create SSH connection for {connection_key}: {str(e)}",
                 )
                 return None
+
+    @staticmethod
+    def _has_ssh_auth_method(
+        password: Optional[str],
+        ssh_key_path: Optional[str],
+        passwordless: bool,
+    ) -> bool:
+        """Return True when any supported SSH auth method is configured."""
+        return bool(ssh_key_path or passwordless or password)
+
+    @staticmethod
+    def _build_ssh_connect_kwargs(
+        host: str,
+        port: int,
+        username: Optional[str],
+        password: Optional[str] = None,
+        ssh_key_path: Optional[str] = None,
+        passwordless: bool = False,
+        connect_timeout: int = 30,
+        keepalive_interval: Optional[int] = None,
+        proxy_client: Optional[asyncssh.SSHClientConnection] = None,
+    ) -> Dict[str, Any]:
+        """
+        Build asyncssh connection kwargs using the tool's auth precedence.
+
+        Explicit key-path authentication wins over password auth so users do not
+        need to provide SSH passwords when a key is configured. If no key is
+        configured, existing password and Redfish-to-SSH fallback behavior stays
+        intact.
+        """
+        if not host:
+            raise ValueError("SSH host not configured")
+        if not username:
+            raise ValueError("SSH username not configured")
+        if not DUTManager._has_ssh_auth_method(password, ssh_key_path, passwordless):
+            raise ValueError("SSH password, key path, or passwordless auth required")
+
+        connect_kwargs: Dict[str, Any] = {
+            "host": host,
+            "port": port,
+            "username": username,
+            "connect_timeout": connect_timeout,
+            "keepalive_interval": keepalive_interval,
+            "known_hosts": None,
+        }
+
+        if proxy_client:
+            connect_kwargs["tunnel"] = proxy_client
+
+        if ssh_key_path:
+            connect_kwargs["client_keys"] = [ssh_key_path]
+            if password:
+                connect_kwargs["passphrase"] = password
+        elif not passwordless:
+            connect_kwargs["password"] = password
+
+        return connect_kwargs
 
     async def close_ssh_connection(self, dut_id: str, hmc: bool = False) -> None:
         """
@@ -2673,7 +3240,7 @@ class DUTManager:
         await self.logger.log_runtime(
             "INFO",
             "DUTManager",
-            f"DUTManager: SSH backend: {self.ssh_backend}, fallback enabled: {self.ssh_fallback_enabled}",
+            "DUTManager: SSH backend: asyncssh",
         )
         if isinstance(self.dut_configs, dict):
             await self.logger.log_runtime(
@@ -2684,6 +3251,76 @@ class DUTManager:
 
         # Create DUT objects from configuration
         await self._create_duts()
+
+    async def _apply_and_log_prefix_override(
+        self, dut_id: str, config: Dict[str, Any]
+    ) -> None:
+        """
+        Apply prefix_override / hmc_prefix_override to RF_DEFAULT_PREFIX /
+        RF_HMC_DEFAULT_PREFIX and keep URIConfigManager in sync.
+
+        Priority rules:
+        - BMC prefix: tool-level ``prefix_override`` applies when DUT still has
+          the default ``/redfish/v1``; a custom DUT-level value takes precedence.
+        - HMC prefix: tool-level ``hmc_prefix_override`` applies when DUT has no
+          ``RF_HMC_DEFAULT_PREFIX``; a DUT-level value always takes precedence.
+
+        Args:
+            dut_id: The DUT identifier
+            config: The DUT configuration dictionary (modified in place)
+        """
+        uri_overrides = self.tool_config.get("uri_overrides") or {}
+
+        # ── BMC prefix ──────────────────────────────────────────────────────────
+        prefix_override = uri_overrides.get("prefix_override")
+        current_rf_prefix = config.get("RF_DEFAULT_PREFIX", "/redfish/v1")
+
+        if prefix_override and current_rf_prefix == "/redfish/v1":
+            config["RF_DEFAULT_PREFIX"] = prefix_override
+            await self.logger.write_to_dut_runtime_log(
+                dut_id,
+                "INFO",
+                "DUTManager",
+                f"DUT {dut_id}: Applied tool-level prefix_override '{prefix_override}' to RF_DEFAULT_PREFIX (was using default '/redfish/v1')",
+            )
+        elif prefix_override and current_rf_prefix != "/redfish/v1":
+            await self.logger.write_to_dut_runtime_log(
+                dut_id,
+                "INFO",
+                "DUTManager",
+                f"DUT {dut_id}: Using custom RF_DEFAULT_PREFIX '{current_rf_prefix}' (overrides tool-level prefix_override '{prefix_override}')",
+            )
+
+        # Always update URIConfigManager with the final RF_DEFAULT_PREFIX value
+        final_rf_prefix = config.get("RF_DEFAULT_PREFIX", "/redfish/v1")
+        if self.uri_config_manager:
+            self.uri_config_manager.update_dut_rf_prefix(dut_id, final_rf_prefix)
+
+        # ── HMC prefix ──────────────────────────────────────────────────────────
+        hmc_prefix_override = uri_overrides.get("hmc_prefix_override")
+        current_hmc_prefix = config.get("RF_HMC_DEFAULT_PREFIX")
+
+        if hmc_prefix_override and not current_hmc_prefix:
+            # Tool-level hmc_prefix_override applies when DUT has no explicit value
+            config["RF_HMC_DEFAULT_PREFIX"] = hmc_prefix_override
+            await self.logger.write_to_dut_runtime_log(
+                dut_id,
+                "INFO",
+                "DUTManager",
+                f"DUT {dut_id}: Applied tool-level hmc_prefix_override '{hmc_prefix_override}' to RF_HMC_DEFAULT_PREFIX",
+            )
+        elif hmc_prefix_override and current_hmc_prefix:
+            await self.logger.write_to_dut_runtime_log(
+                dut_id,
+                "INFO",
+                "DUTManager",
+                f"DUT {dut_id}: Using custom RF_HMC_DEFAULT_PREFIX '{current_hmc_prefix}' (overrides tool-level hmc_prefix_override '{hmc_prefix_override}')",
+            )
+
+        # Update URIConfigManager with the final RF_HMC_DEFAULT_PREFIX value
+        final_hmc_prefix = config.get("RF_HMC_DEFAULT_PREFIX")
+        if self.uri_config_manager and final_hmc_prefix:
+            self.uri_config_manager.update_dut_hmc_prefix(dut_id, final_hmc_prefix)
 
     async def _create_duts(self) -> None:
         """
@@ -2754,57 +3391,11 @@ class DUTManager:
 
         # Process DUTs that don't need config files
         for dut_id, dut_config in duts_without_config:
-            # Track which keys were explicitly set in the original DUT config
-            # Dictionary format: {key_name: True/False} where True means it was in the DUT YAML
-            explicit_keys = {}
-
-            # Get the original YAML data for this DUT to see what was actually specified
-            # The issue is that dut_config already contains defaults from config.py
-            # We need to identify which keys were actually in the original YAML
-            original_yaml_data = self.dut_configs.get(dut_id, {})
-
-            # Skip flags that are known to come from config.py defaults
-            config_py_defaults = {
-                "SKIP_BMC_SSH_LOGS",
-                "SKIP_HOST_LOGS",
-                "SKIP_REDFISH_OOB_LOGS",
-                "SKIP_IPMI_LOGS",
-                "SKIP_PORT_FW",
-                "COLLECTOR_TO_SKIP",
-                "SYSTEM_ID_TO_SKIP",
-                "CHASSIS_ID_TO_SKIP",
-                "MANAGER_ID_TO_SKIP",
-                "EXPAND_QUERY_CHASSIS_LEVEL",
-                "EXPAND_QUERY_FIRMWARE_INVENTORY_LEVEL",
-                "EXPAND_QUERY_MANAGER_LEVEL",
-                "EXPAND_QUERY_SYSTEM_LEVEL",
-                "NVOS_TECH_DUMP_TIMEOUT",
-                "REDFISH_DUMP_TIMEOUT",
-                "REDFISH_DEVICE_DUMP_SLEEP_DURATION",
-                "BMC_TEMP_DIR",
-                "FW_INVENTORY_TABLE_PROPERTIES",
-                "TASK_ID_PREFIX",
-                "TOOL_TEMP_DIR",
-            }
-
-            if isinstance(original_yaml_data, dict):
-                # Only mark keys as explicit if they are NOT known config.py defaults
-                # or if they have non-default values
-                for key in original_yaml_data.keys():
-                    # Skip known config.py defaults unless they have been explicitly overridden
-                    if key in config_py_defaults:
-                        # For skip flags, only mark as explicit if they were actually set in YAML
-                        # Note: config.py defaults for SKIP_BMC_SSH_LOGS is True, others are False
-                        if key.startswith("SKIP_"):
-                            # Only mark as explicit if the key was actually present in the original YAML
-                            # This means it was explicitly set, regardless of the value
-                            if key in original_yaml_data:
-                                explicit_keys[key] = True
-                        # For other config.py defaults, don't mark as explicit
-                        # unless we can determine they were actually set in YAML
-                    else:
-                        # Non-config.py keys are considered explicit
-                        explicit_keys[key] = True
+            explicit_keys = _explicit_key_map(dut_config)
+            defaults_config = _strip_internal_config_keys(defaults)
+            effective_dut_config = _drop_implicit_tool_like_defaults(
+                dut_config, explicit_keys
+            )
 
             await self.logger.write_to_dut_runtime_log(
                 dut_id,
@@ -2816,13 +3407,13 @@ class DUTManager:
                 dut_id,
                 "DEBUG",
                 "DUTManager",
-                f"DUT {dut_id}: dut_config keys: {set(dut_config.keys())}",
+                f"DUT {dut_id}: dut_config keys: {set(effective_dut_config.keys())}",
             )
             await self.logger.write_to_dut_runtime_log(
                 dut_id,
                 "DEBUG",
                 "DUTManager",
-                f"DUT {dut_id}: defaults keys: {set(defaults.keys())}",
+                f"DUT {dut_id}: defaults keys: {set(defaults_config.keys())}",
             )
             await self.logger.write_to_dut_runtime_log(
                 dut_id,
@@ -2830,35 +3421,13 @@ class DUTManager:
                 "DUTManager",
                 f"DUT {dut_id}: explicit_keys: {explicit_keys}",
             )
-            # Merge with tool config first, then defaults, then DUT config
-            # This ensures tool config values (like REDFISH_DUMP_TIMEOUT) are not overridden by defaults
-            config = {**self.tool_config, **defaults, **dut_config}
+            # tool_config < DUT_Defaults < explicit per-DUT values. Implicit
+            # DUTConfig model defaults are removed above so they cannot clobber
+            # tool_config.yaml values.
+            config = {**self.tool_config, **defaults_config, **effective_dut_config}
 
-            # Special handling: Tool config should override DUT defaults for certain fields
-            # This ensures tool_config.yaml values take precedence over config.py defaults
-            tool_config_override_fields = {
-                "FW_INVENTORY_TABLE_PROPERTIES",
-                "ADDITIONAL_OOB_URI_COLLECTION",
-                "NVLINK_OOB_URI",
-                "CUSTOM_DUMP_SERVICES",
-                "POST_CODES_URI",
-                "BMC_TEMP_DIR",
-                "REDFISH_DUMP_TIMEOUT",
-                "NVOS_TECH_DUMP_TIMEOUT",
-                "REDFISH_DEVICE_DUMP_SLEEP_DURATION",
-                # Skip flags
-                "SKIP_BMC_SSH_LOGS",
-                "SKIP_HOST_LOGS",
-                "SKIP_REDFISH_OOB_LOGS",
-                "SKIP_IPMI_LOGS",
-                "SKIP_PORT_FW",
-                # Feature flags
-                "EXTRA_LOG_COLLECTION",
-            }
-
-            for field in tool_config_override_fields:
-                if field in self.tool_config and self.tool_config[field] is not None:
-                    config[field] = self.tool_config[field]
+            # Apply prefix_override to RF_DEFAULT_PREFIX and update URIConfigManager
+            await self._apply_and_log_prefix_override(dut_id, config)
 
             # Log skip flag values for debugging
             await self.logger.write_to_dut_runtime_log(
@@ -2882,38 +3451,25 @@ class DUTManager:
             config_file_to_use = dut_config.get("ConfigFileToUse")
             dut_specific_config = config_cache.get(config_file_to_use, {})
 
-            # Track which keys were explicitly set in the original DUT config
-            # Dictionary format: {key_name: True/False} where True means it was in the DUT YAML
-            explicit_keys = {}
-
-            # Mark keys from the DUT config as explicit
-            for key in dut_config.keys():
-                explicit_keys[key] = True
-
-            # Mark keys from the DUT-specific config file as explicit
+            explicit_keys = _explicit_key_map(dut_config)
             for key in dut_specific_config.keys():
                 explicit_keys[key] = True
 
-            # Merge configurations: DUT config overrides DUT-specific config
-            dut_config_with_overrides = {**dut_specific_config, **dut_config}
-
-            # Merge with tool config first, then defaults, then DUT config
-            # This ensures tool config values (like REDFISH_DUMP_TIMEOUT) are not overridden by defaults
-            config = {**self.tool_config, **defaults, **dut_config_with_overrides}
-
-            # Special handling: Tool config should override DUT defaults for certain fields
-            # This ensures tool_config.yaml values take precedence over config.py defaults
-            tool_config_override_fields = {
-                "FW_INVENTORY_TABLE_PROPERTIES",
-                "ADDITIONAL_OOB_URI_COLLECTION",
-                "NVLINK_OOB_URI",
-                "CUSTOM_DUMP_SERVICES",
-                "POST_CODES_URI",
-                "BMC_TEMP_DIR",
-                "REDFISH_DUMP_TIMEOUT",
-                "NVOS_TECH_DUMP_TIMEOUT",
-                "REDFISH_DEVICE_DUMP_SLEEP_DURATION",
+            defaults_config = _strip_internal_config_keys(defaults)
+            dut_config_with_overrides = {
+                **dut_specific_config,
+                **_strip_internal_config_keys(dut_config),
             }
+            effective_dut_config = _drop_implicit_tool_like_defaults(
+                dut_config_with_overrides, explicit_keys
+            )
+
+            # tool_config < DUT_Defaults < ConfigFileToUse < DUT YAML. The
+            # Pydantic default-only values are stripped before this merge.
+            config = {**self.tool_config, **defaults_config, **effective_dut_config}
+
+            # Apply prefix_override to RF_DEFAULT_PREFIX and update URIConfigManager
+            await self._apply_and_log_prefix_override(dut_id, config)
 
             await self.logger.write_to_dut_runtime_log(
                 dut_id,
@@ -2933,24 +3489,6 @@ class DUTManager:
                 "DUTManager",
                 f"DUT {dut_id}: Tool config BMC_TEMP_DIR: {self.tool_config.get('BMC_TEMP_DIR', 'NOT_FOUND')}",
             )
-
-            for field in tool_config_override_fields:
-                if field in self.tool_config and self.tool_config[field]:
-                    old_value = config.get(field, "NOT_SET")
-                    config[field] = self.tool_config[field]
-                    await self.logger.write_to_dut_runtime_log(
-                        dut_id,
-                        "INFO",
-                        "DUTManager",
-                        f"DUT {dut_id}: Overriding {field} from tool config: {old_value} -> {self.tool_config[field]}",
-                    )
-                else:
-                    await self.logger.write_to_dut_runtime_log(
-                        dut_id,
-                        "DEBUG",
-                        "DUTManager",
-                        f"DUT {dut_id}: No tool config override for {field} - tool_config has: {self.tool_config.get(field, 'NOT_FOUND')}",
-                    )
 
             # Log final config values after override
             await self.logger.write_to_dut_runtime_log(
@@ -2990,7 +3528,7 @@ class DUTManager:
         self,
         dut_id: str,
         config: Dict[str, Any],
-        explicit_keys: Optional[Set[str]] = None,
+        explicit_keys: Optional[Dict[str, bool]] = None,
     ) -> None:
         """
         Create a single DUT object with the given configuration.
@@ -3009,22 +3547,80 @@ class DUTManager:
                 # Preserve explicit/CLI-provided HMC_IP before merge so baseboard defaults don't override it
                 original_hmc_ip = config.get("HMC_IP") or config.get("hmc_ip")
 
+                # Save i2c_config before baseboard merge overwrites it.
+                # At this point config already has the correct precedence:
+                # global tool_config < defaults < per-DUT ConfigFileToUse < DUT YAML
+                pre_merge_i2c_config = config.get("i2c_config", {})
+
                 # Merge baseboard config into DUT config (defaults only)
                 config = {**config, **baseboard_config}
 
+                # Special handling for i2c_config - deep merge with proper precedence:
+                # baseboard (lowest) < tool_config / per-DUT config (higher)
+                if pre_merge_i2c_config:
+                    baseboard_i2c_config = baseboard_config.get("i2c_config", {})
+                    merged_i2c_config = {**baseboard_i2c_config, **pre_merge_i2c_config}
+                    config["i2c_config"] = merged_i2c_config
+                    await self.logger.log_runtime(
+                        "DEBUG",
+                        "DUTManager",
+                        f"Applied i2c_config overrides for DUT {dut_id}: {list(pre_merge_i2c_config.keys())}",
+                    )
+
+                platform_detection = config.get("platform_detection", {})
+
+                hmc_ip_candidates: List[str] = []
+                if isinstance(platform_detection, dict):
+                    raw_hmc_ip = platform_detection.get("hmc_ip")
+                    candidate_values: List[Any] = []
+
+                    if isinstance(raw_hmc_ip, list):
+                        candidate_values.extend(raw_hmc_ip)
+                    else:
+                        candidate_values.append(raw_hmc_ip)
+
+                    existing_candidate_list = platform_detection.get(
+                        "hmc_ip_candidates"
+                    )
+                    if isinstance(existing_candidate_list, list):
+                        candidate_values.extend(existing_candidate_list)
+
+                    for candidate in candidate_values:
+                        if isinstance(candidate, str):
+                            value = candidate.strip()
+                            if value and value not in hmc_ip_candidates:
+                                hmc_ip_candidates.append(value)
+
+                    if hmc_ip_candidates:
+                        platform_detection["hmc_ip_candidates"] = hmc_ip_candidates
+                        platform_detection["hmc_ip"] = hmc_ip_candidates[0]
+                        combined_candidates: List[str] = []
+                        existing_config_candidates = config.get("HMC_IP_CANDIDATES", [])
+                        if isinstance(existing_config_candidates, list):
+                            for candidate in existing_config_candidates:
+                                if (
+                                    isinstance(candidate, str)
+                                    and candidate
+                                    and candidate not in combined_candidates
+                                ):
+                                    combined_candidates.append(candidate.strip())
+
+                        for candidate in hmc_ip_candidates:
+                            if candidate not in combined_candidates:
+                                combined_candidates.append(candidate)
+
+                        if combined_candidates:
+                            config["HMC_IP_CANDIDATES"] = combined_candidates
+
                 # Extract HMC_IP from platform_detection if not already at top level
-                if not original_hmc_ip:
-                    platform_detection = config.get("platform_detection", {})
-                    if isinstance(platform_detection, dict) and platform_detection.get(
-                        "hmc_ip"
-                    ):
-                        config["HMC_IP"] = platform_detection["hmc_ip"]
-                        config["hmc_ip"] = platform_detection["hmc_ip"]
-                        await self.logger.log_runtime(
-                            "INFO",
-                            "DUTManager",
-                            f"Extracted HMC_IP from baseboard platform_detection: {platform_detection['hmc_ip']}",
-                        )
+                if not original_hmc_ip and hmc_ip_candidates:
+                    config["HMC_IP"] = hmc_ip_candidates[0]
+                    config["hmc_ip"] = hmc_ip_candidates[0]
+                    await self.logger.log_runtime(
+                        "INFO",
+                        "DUTManager",
+                        f"Extracted HMC_IP from baseboard platform_detection: {hmc_ip_candidates[0]}",
+                    )
 
                 # Restore HMC_IP if it was explicitly provided
                 if original_hmc_ip:
@@ -3059,61 +3655,135 @@ class DUTManager:
         # Ensure credentials.hmc_ip respects explicit config before any auto-configuration later
         explicit_hmc_ip = config.get("HMC_IP") or config.get("hmc_ip")
 
+        bmc_username = config.get("BMC_USERNAME") or config.get("bmc_user") or ""
+        bmc_password = config.get("BMC_PASSWORD") or config.get("bmc_pass") or ""
+        # Redfish user/pass: if not provided, use BMC user/pass
+        rf_username = config.get("RF_User") or config.get("bmc_rf_user")
+        rf_password = config.get("RF_Pass") or config.get("bmc_rf_pass")
+        if not rf_username and bmc_username:
+            rf_username = bmc_username
+        if not rf_password and bmc_password:
+            rf_password = bmc_password
+        # BMC SSH user/pass: if not provided, use BMC user/pass
+        bmc_ssh_username = config.get("BMC_SSH_USERNAME") or config.get("bmc_ssh_user")
+        bmc_ssh_password = config.get("BMC_SSH_PASSWORD") or config.get("bmc_ssh_pass")
+        if not bmc_ssh_username and bmc_username:
+            bmc_ssh_username = bmc_username
+        if not bmc_ssh_password and bmc_password:
+            bmc_ssh_password = bmc_password
+
+        bmc_use_https = config.get("BMC_USE_HTTPS")
+        if bmc_use_https is None:
+            bmc_use_https = config.get("bmc_use_https", True)
+
+        hmc_use_https = config.get("HMC_USE_HTTPS")
+        if hmc_use_https is None:
+            hmc_use_https = config.get("hmc_use_https", True)
+
+        execution_mode = _resolve_execution_mode(config)
+        config["ExecutionMode"] = execution_mode
+        config["execution_mode"] = execution_mode
+        if execution_mode == "local":
+            config["local"] = True
+
         credentials = DUTCredentials(
-            bmc_ip=config.get("BMC_IP", ""),
-            bmc_username=config.get("BMC_USERNAME", ""),
-            bmc_password=config.get("BMC_PASSWORD", ""),
-            bmc_ssh_username=config.get("BMC_SSH_USERNAME"),
-            bmc_ssh_password=config.get("BMC_SSH_PASSWORD"),
-            bmc_ssh_port=config.get("BMC_SSH_PORT", 22),
-            bmc_ssh_key_path=config.get("BMC_SSH_KEY_PATH"),
-            bmc_ssh_passwordless=config.get("BMC_SSH_PASSWORDLESS", False),
-            bmc_ssh_max_retries=config.get("BMC_SSH_MAX_RETRIES", 3),
-            bmc_rf_port=config.get("BMC_RF_PORT", 443),
-            bmc_use_https=config.get("bmc_use_https", True),
+            bmc_ip=config.get("BMC_IP") or config.get("bmc_ip") or "",
+            bmc_username=bmc_username,
+            bmc_password=bmc_password,
+            bmc_ssh_username=bmc_ssh_username,
+            bmc_ssh_password=bmc_ssh_password,
+            bmc_ssh_port=config.get("BMC_SSH_PORT") or config.get("bmc_ssh_port") or 22,
+            bmc_ssh_key_path=config.get("BMC_SSH_KEY_PATH")
+            or config.get("bmc_ssh_key_path"),
+            bmc_ssh_passwordless=config.get(
+                "BMC_SSH_PASSWORDLESS", config.get("bmc_ssh_passwordless", False)
+            ),
+            bmc_ssh_max_retries=config.get(
+                "BMC_SSH_MAX_RETRIES", config.get("bmc_ssh_max_retries", 3)
+            ),
+            bmc_rf_port=config.get("BMC_RF_PORT") or config.get("bmc_rf_port") or 443,
+            bmc_use_https=bmc_use_https,
             bmc_rf_verify_ssl=config.get("bmc_rf_verify_ssl", False),
-            host_ip=config.get("HOST_IP"),
-            host_username=config.get("HOST_USERNAME"),
-            host_password=config.get("HOST_PASSWORD"),
-            host_ssh_port=config.get("HOST_SSH_PORT", 22),
-            host_ssh_key_path=config.get("HOST_SSH_KEY_PATH"),
-            host_ssh_passwordless=config.get("HOST_SSH_PASSWORDLESS", False),
-            host_ssh_max_retries=config.get("HOST_SSH_MAX_RETRIES", 3),
-            rf_username=config.get("RF_User"),
-            rf_password=config.get("RF_Pass"),
-            tunnel_tcp_port=config.get("TUNNEL_TCP_PORT"),
+            host_ip=config.get("HOST_IP") or config.get("host_ip"),
+            host_username=config.get("HOST_USERNAME") or config.get("host_user"),
+            host_password=config.get("HOST_PASSWORD") or config.get("host_pass"),
+            host_ssh_port=config.get("HOST_SSH_PORT")
+            or config.get("host_ssh_port")
+            or 22,
+            host_ssh_key_path=config.get("HOST_SSH_KEY_PATH")
+            or config.get("host_ssh_key_path"),
+            host_ssh_passwordless=config.get(
+                "HOST_SSH_PASSWORDLESS", config.get("host_ssh_passwordless", False)
+            ),
+            host_ssh_max_retries=config.get(
+                "HOST_SSH_MAX_RETRIES", config.get("host_ssh_max_retries", 3)
+            ),
+            rf_username=rf_username,
+            rf_password=rf_password,
+            tunnel_tcp_port=config.get("TUNNEL_TCP_PORT")
+            or config.get("tunnel_tcp_port"),
             ipmi_cipher=config.get("ipmi_cipher", "-C17"),
             # HMC Configuration
             hmc_ip=explicit_hmc_ip or config.get("HMC_IP"),
-            hmc_username=config.get("HMC_USERNAME"),
-            hmc_password=config.get("HMC_PASSWORD"),
-            hmc_ssh_username=config.get("HMC_SSH_USERNAME"),
-            hmc_ssh_password=config.get("HMC_SSH_PASSWORD"),
-            hmc_ssh_port=config.get("HMC_SSH_PORT", 22),
-            hmc_ssh_key_path=config.get("HMC_SSH_KEY_PATH"),
-            hmc_ssh_passwordless=config.get("HMC_SSH_PASSWORDLESS", False),
-            hmc_ssh_max_retries=config.get("HMC_SSH_MAX_RETRIES", 3),
+            hmc_username=config.get("HMC_USERNAME") or config.get("hmc_user"),
+            hmc_password=config.get("HMC_PASSWORD") or config.get("hmc_pass"),
+            hmc_ssh_username=config.get("HMC_SSH_USERNAME")
+            or config.get("hmc_ssh_user"),
+            hmc_ssh_password=config.get("HMC_SSH_PASSWORD")
+            or config.get("hmc_ssh_pass"),
+            hmc_ssh_port=config.get("HMC_SSH_PORT") or config.get("hmc_ssh_port") or 22,
+            hmc_ssh_key_path=config.get("HMC_SSH_KEY_PATH")
+            or config.get("hmc_ssh_key_path"),
+            hmc_ssh_passwordless=config.get(
+                "HMC_SSH_PASSWORDLESS", config.get("hmc_ssh_passwordless", False)
+            ),
+            hmc_ssh_max_retries=config.get(
+                "HMC_SSH_MAX_RETRIES", config.get("hmc_ssh_max_retries", 3)
+            ),
             hmc_http_port=config.get("HMC_HTTP_PORT", 80),
             hmc_https_port=config.get("HMC_HTTPS_PORT", 443),
-            hmc_use_https=config.get("HMC_USE_HTTPS", True),
+            hmc_use_https=hmc_use_https,
             use_port_forwarding=config.get("USE_PORT_FORWARDING", False),
             rf_hmc_access_method=config.get("RF_HMC_ACCESS_METHOD"),
-            execution_mode=config.get("ExecutionMode", "remote"),
+            execution_mode=execution_mode,
+            hmc_ip_candidates=config.get("HMC_IP_CANDIDATES"),
             # SSH Proxy Configuration
-            ssh_proxy_host=config.get("ssh_proxy_host"),
-            ssh_proxy_port=config.get("ssh_proxy_port", 22),
+            ssh_proxy_host=config.get("SSH_PROXY_HOST")
+            or config.get("ssh_proxy_host"),
+            ssh_proxy_port=config.get(
+                "SSH_PROXY_PORT", config.get("ssh_proxy_port", 22)
+            ),
             ssh_proxy_username=config.get(
-                "ssh_proxy_user"
+                "SSH_PROXY_USERNAME", config.get("ssh_proxy_user")
             ),  # Map ssh_proxy_user to ssh_proxy_username
             ssh_proxy_password=config.get(
-                "ssh_proxy_pass"
+                "SSH_PROXY_PASSWORD", config.get("ssh_proxy_pass")
             ),  # Map ssh_proxy_pass to ssh_proxy_password
-            ssh_proxy_key_path=config.get("ssh_proxy_key_path"),
-            ssh_proxy_passwordless=config.get("ssh_proxy_passwordless", False),
-            ssh_proxy_max_retries=config.get("ssh_proxy_max_retries", 3),
+            ssh_proxy_key_path=config.get("SSH_PROXY_KEY_PATH")
+            or config.get("ssh_proxy_key_path"),
+            ssh_proxy_passwordless=config.get(
+                "SSH_PROXY_PASSWORDLESS", config.get("ssh_proxy_passwordless", False)
+            ),
+            ssh_proxy_max_retries=config.get(
+                "SSH_PROXY_MAX_RETRIES", config.get("ssh_proxy_max_retries", 3)
+            ),
         )
 
         dut = DUT(dut_id, credentials, config, self)
+        dut.redfish_ssl = self.redfish_ssl
+        dut.redfish_session_config = self.redfish_session_config
+        dut.redfish_session_timeout = self.redfish_session_timeout
+        dut.redfish_keepalive_timeout = self.redfish_keepalive_timeout
+        dut.redfish_ttl_dns_cache = self.redfish_ttl_dns_cache
+        dut.redfish_use_dns_cache = self.redfish_use_dns_cache
+        dut.redfish_force_close = self.redfish_force_close
+        dut.redfish_enable_cleanup_closed = self.redfish_enable_cleanup_closed
+        dut.redfish_fallback_connection_pool_limit = (
+            self.redfish_fallback_connection_pool_limit
+        )
+        dut.redfish_fallback_connection_pool_limit_per_host = (
+            self.redfish_fallback_connection_pool_limit_per_host
+        )
         dut.logger = self.logger  # Give DUT access to the logger
         # Store explicit keys for configuration precedence
         dut.explicit_config_keys = explicit_keys or {}
@@ -3212,11 +3882,11 @@ class DUTManager:
             else:
                 # No running loop, safe to use asyncio.run()
                 asyncio.run(self.cleanup_all_ssh_proxy_tunnels())
-        except RuntimeError as e:
+        except RuntimeError:
             # No event loop, safe to use asyncio.run()
             try:
                 asyncio.run(self.cleanup_all_ssh_proxy_tunnels())
-            except Exception as e2:
+            except Exception:
                 self._kill_all_ssh_tunnels_direct()
         except Exception as e:
             # Fallback to direct SSH process killing
@@ -3330,6 +4000,7 @@ class DUTManager:
         self,
         required_collector_groups: Optional[List[str]] = None,
         show_progress: bool = True,
+        collector_definitions: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Run preflight checks on all DUTs in parallel with comprehensive logging and progress bar
@@ -3338,6 +4009,7 @@ class DUTManager:
             required_collector_groups: List of collector groups that will be executed.
                                      If None, runs all preflight checks.
                                      Valid groups: ["redfish", "ipmi", "ssh", "host"]
+            collector_definitions: Full collector catalog with applicable baseboards.
         """
         if not self.duts:
             await self.logger.log_runtime("ERROR", "DUTManager", "No DUTs configured")
@@ -3359,6 +4031,9 @@ class DUTManager:
             console = Console(file=self.logger.original_stdout, force_terminal=True)
         else:
             console = Console(force_terminal=True)
+
+        # Build collector group mapping once for baseboard-aware preflight skipping
+        collectors_by_group = self._build_collectors_by_group_map(collector_definitions)
 
         results = {}
 
@@ -3385,7 +4060,12 @@ class DUTManager:
                 dut_tasks = []
                 for dut_id, dut in self.duts.items():
                     task = self._run_dut_preflight_parallel(
-                        dut_id, dut, progress, main_task, services_to_check
+                        dut_id,
+                        dut,
+                        progress,
+                        main_task,
+                        services_to_check,
+                        collectors_by_group,
                     )
                     dut_tasks.append(task)
 
@@ -3416,7 +4096,7 @@ class DUTManager:
             dut_tasks = []
             for dut_id, dut in self.duts.items():
                 task = self._run_dut_preflight_no_progress(
-                    dut_id, dut, services_to_check
+                    dut_id, dut, services_to_check, collectors_by_group
                 )
                 dut_tasks.append(task)
 
@@ -3451,7 +4131,7 @@ class DUTManager:
         await self.logger.log_runtime(
             "INFO",
             "DUTManager",
-            f"Preflight checks completed for all DUTs in parallel",
+            "Preflight checks completed for all DUTs in parallel",
         )
         return results
 
@@ -3490,6 +4170,203 @@ class DUTManager:
 
         return services_to_check
 
+    def _build_collectors_by_group_map(
+        self, collector_definitions: Optional[Dict[str, Any]]
+    ) -> Dict[str, List[Tuple[str, Dict[str, Any]]]]:
+        """
+        Build a mapping of collector group -> collector definitions for quick lookups.
+
+        Args:
+            collector_definitions: Collector catalog data structure.
+
+        Returns:
+            Dictionary keyed by lowercase group name with list of (collector_id, definition).
+        """
+        group_map: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
+        if not collector_definitions:
+            return group_map
+
+        collectors = collector_definitions.get("collectors", {})
+        if not isinstance(collectors, dict):
+            return group_map
+
+        for collector_id, collector in collectors.items():
+            if not isinstance(collector, dict):
+                continue
+            group = collector.get("group")
+            if not group:
+                continue
+            group_key = str(group).strip().lower()
+            if not group_key:
+                continue
+            group_map.setdefault(group_key, []).append((str(collector_id), collector))
+
+        return group_map
+
+    def _normalize_applicable_baseboards(
+        self, applicable: Optional[Union[str, List[Any], Dict[str, Any]]]
+    ) -> List[str]:
+        """
+        Normalize applicable_baseboards values into a flat list of strings.
+        """
+        normalized: List[str] = []
+
+        def _flatten(value):
+            if value is None:
+                return
+            if isinstance(value, str):
+                trimmed = value.strip()
+                if trimmed:
+                    normalized.append(trimmed)
+                return
+            if isinstance(value, list):
+                for item in value:
+                    _flatten(item)
+                return
+            if isinstance(value, dict):
+                for key, flag in value.items():
+                    include = True
+                    if isinstance(flag, bool):
+                        include = flag
+                    elif isinstance(flag, str):
+                        include = flag.strip().lower() not in (
+                            "false",
+                            "0",
+                            "no",
+                            "off",
+                        )
+                    elif isinstance(flag, (int, float)):
+                        include = bool(flag)
+                    if include:
+                        normalized.append(str(key).strip())
+                return
+            normalized.append(str(value).strip())
+
+        _flatten(applicable)
+        return [spec for spec in normalized if spec]
+
+    def _collector_matches_baseboard(
+        self,
+        collector_def: Dict[str, Any],
+        baseboard_name: str,
+        baseboard_type: Optional[str],
+        baseboard_manager: Optional[BaseboardManager],
+        node_type: Optional[str] = None,
+    ) -> bool:
+        """
+        Determine if collector applies to given baseboard name/type.
+        """
+        applicable_specs = self._normalize_applicable_baseboards(
+            collector_def.get("applicable_baseboards")
+        )
+        exclude_specs = self._normalize_applicable_baseboards(
+            collector_def.get("exclude_baseboards")
+        )
+
+        # If no specification, assume collector applies broadly.
+        if not applicable_specs:
+            applicable_specs = ["all"]
+
+        baseboard_type_lower = baseboard_type.lower() if baseboard_type else None
+        node_type_lower = node_type.lower() if node_type else None
+        effective_baseboard_names = [baseboard_name]
+        effective_baseboard_names_lower = [
+            member.lower() for member in effective_baseboard_names
+        ]
+
+        def spec_matches(spec: str) -> bool:
+            spec_lower = spec.lower()
+            if spec_lower in {"all", "*"}:
+                return True
+            if spec_lower in effective_baseboard_names_lower:
+                return True
+            if baseboard_type_lower and baseboard_type_lower == spec_lower:
+                return True
+            if node_type_lower and node_type_lower == spec_lower:
+                return True
+            if baseboard_manager:
+                group_members = baseboard_manager.get_baseboards_in_group(spec)
+                if group_members:
+                    members_lower = [member.lower() for member in group_members]
+                    if any(
+                        effective_name in members_lower
+                        for effective_name in effective_baseboard_names_lower
+                    ):
+                        return True
+            return False
+
+        if any(spec_matches(spec) for spec in exclude_specs):
+            return False
+
+        return any(spec_matches(spec) for spec in applicable_specs)
+
+    def _should_run_service_for_dut(
+        self,
+        dut: "DUT",
+        service_name: str,
+        collectors_by_group: Optional[
+            Dict[str, List[Tuple[str, Dict[str, Any]]]]
+        ] = None,
+    ) -> Tuple[bool, str]:
+        """
+        Check if a preflight service should run for a DUT based on applicable baseboards.
+
+        Returns:
+            Tuple of (should_run, reason_message).
+        """
+        if not collectors_by_group:
+            return True, "Collector definitions unavailable"
+
+        service_collectors = collectors_by_group.get(service_name.lower(), [])
+        if not service_collectors:
+            return True, f"No {service_name} collectors defined"
+
+        baseboard_name = None
+        node_type = None
+        if dut and getattr(dut, "config", None):
+            baseboard_name = dut.config.get("baseboard") or dut.config.get(
+                "TargetBaseboard"
+            )
+            node_type = dut.config.get("NodeType") or dut.config.get("node_type")
+
+        if not baseboard_name:
+            return True, "Baseboard not specified; running preflight by default"
+
+        baseboard_name = str(baseboard_name).strip()
+        if not baseboard_name or baseboard_name.lower() == "unknown":
+            return True, "Baseboard not specified; running preflight by default"
+
+        baseboard_manager = self._get_baseboard_manager()
+        baseboard_type = (
+            baseboard_manager.get_baseboard_type(baseboard_name)
+            if baseboard_manager
+            else None
+        )
+
+        for collector_id, collector_def in service_collectors:
+            if self._collector_matches_baseboard(
+                collector_def,
+                baseboard_name,
+                baseboard_type,
+                baseboard_manager,
+                node_type=node_type,
+            ):
+                return (
+                    True,
+                    f"Collector {collector_id} targets baseboard {baseboard_name}",
+                )
+
+        if baseboard_type:
+            return (
+                False,
+                f"No applicable {service_name} collectors for baseboard '{baseboard_name}' ({baseboard_type})",
+            )
+        else:
+            return (
+                False,
+                f"No applicable {service_name} collectors for baseboard '{baseboard_name}'",
+            )
+
     async def _run_dut_preflight_parallel(
         self,
         dut_id: str,
@@ -3497,6 +4374,9 @@ class DUTManager:
         progress,
         main_task,
         services_to_check: List[str],
+        collectors_by_group: Optional[
+            Dict[str, List[Tuple[str, Dict[str, Any]]]]
+        ] = None,
     ) -> Dict[str, Any]:
         """
         Run preflight checks for a single DUT with all services in parallel.
@@ -3507,6 +4387,7 @@ class DUTManager:
             progress: Progress bar instance.
             main_task: Main task ID for progress tracking.
             services_to_check: List of services to check.
+            collectors_by_group: Mapping of collector group -> collectors with metadata.
 
         Returns:
             Dictionary with preflight results for the DUT.
@@ -3526,10 +4407,14 @@ class DUTManager:
 
         # Define all services to test
         all_services = [
-            ("redfish", self._fast_redfish_check, dut),
-            ("ipmi", self._fast_ipmi_check, dut),
-            ("ssh", self._fast_ssh_check, dut),
-            ("host", self._fast_host_check, dut),
+            (
+                "redfish",
+                lambda d: self._fast_redfish_check(d, collectors_by_group),
+                dut,
+            ),
+            ("ipmi", lambda d: self._fast_ipmi_check(d, collectors_by_group), dut),
+            ("ssh", lambda d: self._fast_ssh_check(d, collectors_by_group), dut),
+            ("host", lambda d: self._fast_host_check(d, collectors_by_group), dut),
         ]
 
         # Filter services based on what's needed
@@ -3538,7 +4423,6 @@ class DUTManager:
         ]
 
         # Run services sequentially to avoid resource contention
-        service_results = []
         for service_name, test_func, dut_obj in services:
             # Check for shutdown request before each service
             if (
@@ -3559,46 +4443,67 @@ class DUTManager:
                 dut_result["overall_status"] = "interrupted"
                 break
 
-            result = await self._run_service_preflight_parallel(
-                service_name, test_func, dut_obj, dut_id, progress, main_task
+            should_run, skip_reason = self._should_run_service_for_dut(
+                dut, service_name, collectors_by_group
             )
-            service_results.append(result)
+            if not should_run:
+                progress.update(
+                    main_task,
+                    description=f"[cyan]Preflight: {service_name}[/cyan] on [yellow]{dut_id}[/yellow] - skipped",
+                )
+                progress.advance(main_task)
+                dut_result["services"][service_name] = {
+                    "status": "skip",
+                    "message": skip_reason,
+                }
+                await self.logger.log_runtime(
+                    "INFO",
+                    f"DUT:{dut_id}",
+                    f"Skipping {service_name} preflight: {skip_reason}",
+                )
+                await self.logger.write_to_dut_runtime_log(
+                    dut_id,
+                    "INFO",
+                    "PreflightChecks",
+                    f"Skipping {service_name} preflight: {skip_reason}",
+                )
+                continue
 
-        # Process service results
-        for i, result in enumerate(service_results):
-            service_name = services[i][0]
-            if isinstance(result, Exception):
-                # Handle exception
+            try:
+                success, message = await self._run_service_preflight_parallel(
+                    service_name, test_func, dut_obj, dut_id, progress, main_task
+                )
+            except Exception as exc:
                 dut_result["services"][service_name] = {
                     "status": "fail",
-                    "message": f"Exception during {service_name} test: {str(result)}",
+                    "message": f"Exception during {service_name} test: {str(exc)}",
                 }
                 dut_result["overall_status"] = "fail"
                 await self.logger.log_runtime(
                     "ERROR",
                     f"DUT:{dut_id}",
-                    f"{service_name} service exception: {str(result)}",
+                    f"{service_name} service exception: {str(exc)}",
+                )
+                continue
+
+            dut_result["services"][service_name] = {
+                "status": "pass" if success else "fail",
+                "message": message,
+            }
+
+            if not success:
+                dut_result["overall_status"] = "fail"
+                await self.logger.log_runtime(
+                    "WARN",
+                    f"DUT:{dut_id}",
+                    f"{service_name} service failed: {message}",
                 )
             else:
-                success, message = result
-                dut_result["services"][service_name] = {
-                    "status": "pass" if success else "fail",
-                    "message": message,
-                }
-
-                if not success:
-                    dut_result["overall_status"] = "fail"
-                    await self.logger.log_runtime(
-                        "WARN",
-                        f"DUT:{dut_id}",
-                        f"{service_name} service failed: {message}",
-                    )
-                else:
-                    await self.logger.log_runtime(
-                        "INFO",
-                        f"DUT:{dut_id}",
-                        f"{service_name} service passed: {message}",
-                    )
+                await self.logger.log_runtime(
+                    "INFO",
+                    f"DUT:{dut_id}",
+                    f"{service_name} service passed: {message}",
+                )
 
         status_msg = "PASSED" if dut_result["overall_status"] == "pass" else "FAILED"
         await self.logger.write_to_dut_runtime_log(
@@ -3611,7 +4516,13 @@ class DUTManager:
         return dut_result
 
     async def _run_dut_preflight_no_progress(
-        self, dut_id: str, dut: "DUT", services_to_check: List[str]
+        self,
+        dut_id: str,
+        dut: "DUT",
+        services_to_check: List[str],
+        collectors_by_group: Optional[
+            Dict[str, List[Tuple[str, Dict[str, Any]]]]
+        ] = None,
     ) -> Dict[str, Any]:
         """
         Run preflight checks for a single DUT without progress bar.
@@ -3620,6 +4531,7 @@ class DUTManager:
             dut_id: DUT ID.
             dut: DUT instance.
             services_to_check: List of services to check.
+            collectors_by_group: Mapping of collector group -> collectors with metadata.
         """
         await self.logger.log_runtime(
             "INFO",
@@ -3636,10 +4548,14 @@ class DUTManager:
 
         # Define all services to test
         all_services = [
-            ("redfish", self._fast_redfish_check, dut),
-            ("ipmi", self._fast_ipmi_check, dut),
-            ("ssh", self._fast_ssh_check, dut),
-            ("host", self._fast_host_check, dut),
+            (
+                "redfish",
+                lambda d: self._fast_redfish_check(d, collectors_by_group),
+                dut,
+            ),
+            ("ipmi", lambda d: self._fast_ipmi_check(d, collectors_by_group), dut),
+            ("ssh", lambda d: self._fast_ssh_check(d, collectors_by_group), dut),
+            ("host", lambda d: self._fast_host_check(d, collectors_by_group), dut),
         ]
 
         # Filter services based on what's needed
@@ -3648,48 +4564,63 @@ class DUTManager:
         ]
 
         # Run services sequentially to avoid resource contention
-        service_results = []
         for service_name, test_func, dut_obj in services:
-            result = await self._run_service_preflight_no_progress(
-                service_name, test_func, dut_obj, dut_id
+            should_run, skip_reason = self._should_run_service_for_dut(
+                dut, service_name, collectors_by_group
             )
-            service_results.append(result)
+            if not should_run:
+                dut_result["services"][service_name] = {
+                    "status": "skip",
+                    "message": skip_reason,
+                }
+                await self.logger.log_runtime(
+                    "INFO",
+                    f"DUT:{dut_id}",
+                    f"Skipping {service_name} preflight: {skip_reason}",
+                )
+                await self.logger.write_to_dut_runtime_log(
+                    dut_id,
+                    "INFO",
+                    "PreflightChecks",
+                    f"Skipping {service_name} preflight: {skip_reason}",
+                )
+                continue
 
-        # Process service results
-        for i, result in enumerate(service_results):
-            service_name = services[i][0]
-            if isinstance(result, Exception):
-                # Handle exception
+            try:
+                success, message = await self._run_service_preflight_no_progress(
+                    service_name, test_func, dut_obj, dut_id
+                )
+            except Exception as exc:
                 dut_result["services"][service_name] = {
                     "status": "fail",
-                    "message": f"Exception during {service_name} test: {str(result)}",
+                    "message": f"Exception during {service_name} test: {str(exc)}",
                 }
                 dut_result["overall_status"] = "fail"
                 await self.logger.log_runtime(
                     "ERROR",
                     f"DUT:{dut_id}",
-                    f"{service_name} service exception: {str(result)}",
+                    f"{service_name} service exception: {str(exc)}",
+                )
+                continue
+
+            dut_result["services"][service_name] = {
+                "status": "pass" if success else "fail",
+                "message": message,
+            }
+
+            if not success:
+                dut_result["overall_status"] = "fail"
+                await self.logger.log_runtime(
+                    "WARN",
+                    f"DUT:{dut_id}",
+                    f"{service_name} service failed: {message}",
                 )
             else:
-                success, message = result
-                dut_result["services"][service_name] = {
-                    "status": "pass" if success else "fail",
-                    "message": message,
-                }
-
-                if not success:
-                    dut_result["overall_status"] = "fail"
-                    await self.logger.log_runtime(
-                        "WARN",
-                        f"DUT:{dut_id}",
-                        f"{service_name} service failed: {message}",
-                    )
-                else:
-                    await self.logger.log_runtime(
-                        "INFO",
-                        f"DUT:{dut_id}",
-                        f"{service_name} service passed: {message}",
-                    )
+                await self.logger.log_runtime(
+                    "INFO",
+                    f"DUT:{dut_id}",
+                    f"{service_name} service passed: {message}",
+                )
 
         status_msg = "PASSED" if dut_result["overall_status"] == "pass" else "FAILED"
         await self.logger.write_to_dut_runtime_log(
@@ -3790,12 +4721,96 @@ class DUTManager:
         except Exception as e:
             raise e
 
-    async def _fast_redfish_check(self, dut: "DUT") -> Tuple[bool, str]:
+    def _check_service_collector_applicability(
+        self,
+        dut: "DUT",
+        service_name: str,
+        collectors_by_group: Optional[
+            Dict[str, List[Tuple[str, Dict[str, Any]]]]
+        ] = None,
+    ) -> Tuple[bool, str]:
+        """
+        Check if any collectors for a given service are applicable to the DUT's baseboard.
+
+        Args:
+            dut: DUT instance.
+            service_name: Service name (e.g., "ipmi", "redfish", "ssh", "host").
+            collectors_by_group: Mapping of collector group -> collectors with metadata.
+
+        Returns:
+            Tuple of (should_skip, message). If should_skip is True, the preflight should be skipped.
+        """
+        if not collectors_by_group:
+            return False, ""
+
+        service_collectors = collectors_by_group.get(service_name.lower(), [])
+        if not service_collectors:
+            return False, ""
+
+        # Get baseboard information
+        baseboard_name = None
+        node_type = None
+        if dut and getattr(dut, "config", None):
+            baseboard_name = dut.config.get("baseboard") or dut.config.get(
+                "TargetBaseboard"
+            )
+            node_type = dut.config.get("NodeType") or dut.config.get("node_type")
+
+        if not baseboard_name:
+            return False, ""
+
+        baseboard_name = str(baseboard_name).strip()
+        if not baseboard_name or baseboard_name.lower() == "unknown":
+            return False, ""
+
+        # Check if any collector is applicable for this baseboard
+        baseboard_manager = self._get_baseboard_manager()
+        baseboard_type = (
+            baseboard_manager.get_baseboard_type(baseboard_name)
+            if baseboard_manager
+            else None
+        )
+
+        # Count applicable collectors
+        applicable_count = 0
+        for collector_id, collector_def in service_collectors:
+            if self._collector_matches_baseboard(
+                collector_def,
+                baseboard_name,
+                baseboard_type,
+                baseboard_manager,
+                node_type=node_type,
+            ):
+                applicable_count += 1
+
+        # If no collectors are applicable, return skip signal
+        if applicable_count == 0:
+            if baseboard_type:
+                return (
+                    True,
+                    f"No applicable {service_name.upper()} collectors for baseboard '{baseboard_name}' ({baseboard_type})",
+                )
+            else:
+                return (
+                    True,
+                    f"No applicable {service_name.upper()} collectors for baseboard '{baseboard_name}'",
+                )
+
+        return False, ""
+
+    async def _fast_redfish_check(
+        self,
+        dut: "DUT",
+        collectors_by_group: Optional[
+            Dict[str, List[Tuple[str, Dict[str, Any]]]]
+        ] = None,
+    ) -> Tuple[bool, str]:
         """
         Fast Redfish check using ping first, then actual interface test.
 
         Args:
             dut: DUT instance.
+            collectors_by_group: Mapping of collector group -> collectors with metadata.
 
         Returns:
             Tuple of (success, message).
@@ -3824,7 +4839,9 @@ class DUTManager:
         try:
             # Use the DUT's redfish method with timeout
             # Increase timeout for SSH proxy scenarios (tunnel setup takes time)
-            timeout = 30.0 if dut.credentials.ssh_proxy_host else 10.0
+            timeout = REDFISH_PREFLIGHT_WAIT_FOR_TIMEOUT
+            if dut.credentials.ssh_proxy_host or dut.credentials.use_port_forwarding:
+                timeout = max(timeout, 60.0)
             success, response = await asyncio.wait_for(
                 dut.test_redfish_connection(), timeout=timeout
             )
@@ -3833,17 +4850,31 @@ class DUTManager:
             else:
                 return False, f"Redfish interface failed: {response}"
         except asyncio.TimeoutError:
+            # Check if any Redfish collectors are applicable for this DUT's baseboard
+            should_skip, skip_message = self._check_service_collector_applicability(
+                dut, "redfish", collectors_by_group
+            )
+            if should_skip:
+                return False, skip_message
+
             timeout_msg = f"Redfish interface timeout ({timeout}s)"
             return False, timeout_msg
         except Exception as e:
             return False, f"Redfish interface error: {str(e)}"
 
-    async def _fast_ipmi_check(self, dut: "DUT") -> Tuple[bool, str]:
+    async def _fast_ipmi_check(
+        self,
+        dut: "DUT",
+        collectors_by_group: Optional[
+            Dict[str, List[Tuple[str, Dict[str, Any]]]]
+        ] = None,
+    ) -> Tuple[bool, str]:
         """
         Fast IPMI check using ping first, then actual interface test.
 
         Args:
             dut: DUT instance.
+            collectors_by_group: Mapping of collector group -> collectors with metadata.
 
         Returns:
             Tuple of (success, message).
@@ -3874,25 +4905,44 @@ class DUTManager:
 
         # Then test actual IPMI interface using DUT method
         try:
+            timeout = (
+                30.0
+                if dut.credentials.ssh_proxy_host or dut.credentials.use_port_forwarding
+                else 5.0
+            )
             # Use the DUT's ipmi method with timeout
             success, response = await asyncio.wait_for(
-                dut.test_ipmi_connection(), timeout=5.0
+                dut.test_ipmi_connection(), timeout=timeout
             )
             if success:
                 return True, "IPMI interface accessible"
             else:
                 return False, f"IPMI interface failed: {response}"
         except asyncio.TimeoutError:
-            return False, "IPMI interface timeout (5s)"
+            # Check if any IPMI collectors are applicable for this DUT's baseboard
+            should_skip, skip_message = self._check_service_collector_applicability(
+                dut, "ipmi", collectors_by_group
+            )
+            if should_skip:
+                return False, skip_message
+
+            return False, f"IPMI interface timeout ({timeout}s)"
         except Exception as e:
             return False, f"IPMI interface error: {str(e)}"
 
-    async def _fast_ssh_check(self, dut: "DUT") -> Tuple[bool, str]:
+    async def _fast_ssh_check(
+        self,
+        dut: "DUT",
+        collectors_by_group: Optional[
+            Dict[str, List[Tuple[str, Dict[str, Any]]]]
+        ] = None,
+    ) -> Tuple[bool, str]:
         """
         Fast SSH check using ping first, then actual interface test.
 
         Args:
             dut: DUT instance.
+            collectors_by_group: Mapping of collector group -> collectors with metadata.
 
         Returns:
             Tuple of (success, message).
@@ -3921,6 +4971,13 @@ class DUTManager:
                 else:
                     return False, f"SSH interface failed via proxy: {response}"
             except asyncio.TimeoutError:
+                # Check if any SSH collectors are applicable for this DUT's baseboard
+                should_skip, skip_message = self._check_service_collector_applicability(
+                    dut, "ssh", collectors_by_group
+                )
+                if should_skip:
+                    return False, skip_message
+
                 return False, "SSH interface timeout (30s)"
             except Exception as e:
                 return False, f"SSH interface error: {str(e)}"
@@ -3944,22 +5001,44 @@ class DUTManager:
                 else:
                     return False, f"SSH interface failed: {response}"
             except asyncio.TimeoutError:
+                # Check if any SSH collectors are applicable for this DUT's baseboard
+                should_skip, skip_message = self._check_service_collector_applicability(
+                    dut, "ssh", collectors_by_group
+                )
+                if should_skip:
+                    return False, skip_message
+
                 return False, "SSH interface timeout (30s)"
             except Exception as e:
                 return False, f"SSH interface error: {str(e)}"
 
-    async def _fast_host_check(self, dut: "DUT") -> Tuple[bool, str]:
+    async def _fast_host_check(
+        self,
+        dut: "DUT",
+        collectors_by_group: Optional[
+            Dict[str, List[Tuple[str, Dict[str, Any]]]]
+        ] = None,
+    ) -> Tuple[bool, str]:
         """
         Fast host check using ping first, then actual interface test.
 
         Args:
             dut: DUT instance.
+            collectors_by_group: Mapping of collector group -> collectors with metadata.
 
         Returns:
             Tuple of (success, message).
         """
+        # Check if local mode is enabled
+        is_local_mode = dut.config and dut.config.get("local", False)
+
         if not dut.credentials.host_ip:
-            return True, "Local host execution"
+            if is_local_mode:
+                # Local mode explicitly requested - allow execution without host IP
+                return True, "Local host execution (--local flag)"
+            else:
+                # No host IP and no local flag - this is a configuration error
+                return False, "No host IP configured and --local flag not set"
 
         # Check if SSH proxy is configured
         if dut.credentials.ssh_proxy_host:
@@ -3982,6 +5061,13 @@ class DUTManager:
                 else:
                     return False, f"Host interface failed via proxy: {response}"
             except asyncio.TimeoutError:
+                # Check if any Host collectors are applicable for this DUT's baseboard
+                should_skip, skip_message = self._check_service_collector_applicability(
+                    dut, "host", collectors_by_group
+                )
+                if should_skip:
+                    return False, skip_message
+
                 return False, "Host interface timeout (30s)"
             except Exception as e:
                 return False, f"Host interface error: {str(e)}"
@@ -4005,6 +5091,13 @@ class DUTManager:
                 else:
                     return False, f"Host interface failed: {response}"
             except asyncio.TimeoutError:
+                # Check if any Host collectors are applicable for this DUT's baseboard
+                should_skip, skip_message = self._check_service_collector_applicability(
+                    dut, "host", collectors_by_group
+                )
+                if should_skip:
+                    return False, skip_message
+
                 return False, "Host interface timeout (30s)"
             except Exception as e:
                 return False, f"Host interface error: {str(e)}"
@@ -4078,12 +5171,26 @@ class DUTManager:
         # Use credentials from connection info (HMC or BMC)
         username = connection_info["username"]
         password = connection_info["password"]
+        request_auth = (
+            aiohttp.BasicAuth(username, password)
+            if connection_info.get("auth_enabled", True) and username and password
+            else None
+        )
 
         # Retry configuration with exponential backoff
         max_retries = retry_count
         base_delay = 1  # Start with 1 second
         max_delay = 30  # Cap at 30 seconds
-        retryable_status_codes = {500, 502, 503, 504, 520, 521, 522, 523, 524}
+
+        # HTTP 500 (Internal Server Error) typically indicates a persistent server-side issue
+        # that won't be resolved by retrying, so we use fewer retries for it.
+        # Other 5xx errors (502, 503, 504) are more likely to be transient and benefit from retries.
+        retryable_status_codes = {502, 503, 504, 520, 521, 522, 523, 524}
+        limited_retry_status_codes = {500}  # Only 1 retry for HTTP 500
+        max_retries_for_500 = 1  # Reduced retries for persistent server errors
+
+        # Track consecutive 500 errors for this request
+        consecutive_500_count = 0
 
         # Log request start
         await dut._log_runtime(
@@ -4122,7 +5229,7 @@ class DUTManager:
                                 full_url,
                                 auth=session_obj["auth"],
                                 json=body if body else None,
-                                ssl=False,
+                                ssl=dut.redfish_ssl,
                                 timeout=aiohttp.ClientTimeout(total=timeout),
                             ) as response:
                                 result = await self._handle_redfish_response(
@@ -4135,7 +5242,14 @@ class DUTManager:
                                     current_delay,
                                     retryable_status_codes,
                                     get_raw_content,
+                                    limited_retry_status_codes,
+                                    max_retries_for_500,
                                 )
+                                # Check if we should retry
+                                success, data, _, _ = result
+                                if not success and data == "retry":
+                                    # No need to release - shared session
+                                    continue  # Retry in the loop
                                 # No need to release - shared session
                                 return result
                         except Exception as e:
@@ -4180,10 +5294,10 @@ class DUTManager:
                         full_url,
                         auth=dut.redfish_auth,
                         json=body if body else None,
-                        ssl=False,
+                        ssl=dut.redfish_ssl,
                         timeout=aiohttp.ClientTimeout(total=timeout),
                     ) as response:
-                        return await self._handle_redfish_response(
+                        result = await self._handle_redfish_response(
                             dut,
                             response,
                             normalized_url,
@@ -4193,19 +5307,26 @@ class DUTManager:
                             current_delay,
                             retryable_status_codes,
                             get_raw_content,
+                            limited_retry_status_codes,
+                            max_retries_for_500,
                         )
+                        # Check if we should retry
+                        success, data, _, _ = result
+                        if not success and data == "retry":
+                            continue  # Retry in the loop
+                        return result
                 else:
                     # Create temporary session
                     async with aiohttp.ClientSession() as session:
                         async with session.request(
                             method,
                             full_url,
-                            auth=aiohttp.BasicAuth(username, password),
+                            auth=request_auth,
                             json=body if body else None,
-                            ssl=False,
+                            ssl=dut.redfish_ssl,
                             timeout=aiohttp.ClientTimeout(total=timeout),
                         ) as response:
-                            return await self._handle_redfish_response(
+                            result = await self._handle_redfish_response(
                                 dut,
                                 response,
                                 normalized_url,
@@ -4215,7 +5336,14 @@ class DUTManager:
                                 current_delay,
                                 retryable_status_codes,
                                 get_raw_content,
+                                limited_retry_status_codes,
+                                max_retries_for_500,
                             )
+                            # Check if we should retry
+                            success, data, _, _ = result
+                            if not success and data == "retry":
+                                continue  # Retry in the loop
+                            return result
 
             except (
                 asyncio.TimeoutError,
@@ -4274,6 +5402,8 @@ class DUTManager:
         current_delay: float,
         retryable_status_codes: set,
         get_raw_content: bool = False,
+        limited_retry_status_codes: set = None,
+        max_retries_for_limited: int = 1,
     ) -> Tuple[bool, Union[str, dict, bytes], dict, dict]:
         """
         Handle Redfish response with caching and retry logic.
@@ -4286,12 +5416,16 @@ class DUTManager:
             attempt: Current attempt number.
             max_retries: Maximum retry attempts.
             current_delay: Current retry delay.
-            retryable_status_codes: Set of status codes that trigger retries.
+            retryable_status_codes: Set of status codes that trigger full retries.
             get_raw_content: Whether to return raw binary content.
+            limited_retry_status_codes: Set of status codes that trigger limited retries (e.g., HTTP 500).
+            max_retries_for_limited: Maximum retries for limited retry status codes.
 
         Returns:
             Tuple of (success, response, metadata, headers).
         """
+        if limited_retry_status_codes is None:
+            limited_retry_status_codes = {500}
         # Log response status
         await dut._log_runtime(
             "DEBUG",
@@ -4302,7 +5436,12 @@ class DUTManager:
             # Success - parse response
             if get_raw_content:
                 # For binary data, return raw bytes
+                MAX_RESPONSE_SIZE = 500 * 1024 * 1024  # 500 MB
                 content = await response.read()
+                if len(content) > MAX_RESPONSE_SIZE:
+                    raise ValueError(
+                        f"Response exceeds {MAX_RESPONSE_SIZE // (1024 * 1024)}MB limit"
+                    )
                 await dut._log_runtime(
                     "DEBUG",
                     f"Successfully downloaded {len(content)} bytes for {method} {uri}",
@@ -4331,18 +5470,50 @@ class DUTManager:
                     await dut._log_runtime("DEBUG", f"Cached response for {uri}")
 
                 return True, result, {}, {}
-        elif response.status in retryable_status_codes:
+        elif (
+            response.status in retryable_status_codes
+            or response.status in limited_retry_status_codes
+        ):
             # Server error - retry if we have attempts left
             response_text = await response.text()
+
+            # Try to parse as JSON even for error responses
+            # Many BMCs (including NVIDIA) return valid Redfish JSON with HTTP 500
+            parsed_response = response_text
+            try:
+                parsed_response = json.loads(response_text)
+                await dut._log_runtime(
+                    "DEBUG",
+                    f"Parsed JSON from HTTP {response.status} response for {method} {uri}",
+                )
+            except json.JSONDecodeError:
+                await dut._log_runtime(
+                    "DEBUG",
+                    f"Could not parse HTTP {response.status} response as JSON for {method} {uri}",
+                )
+
+            compact_text = " ".join(response_text.split())[:200]
             await dut._log_runtime(
                 "WARNING",
-                f"Server error HTTP {response.status} for {method} {uri}: {response_text[:200]}...",
+                f"Server error HTTP {response.status} for {method} {uri}: {compact_text}",
             )
 
-            if attempt < max_retries:
+            # Determine effective max retries based on status code
+            # HTTP 500 (Internal Server Error) typically indicates a persistent issue,
+            # so we use fewer retries to avoid wasting time on endpoints that won't recover
+            effective_max_retries = max_retries
+            if response.status in limited_retry_status_codes:
+                effective_max_retries = min(max_retries, max_retries_for_limited)
+                if attempt == 0:
+                    await dut._log_runtime(
+                        "INFO",
+                        f"HTTP {response.status} uses limited retries ({effective_max_retries}) - persistent server errors typically don't resolve with more retries",
+                    )
+
+            if attempt < effective_max_retries:
                 await dut._log_runtime(
                     "INFO",
-                    f"Retrying due to server error HTTP {response.status} (attempt {attempt + 1}/{max_retries})",
+                    f"Retrying due to server error HTTP {response.status} (attempt {attempt + 1}/{effective_max_retries + 1})",
                 )
                 await asyncio.sleep(current_delay)
                 return (
@@ -4356,33 +5527,38 @@ class DUTManager:
                     },
                     {
                         "attempt": attempt + 1,
-                        "max_retries": max_retries,
+                        "max_retries": effective_max_retries,
                         "current_delay": current_delay,
                     },
                 )  # Signal to retry with detailed error info
             else:
                 await dut._log_runtime(
-                    "ERROR",
-                    f"Max retries exceeded for server error HTTP {response.status} on {method} {uri}",
+                    "WARNING",
+                    f"Max retries ({effective_max_retries}) exceeded for server error HTTP {response.status} on {method} {uri}, returning parsed response if available",
                 )
+                # Return the parsed response (JSON dict or string) even though retries exceeded
+                # This allows valid Redfish data to be used even with HTTP 500 errors
                 return (
                     False,
-                    f"HTTP {response.status}: {response_text}",
+                    parsed_response,
                     {
                         "http_status": response.status,
                         "error_message": response_text,
                         "uri": uri,
                         "method": method,
                         "max_retries_exceeded": True,
+                        "limited_retries_used": response.status
+                        in limited_retry_status_codes,
                     },
-                    {"attempt": attempt + 1, "max_retries": max_retries},
+                    {"attempt": attempt + 1, "max_retries": effective_max_retries},
                 )
         else:
             # Client error (4xx) - don't retry
             response_text = await response.text()
+            compact_text = " ".join(response_text.split())[:200]
             await dut._log_runtime(
                 "ERROR",
-                f"Client error HTTP {response.status} for {method} {uri}: {response_text[:200]}...",
+                f"Client error HTTP {response.status} for {method} {uri}: {compact_text}",
             )
             return (
                 False,
@@ -4423,7 +5599,7 @@ class DUTManager:
         self, dut_id: str, command: str, timeout: int = 180
     ) -> Tuple[int, str, str]:
         """
-        Execute IPMI command on a DUT with retry logic
+        Execute IPMI command on a DUT with legacy nvdebug retry logic
 
         Args:
             dut_id: DUT identifier
@@ -4431,7 +5607,7 @@ class DUTManager:
             timeout: Command timeout in seconds
 
         Returns:
-            Tuple of (exit_code, stdout, stderr)
+            Tuple of (exit_code, stdout, stderr) - matching legacy nvdebug pattern
 
         Notes:
             - Automatically removes 'ipmitool' prefix if present
@@ -4492,7 +5668,7 @@ class DUTManager:
                     await self.logger.log_runtime(
                         "WARNING",
                         "DUTManager",
-                        f"Warning IPMI.7: Verbose command succeeded where original failed",
+                        "Warning IPMI.7: Verbose command succeeded where original failed",
                     )
                     return verbose_exit_code, verbose_stdout, verbose_stderr
 
@@ -4650,13 +5826,10 @@ class DUTManager:
 
             # Wait for completion with timeout
             try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(), timeout=timeout
+                stdout, stderr = await _communicate_subprocess(
+                    process, timeout=timeout
                 )
             except asyncio.TimeoutError:
-                # Kill the process if it times out
-                process.kill()
-                await process.wait()  # Wait for the process to be cleaned up
                 await self.logger.log_runtime(
                     "ERROR",
                     "DUTManager",
@@ -4672,7 +5845,7 @@ class DUTManager:
             stdout_text = self._process_command_output(stdout)
             stderr_text = self._process_command_output(stderr)
 
-            # Always capture both stdout and stderr
+            # Always capture both stdout and stderr (matching legacy nvdebug pattern)
             return process.returncode, stdout_text, stderr_text
 
         except Exception as e:
@@ -4706,7 +5879,7 @@ class DUTManager:
                 try:
                     # Try latin1 as fallback - it can handle all byte values
                     return output.decode("latin1", errors="replace")
-                except Exception as e:
+                except Exception:
                     # Last resort - hex representation
                     return f"hex:{output.hex()}"
 
@@ -4730,7 +5903,7 @@ class DUTManager:
     ) -> str:
         """
         Format error messages for IPMI command execution failures consistently.
-        Standard implementation.
+        Matches legacy nvdebug implementation.
 
         Args:
             command: The command that was executed
@@ -4748,7 +5921,7 @@ class DUTManager:
             stderr_msg = stderr if stderr else "<empty>"
             cmd_type = f"{command_type}" if command_type else ""
 
-            # Format the error message
+            # Format the error message similar to legacy nvdebug
             error_msg = f"Command failed: {command}\n"
             error_msg += f"Exit code: {exit_code}\n"
             if cmd_type:
@@ -4764,166 +5937,6 @@ class DUTManager:
 
         except Exception as e:
             return f"Error formatting command error: {str(e)}"
-
-    async def _execute_ssh_command_paramiko(
-        self,
-        host: str,
-        port: int,
-        username: str,
-        password: Optional[str] = None,
-        command: str = "",
-        timeout: int = 180,
-        ssh_key_path: Optional[str] = None,
-        passwordless: bool = False,
-        max_retries: int = 3,
-        proxy_client: Optional[paramiko.SSHClient] = None,
-        use_sudo: bool = False,
-        use_shell: bool = True,
-    ) -> Tuple[int, str, str]:
-        """
-        Execute SSH command with advanced authentication support
-
-        Args:
-            host: Target host IP/hostname
-            port: SSH port
-            username: SSH username
-            password: SSH password (optional if using key auth)
-            command: Command to execute (empty for connection test)
-            timeout: Connection/command timeout
-            ssh_key_path: Path to SSH private key file
-            passwordless: Enable passwordless SSH
-            max_retries: Maximum retry attempts
-            proxy_client: SSH proxy client for jumpbox connections
-            use_sudo: Enable automatic sudo password injection
-            use_shell: Use shell when running commands
-
-        Returns:
-            Tuple of (exit_code, stdout, stderr)
-        """
-        last_error = ""
-
-        for attempt in range(max_retries):
-            try:
-                client = paramiko.SSHClient()
-                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-                # Prepare connection parameters
-                connect_kwargs = {
-                    "hostname": host,
-                    "port": port,
-                    "username": username,
-                    "timeout": timeout,
-                }
-
-                # Add proxy if provided (for SSH jumpbox)
-                if proxy_client:
-                    connect_kwargs["sock"] = proxy_client.get_transport().open_channel(
-                        "direct-tcpip", (host, port), ("", 0)
-                    )
-
-                # Handle different authentication methods
-                if ssh_key_path:
-                    # SSH key authentication (with optional password for encrypted keys)
-                    try:
-                        key = paramiko.RSAKey.from_private_key_file(
-                            ssh_key_path, password=password
-                        )
-                        connect_kwargs["pkey"] = key
-                    except paramiko.PasswordRequiredException:
-                        if password:
-                            key = paramiko.RSAKey.from_private_key_file(
-                                ssh_key_path, password=password
-                            )
-                            connect_kwargs["pkey"] = key
-                        else:
-                            return (
-                                -1,
-                                "",
-                                f"SSH key {ssh_key_path} requires password but none provided",
-                            )
-                    except Exception as e:
-                        # Try other key types
-                        try:
-                            key = paramiko.Ed25519Key.from_private_key_file(
-                                ssh_key_path, password=password
-                            )
-                            connect_kwargs["pkey"] = key
-                        except:
-                            try:
-                                key = paramiko.ECDSAKey.from_private_key_file(
-                                    ssh_key_path, password=password
-                                )
-                                connect_kwargs["pkey"] = key
-                            except:
-                                return (
-                                    -1,
-                                    "",
-                                    f"Failed to load SSH key {ssh_key_path}: {str(e)}",
-                                )
-
-                elif passwordless:
-                    # Passwordless SSH (no password, no key - relies on SSH agent or host-based auth)
-                    connect_kwargs["password"] = None
-                    connect_kwargs["allow_agent"] = True
-                    connect_kwargs["look_for_keys"] = True
-                else:
-                    # Password authentication
-                    if not password:
-                        return (
-                            -1,
-                            "",
-                            "Password required for SSH authentication",
-                        )
-                    connect_kwargs["password"] = password
-
-                # Attempt connection
-                client.connect(**connect_kwargs)
-
-                # If no command specified, this is just a connection test
-                if not command:
-                    client.close()
-                    return 0, "SSH connection successful", ""
-
-                # Execute command
-                stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
-
-                # Handle sudo commands if requested
-                if use_sudo and "sudo" in command and not passwordless and password:
-                    # Provide the sudo password
-                    stdin.write(password + "\n")
-                    stdin.flush()
-
-                exit_code = stdout.channel.recv_exit_status()
-
-                output = self._process_command_output(stdout.read())
-                error = self._process_command_output(stderr.read())
-
-                client.close()
-
-                # Always capture both stdout and stderr
-                return exit_code, output, error
-
-            except Exception as e:
-                last_error = f"SSH attempt {attempt + 1}/{max_retries} failed: {str(e)}"
-                await self.logger.log_runtime(
-                    "WARNING",
-                    "DUTManager",
-                    f"Paramiko connection attempt {attempt + 1}/{max_retries} to {host}:{port} failed: {str(e)}",
-                )
-                if attempt < max_retries - 1:
-                    # Wait before retry (exponential backoff)
-                    wait_time = 2**attempt
-                    await self.logger.log_runtime(
-                        "INFO",
-                        "DUTManager",
-                        f"Waiting {wait_time}s before retry {attempt + 2}/{max_retries}",
-                    )
-                    await asyncio.sleep(wait_time)
-                    continue
-                else:
-                    return -1, "", last_error
-
-        return -1, "", f"SSH failed after {max_retries} attempts: {last_error}"
 
     async def _execute_ssh_command_async(
         self,
@@ -4958,54 +5971,23 @@ class DUTManager:
             use_shell: Use shell when running commands
 
         Returns:
-            Tuple of (exit_code, stdout, stderr)
+            Tuple of (exit_code, stdout, stderr) - matching legacy nvdebug pattern
         """
         last_error = ""
 
         for attempt in range(max_retries):
             try:
-                # Prepare connection parameters
-                connect_kwargs = {
-                    "host": host,
-                    "port": port,
-                    "username": username,
-                    "connect_timeout": timeout,
-                    "keepalive_interval": None,  # Disable keepalive for faster connections
-                }
-
-                # Add proxy if provided (for SSH jumpbox)
-                if proxy_client:
-                    connect_kwargs["sock"] = proxy_client.get_extra_info("socket")
-
-                # Handle different authentication methods
-                if ssh_key_path:
-                    # SSH key authentication
-                    try:
-                        # asyncssh supports multiple key types automatically
-                        connect_kwargs["client_keys"] = [ssh_key_path]
-                        if password:
-                            connect_kwargs["passphrase"] = password
-                    except Exception as e:
-                        return (
-                            -1,
-                            "",
-                            f"Failed to load SSH key {ssh_key_path}: {str(e)}",
-                        )
-
-                elif passwordless:
-                    # Passwordless SSH (relies on SSH agent or host-based auth)
-                    connect_kwargs["known_hosts"] = None  # Accept any host key
-                else:
-                    # Password authentication
-                    if not password:
-                        return (
-                            False,
-                            "Password required for SSH authentication",
-                        )
-                    connect_kwargs["password"] = password
-
-                # Always accept unknown host keys (similar to paramiko.AutoAddPolicy())
-                connect_kwargs["known_hosts"] = None
+                connect_kwargs = self._build_ssh_connect_kwargs(
+                    host=host,
+                    port=port,
+                    username=username,
+                    password=password,
+                    ssh_key_path=ssh_key_path,
+                    passwordless=passwordless,
+                    connect_timeout=timeout,
+                    keepalive_interval=None,
+                    proxy_client=proxy_client,
+                )
 
                 # Attempt connection with explicit cleanup
                 conn = None
@@ -5026,7 +6008,7 @@ class DUTManager:
                             and password
                         ):
                             # For sudo commands, we need to provide the password
-                            # asyncssh doesn't have direct stdin support like paramiko
+                            # asyncssh doesn't have direct stdin support
                             # So we'll use a different approach - modify the command to use sudo -S
                             if "sudo -S" not in command:
                                 command = command.replace("sudo ", "sudo -S ")
@@ -5041,7 +6023,7 @@ class DUTManager:
                                 conn.run(command), timeout=timeout
                             )
 
-                        # Always capture both stdout and stderr
+                        # Always capture both stdout and stderr (matching legacy nvdebug pattern)
                         stdout = result.stdout or ""
                         stderr = result.stderr or ""
 
@@ -5058,9 +6040,33 @@ class DUTManager:
                     # Ensure connection is properly closed
                     if conn:
                         conn.close()
-                        await conn.wait_closed()
+                        try:
+                            await asyncio.wait_for(_wait_closed(conn), timeout=5)
+                        except asyncio.TimeoutError:
+                            await self.logger.log_runtime(
+                                "WARNING",
+                                "DUTManager",
+                                (
+                                    "Timed out waiting for SSH connection close "
+                                    f"after command timeout on {host}:{port}"
+                                ),
+                            )
+                            if hasattr(conn, "abort"):
+                                conn.abort()
+                        except Exception as close_error:
+                            await self.logger.log_runtime(
+                                "WARNING",
+                                "DUTManager",
+                                (
+                                    "Error while closing SSH connection "
+                                    f"to {host}:{port}: {close_error}"
+                                ),
+                            )
 
             except Exception as e:
+                if isinstance(e, ValueError):
+                    return -1, "", str(e)
+
                 last_error = f"SSH attempt {attempt + 1}/{max_retries} failed: {str(e)}"
                 await self.logger.log_runtime(
                     "WARNING",
@@ -5098,7 +6104,7 @@ class DUTManager:
         use_shell: bool = True,
     ) -> Tuple[int, str, str]:
         """
-        Execute SSH command using the configured backend (asyncssh or paramiko)
+        Execute SSH command using asyncssh
 
         Args:
             host: Target host IP/hostname
@@ -5115,93 +6121,34 @@ class DUTManager:
             use_shell: Use shell when running commands
 
         Returns:
-            Tuple of (exit_code, stdout, stderr)
+            Tuple of (exit_code, stdout, stderr) - matching legacy nvdebug pattern
         """
-        # Use asyncssh by default, fallback to paramiko if configured
-        if self.ssh_backend == "asyncssh":
-            try:
-                return await self._execute_ssh_command_async(
-                    host,
-                    port,
-                    username,
-                    password,
-                    command,
-                    timeout,
-                    ssh_key_path,
-                    passwordless,
-                    max_retries,
-                    proxy_client,
-                    use_sudo,
-                    use_shell,
-                )
-            except Exception as e:
-                # If fallback is enabled and this is a connection error, try paramiko
-                if self.ssh_fallback_enabled:
-                    await self.logger.log_runtime(
-                        "WARNING",
-                        "DUTManager",
-                        f"AsyncSSH failed: {e}, falling back to paramiko",
-                    )
-                    return await self._execute_ssh_command_paramiko(
-                        host,
-                        port,
-                        username,
-                        password,
-                        command,
-                        timeout,
-                        ssh_key_path,
-                        passwordless,
-                        max_retries,
-                        proxy_client,
-                        use_sudo,
-                        use_shell,
-                    )
-                else:
-                    raise
-        else:
-            # Use paramiko directly
-            return await self._execute_ssh_command_paramiko(
-                host,
-                port,
-                username,
-                password,
-                command,
-                timeout,
-                ssh_key_path,
-                passwordless,
-                max_retries,
-                proxy_client,
-                use_sudo,
-                use_shell,
-            )
+        return await self._execute_ssh_command_async(
+            host,
+            port,
+            username,
+            password,
+            command,
+            timeout,
+            ssh_key_path,
+            passwordless,
+            max_retries,
+            proxy_client,
+            use_sudo,
+            use_shell,
+        )
 
-    async def create_proxy_connection(self, dut_id: str):
+    async def create_proxy_connection(self, dut_id: str) -> Optional[asyncssh.SSHClientConnection]:
         """
-        Create SSH proxy connection using the configured backend
+        Create SSH proxy connection using asyncssh
 
         Args:
             dut_id: DUT identifier
 
         Returns:
-            SSH proxy connection object (type depends on backend)
+            SSH proxy connection object
         """
-        if self.ssh_backend == "asyncssh":
-            try:
-                return await self._create_proxy_connection_async(dut_id)
-            except Exception as e:
-                # If fallback is enabled, try paramiko
-                if self.ssh_fallback_enabled:
-                    await self.logger.log_runtime(
-                        "WARNING",
-                        "DUTManager",
-                        f"AsyncSSH proxy failed: {e}, falling back to paramiko",
-                    )
-                    return await self._create_proxy_connection(dut_id)
-                else:
-                    raise
-        else:
-            # Use paramiko directly
-            return await self._create_proxy_connection(dut_id)
+        return await self._create_proxy_connection_async(dut_id)
 
     async def _create_proxy_connection_async(
         self, dut_id: str
@@ -5222,38 +6169,16 @@ class DUTManager:
             return None
 
         try:
-            # Prepare connection parameters
-            connect_kwargs = {
-                "host": dut.credentials.ssh_proxy_host,
-                "port": dut.credentials.ssh_proxy_port,
-                "username": dut.credentials.ssh_proxy_username,
-                "connect_timeout": 30,
-                "keepalive_interval": None,  # Disable keepalive for faster connections
-            }
-
-            # Handle authentication
-            if dut.credentials.ssh_proxy_key_path:
-                try:
-                    connect_kwargs["client_keys"] = [dut.credentials.ssh_proxy_key_path]
-                    if dut.credentials.ssh_proxy_password:
-                        connect_kwargs["passphrase"] = (
-                            dut.credentials.ssh_proxy_password
-                        )
-                except Exception as e:
-                    await self.logger.write_to_dut_runtime_log(
-                        dut_id,
-                        "ERROR",
-                        "DUTManager",
-                        f"Failed to load proxy SSH key: {e}",
-                    )
-                    return None
-            elif dut.credentials.ssh_proxy_passwordless:
-                connect_kwargs["known_hosts"] = None  # Accept any host key
-            else:
-                connect_kwargs["password"] = dut.credentials.ssh_proxy_password
-
-            # Always accept unknown host keys (similar to paramiko.AutoAddPolicy())
-            connect_kwargs["known_hosts"] = None
+            connect_kwargs = self._build_ssh_connect_kwargs(
+                host=dut.credentials.ssh_proxy_host,
+                port=dut.credentials.ssh_proxy_port,
+                username=dut.credentials.ssh_proxy_username,
+                password=dut.credentials.ssh_proxy_password,
+                ssh_key_path=dut.credentials.ssh_proxy_key_path,
+                passwordless=dut.credentials.ssh_proxy_passwordless,
+                connect_timeout=30,
+                keepalive_interval=None,
+            )
 
             # Connect to proxy
             conn = await asyncssh.connect(**connect_kwargs)
@@ -5267,104 +6192,6 @@ class DUTManager:
                 f"Failed to create async proxy connection: {e}",
             )
             return None
-
-    async def _create_proxy_connection(
-        self, dut_id: str
-    ) -> Optional[paramiko.SSHClient]:
-        """
-        Create SSH connection to proxy for multi-hop access
-
-        Args:
-            dut_id: DUT identifier
-
-        Returns:
-            SSH client connected to proxy, or None if no proxy configured
-        """
-        dut = self.get_dut(dut_id)
-
-        # Check if proxy is configured
-        if not dut.credentials.ssh_proxy_host:
-            return None
-
-        try:
-            # Create proxy connection using the enhanced SSH method
-            success, _ = await self._execute_ssh_command(
-                host=dut.credentials.ssh_proxy_host,
-                port=dut.credentials.ssh_proxy_port,
-                username=dut.credentials.ssh_proxy_username,
-                password=dut.credentials.ssh_proxy_password,
-                command="",  # Just test connection
-                timeout=30,
-                ssh_key_path=dut.credentials.ssh_proxy_key_path,
-                passwordless=dut.credentials.ssh_proxy_passwordless,
-                max_retries=dut.credentials.ssh_proxy_max_retries,
-            )
-
-            if success:
-                # Create actual SSH client for jumpbox
-                client = paramiko.SSHClient()
-                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-                # Prepare connection parameters
-                connect_kwargs = {
-                    "hostname": dut.credentials.ssh_proxy_host,
-                    "port": dut.credentials.ssh_proxy_port,
-                    "username": dut.credentials.ssh_proxy_username,
-                    "timeout": 30,
-                }
-
-                # Handle authentication
-                if dut.credentials.ssh_proxy_key_path:
-                    try:
-                        key = paramiko.RSAKey.from_private_key_file(
-                            dut.credentials.ssh_proxy_key_path,
-                            password=dut.credentials.ssh_proxy_password,
-                        )
-                        connect_kwargs["pkey"] = key
-                    except Exception as e:
-                        # Try other key types
-                        try:
-                            key = paramiko.Ed25519Key.from_private_key_file(
-                                dut.credentials.ssh_proxy_key_path,
-                                password=dut.credentials.ssh_proxy_password,
-                            )
-                            connect_kwargs["pkey"] = key
-                        except:
-                            try:
-                                key = paramiko.ECDSAKey.from_private_key_file(
-                                    dut.credentials.ssh_proxy_key_path,
-                                    password=dut.credentials.ssh_proxy_password,
-                                )
-                                connect_kwargs["pkey"] = key
-                            except:
-                                await self.logger.write_to_dut_runtime_log(
-                                    dut_id,
-                                    "ERROR",
-                                    "DUTManager",
-                                    f"Failed to load proxy SSH key: {e}",
-                                )
-                                return None
-                elif dut.credentials.ssh_proxy_passwordless:
-                    connect_kwargs["password"] = None
-                    connect_kwargs["allow_agent"] = True
-                    connect_kwargs["look_for_keys"] = True
-                else:
-                    connect_kwargs["password"] = dut.credentials.ssh_proxy_password
-
-                # Connect to proxy
-                client.connect(**connect_kwargs)
-                return client
-
-        except Exception as e:
-            await self.logger.write_to_dut_runtime_log(
-                dut_id,
-                "ERROR",
-                "DUTManager",
-                f"Failed to create proxy connection: {e}",
-            )
-            return None
-
-        return None
 
     async def execute_bmc_command(
         self, dut_id: str, command: str, timeout: int = 180, hmc: bool = False
@@ -5382,13 +6209,6 @@ class DUTManager:
             Tuple of (return_code, stdout, stderr).
         """
         dut = self.get_dut(dut_id)
-
-        # Ensure BMC SSH connection is established
-        success, message = await self._ensure_connection(
-            dut_id, "ssh", "test_ssh_connection"
-        )
-        if not success:
-            return -1, "", message
 
         if hmc:
             # HMC execution
@@ -5411,6 +6231,13 @@ class DUTManager:
                 proxy_client=None,  # HMC doesn't use proxy
             )
         else:
+            # Ensure BMC SSH connection is established
+            success, message = await self._ensure_connection(
+                dut_id, "ssh", "test_ssh_connection"
+            )
+            if not success:
+                return -1, "", message
+
             # BMC execution
             username = dut.credentials.bmc_ssh_username or dut.credentials.bmc_username
             password = dut.credentials.bmc_ssh_password or dut.credentials.bmc_password
@@ -5510,18 +6337,21 @@ class DUTManager:
         if not success:
             return -1, "", message
 
-        # Follow legacy pattern: prepend sudo -S if use_sudo is True
+        local_execution = not dut.credentials.host_ip
+
         command_to_run = command
-        if use_sudo and not command.strip().startswith("sudo"):
-            command_to_run = f"sudo -S {command}"
+        if use_sudo:
+            command_to_run = _build_sudo_command(
+                command, local_execution=local_execution
+            )
             await self.logger.log_runtime(
                 "DEBUG",
                 "DUTManager",
-                f"Command after sudo prepend: {command_to_run}",
+                f"Command after sudo handling: {command_to_run}",
             )
 
         try:
-            if not dut.credentials.host_ip:
+            if local_execution:
                 # Local execution - use unified execute_bash_command
                 await self.logger.log_runtime(
                     "DEBUG", "DUTManager", "Using local execution path"
@@ -5530,18 +6360,14 @@ class DUTManager:
                 # Determine shell usage
                 use_shell = True if override_shell is None else override_shell
 
-                # For local execution, we can use the same password as SSH if available
-                # or a local sudo password if configured
                 sudo_password = None
                 if use_sudo:
-                    # In local mode, assume passwordless sudo access
                     if dut.config and dut.config.get("local", False):
                         await self.logger.log_runtime(
                             "DEBUG",
                             "DUTManager",
-                            "Local mode detected - assuming passwordless sudo access",
+                            "Local mode detected - using non-interactive local sudo behavior",
                         )
-                        # Don't require sudo password in local mode
                         sudo_password = None
                     else:
                         # Try to get sudo password from credentials
@@ -5574,10 +6400,12 @@ class DUTManager:
                 return result
             else:
                 # Remote execution via SSH
-                if (
-                    not dut.credentials.host_username
-                    or not dut.credentials.host_password
-                ):
+                has_host_auth = self._has_ssh_auth_method(
+                    dut.credentials.host_password,
+                    dut.credentials.host_ssh_key_path,
+                    dut.credentials.host_ssh_passwordless,
+                )
+                if not dut.credentials.host_username or not has_host_auth:
                     return -1, "", "Host SSH credentials not configured"
 
                 # Check if SSH proxy tunneling is active
@@ -5681,6 +6509,12 @@ class DUTManager:
                 "DUTManager",
                 f"NVOS command failed: {command}, exit_code: {exit_code}, stderr: {stderr}",
             )
+            error_output = stderr or stdout or ""
+            if exit_code == -1 and (
+                "timeout" in error_output.lower()
+                or "timed out" in error_output.lower()
+            ):
+                return False, error_output
             return False, None
 
     def is_hmc_present(self, dut_id: str) -> bool:
@@ -5767,187 +6601,76 @@ class DUTManager:
 
             while retry_count < max_retries:
                 try:
-                    if self.ssh_backend == "asyncssh":
-                        # Use asyncssh for file transfer
-                        connect_kwargs = {
-                            "host": dut.credentials.bmc_ip,
-                            "port": dut.credentials.bmc_ssh_port,
-                            "username": username,
-                            "connect_timeout": 30,
-                            "known_hosts": None,
-                        }
+                    connect_kwargs = self._build_ssh_connect_kwargs(
+                        host=dut.credentials.bmc_ip,
+                        port=dut.credentials.bmc_ssh_port,
+                        username=username,
+                        password=password,
+                        ssh_key_path=dut.credentials.bmc_ssh_key_path,
+                        passwordless=dut.credentials.bmc_ssh_passwordless,
+                        connect_timeout=30,
+                    )
 
-                        if password:
-                            connect_kwargs["password"] = password
-                        elif dut.credentials.bmc_ssh_key_path:
-                            connect_kwargs["client_keys"] = [
-                                dut.credentials.bmc_ssh_key_path
-                            ]
+                    conn = await asyncssh.connect(**connect_kwargs)
 
-                        conn = await asyncssh.connect(**connect_kwargs)
-
-                        # Try SFTP first
-                        try:
-                            async with conn.start_sftp_client() as sftp:
-                                file_name = os.path.basename(source)
-                                remote_path = f"{destination_directory}/{file_name}"
-
-                                if copy_to_destination:
-                                    # Copy local file to remote
-                                    await sftp.put(source, remote_path)
-                                    transfer_method = "SFTP"
-                                    await self.logger.log_runtime(
-                                        "INFO",
-                                        "DUTManager",
-                                        f"Transferred {source} to {remote_path} via SFTP",
-                                    )
-                                else:
-                                    # Copy remote file to local
-                                    await sftp.get(remote_path, source)
-                                    transfer_method = "SFTP"
-                                    await self.logger.log_runtime(
-                                        "INFO",
-                                        "DUTManager",
-                                        f"Transferred {remote_path} to {source} via SFTP",
-                                    )
-                            conn.close()
-                            await conn.wait_closed()
-                        except Exception as sftp_ex:
-                            # SFTP failed - try SCP as fallback
-                            await self.logger.log_runtime(
-                                "DEBUG",
-                                "DUTManager",
-                                f"SFTP failed ({sftp_ex}), trying SCP fallback",
-                            )
-
+                    # Try SFTP first
+                    try:
+                        async with conn.start_sftp_client() as sftp:
                             file_name = os.path.basename(source)
                             remote_path = f"{destination_directory}/{file_name}"
 
                             if copy_to_destination:
-                                # Upload using SCP
-                                await asyncssh.scp(source, (conn, remote_path))
-                                transfer_method = "SCP"
+                                # Copy local file to remote
+                                await sftp.put(source, remote_path)
+                                transfer_method = "SFTP"
                                 await self.logger.log_runtime(
                                     "INFO",
                                     "DUTManager",
-                                    f"Transferred {source} to {remote_path} via SCP",
+                                    f"Transferred {source} to {remote_path} via SFTP",
                                 )
                             else:
-                                # Download using SCP
-                                await asyncssh.scp((conn, remote_path), source)
-                                transfer_method = "SCP"
+                                # Copy remote file to local
+                                await sftp.get(remote_path, source)
+                                transfer_method = "SFTP"
                                 await self.logger.log_runtime(
                                     "INFO",
                                     "DUTManager",
-                                    f"Transferred {remote_path} to {source} via SCP",
+                                    f"Transferred {remote_path} to {source} via SFTP",
                                 )
+                        conn.close()
+                        await conn.wait_closed()
+                    except Exception as sftp_ex:
+                        # SFTP failed - try SCP as fallback
+                        await self.logger.log_runtime(
+                            "DEBUG",
+                            "DUTManager",
+                            f"SFTP failed ({sftp_ex}), trying SCP fallback",
+                        )
 
-                            conn.close()
-                            await conn.wait_closed()
-                    else:
-                        # Use paramiko for file transfer
-                        client = paramiko.SSHClient()
-                        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                        file_name = os.path.basename(source)
+                        remote_path = f"{destination_directory}/{file_name}"
 
-                        connect_kwargs = {
-                            "hostname": dut.credentials.bmc_ip,
-                            "port": dut.credentials.bmc_ssh_port,
-                            "username": username,
-                            "timeout": 30,
-                        }
-
-                        if password:
-                            connect_kwargs["password"] = password
-                        elif dut.credentials.bmc_ssh_key_path:
-                            key = paramiko.RSAKey.from_private_key_file(
-                                dut.credentials.bmc_ssh_key_path
-                            )
-                            connect_kwargs["pkey"] = key
-
-                        client.connect(**connect_kwargs)
-
-                        # Try SFTP first
-                        try:
-                            with client.open_sftp() as sftp:
-                                file_name = os.path.basename(source)
-                                remote_path = f"{destination_directory}/{file_name}"
-
-                                if copy_to_destination:
-                                    # Copy local file to remote
-                                    sftp.put(source, remote_path)
-                                    transfer_method = "SFTP"
-                                    await self.logger.log_runtime(
-                                        "INFO",
-                                        "DUTManager",
-                                        f"Transferred {source} to {remote_path} via SFTP",
-                                    )
-                                else:
-                                    # Copy remote file to local
-                                    sftp.get(remote_path, source)
-                                    transfer_method = "SFTP"
-                                    await self.logger.log_runtime(
-                                        "INFO",
-                                        "DUTManager",
-                                        f"Transferred {remote_path} to {source} via SFTP",
-                                    )
-                            client.close()
-                        except Exception as sftp_ex:
-                            # SFTP failed - try SCP as fallback using paramiko
+                        if copy_to_destination:
+                            # Upload using SCP
+                            await asyncssh.scp(source, (conn, remote_path))
+                            transfer_method = "SCP"
                             await self.logger.log_runtime(
-                                "DEBUG",
+                                "INFO",
                                 "DUTManager",
-                                f"SFTP failed ({sftp_ex}), trying SCP fallback",
+                                f"Transferred {source} to {remote_path} via SCP",
+                            )
+                        else:
+                            # Download using SCP
+                            await asyncssh.scp((conn, remote_path), source)
+                            transfer_method = "SCP"
+                            await self.logger.log_runtime(
+                                "INFO",
+                                "DUTManager",
+                                f"Transferred {remote_path} to {source} via SCP",
                             )
 
-                            scp_attempted = False
-                            try:
-                                try:
-                                    from scp import SCPClient
-
-                                    scp_available = True
-                                except ImportError:
-                                    scp_available = False
-                                    await self.logger.log_runtime(
-                                        "DEBUG",
-                                        "DUTManager",
-                                        "SCP module not installed, skipping SCP fallback (install with: pip install scp)",
-                                    )
-
-                                if scp_available:
-                                    scp_attempted = True
-                                    file_name = os.path.basename(source)
-                                    remote_path = f"{destination_directory}/{file_name}"
-
-                                    with SCPClient(client.get_transport()) as scp:
-                                        if copy_to_destination:
-                                            # Upload using SCP
-                                            scp.put(source, remote_path)
-                                            transfer_method = "SCP"
-                                            await self.logger.log_runtime(
-                                                "INFO",
-                                                "DUTManager",
-                                                f"Transferred {source} to {remote_path} via SCP",
-                                            )
-                                        else:
-                                            # Download using SCP
-                                            scp.get(remote_path, source)
-                                            transfer_method = "SCP"
-                                            await self.logger.log_runtime(
-                                                "INFO",
-                                                "DUTManager",
-                                                f"Transferred {remote_path} to {source} via SCP",
-                                            )
-                            except Exception as scp_ex:
-                                if scp_attempted:
-                                    await self.logger.log_runtime(
-                                        "DEBUG",
-                                        "DUTManager",
-                                        f"SCP fallback also failed: {scp_ex}",
-                                    )
-                                # Re-raise the original SFTP error since SCP also failed
-                                raise sftp_ex
-                            finally:
-                                client.close()
+                        conn.close()
+                        await conn.wait_closed()
 
                     break  # Transfer successful
                 except Exception as e:
@@ -6034,9 +6757,9 @@ class DUTManager:
         if not copy_to_destination:
             await self.logger.write_to_dut_runtime_log(
                 dut_id,
-                "INFO",
+                "DEBUG",
                 "DUTManager",
-                f"Using enhanced fallback logic for host file transfer",
+                "Using enhanced fallback logic for host file transfer",
             )
             return await self._transfer_host_files_with_fallback(
                 dut_id, sources, destination_directory, max_retries
@@ -6066,165 +6789,64 @@ class DUTManager:
             retry_count = 0
             while retry_count < max_retries:
                 try:
-                    if self.ssh_backend == "asyncssh":
-                        # Use asyncssh for file transfer
+                    await self.logger.write_to_dut_runtime_log(
+                        dut_id,
+                        "DEBUG",
+                        "DUTManager",
+                        "Using asyncssh for host file transfer",
+                    )
+                    connect_kwargs = self._build_ssh_connect_kwargs(
+                        host=dut.credentials.host_ip,
+                        port=dut.credentials.host_ssh_port,
+                        username=username,
+                        password=password,
+                        ssh_key_path=dut.credentials.host_ssh_key_path,
+                        passwordless=dut.credentials.host_ssh_passwordless,
+                        connect_timeout=30,
+                    )
+                    await self.logger.write_to_dut_runtime_log(
+                        dut_id,
+                        "DEBUG",
+                        "DUTManager",
+                        f"asyncssh connect_kwargs: host={dut.credentials.host_ip}, port={dut.credentials.host_ssh_port}, username={username}",
+                    )
+
+                    if dut.credentials.host_ssh_key_path:
                         await self.logger.write_to_dut_runtime_log(
                             dut_id,
                             "DEBUG",
                             "DUTManager",
-                            f"Using asyncssh for host file transfer",
+                            f"Using SSH key authentication for host file transfer: {dut.credentials.host_ssh_key_path}",
                         )
-                        connect_kwargs = {
-                            "host": dut.credentials.host_ip,
-                            "port": dut.credentials.host_ssh_port,
-                            "username": username,
-                            "connect_timeout": 30,
-                            "known_hosts": None,
-                        }
+                    elif dut.credentials.host_ssh_passwordless:
                         await self.logger.write_to_dut_runtime_log(
                             dut_id,
                             "DEBUG",
                             "DUTManager",
-                            f"asyncssh connect_kwargs: host={dut.credentials.host_ip}, port={dut.credentials.host_ssh_port}, username={username}",
+                            "Using passwordless authentication for host file transfer",
                         )
-
-                        if password:
-                            connect_kwargs["password"] = password
-                            await self.logger.write_to_dut_runtime_log(
-                                dut_id,
-                                "DEBUG",
-                                "DUTManager",
-                                "Using password authentication for host file transfer",
-                            )
-                        elif dut.credentials.host_ssh_key_path:
-                            connect_kwargs["client_keys"] = [
-                                dut.credentials.host_ssh_key_path
-                            ]
-                            await self.logger.write_to_dut_runtime_log(
-                                dut_id,
-                                "DEBUG",
-                                "DUTManager",
-                                f"Using SSH key authentication for host file transfer: {dut.credentials.host_ssh_key_path}",
-                            )
-
-                        await self.logger.write_to_dut_runtime_log(
-                            dut_id,
-                            "DEBUG",
-                            "DUTManager",
-                            f"Attempting asyncssh connection to {dut.credentials.host_ip}",
-                        )
-                        conn = await asyncssh.connect(**connect_kwargs)
-                        try:
-                            async with conn.start_sftp_client() as sftp:
-                                await self.logger.write_to_dut_runtime_log(
-                                    dut_id,
-                                    "DEBUG",
-                                    "DUTManager",
-                                    f"SFTP client started successfully",
-                                )
-                                file_name = os.path.basename(source)
-                                remote_path = f"{destination_directory}/{file_name}"
-
-                                if copy_to_destination:
-                                    # Copy local file to remote
-                                    await self.logger.write_to_dut_runtime_log(
-                                        dut_id,
-                                        "DEBUG",
-                                        "DUTManager",
-                                        f"Copying local file {source} to remote {remote_path}",
-                                    )
-                                    await sftp.put(source, remote_path)
-                                    await self.logger.log_runtime(
-                                        "INFO",
-                                        "DUTManager",
-                                        f"Transferred {source} to {remote_path}",
-                                    )
-                                else:
-                                    # Copy remote file to local
-                                    local_path = f"{destination_directory}/{file_name}"
-                                    await self.logger.log_runtime(
-                                        "DEBUG",
-                                        "DUTManager",
-                                        f"Copying remote file {source} to local {local_path}",
-                                    )
-                                    await self.logger.log_runtime(
-                                        "DEBUG",
-                                        "DUTManager",
-                                        f"About to call sftp.get({source}, {local_path})",
-                                    )
-                                    await sftp.get(source, local_path)
-                                    await self.logger.write_to_dut_runtime_log(
-                                        dut_id,
-                                        "DEBUG",
-                                        "DUTManager",
-                                        f"SFTP get operation completed successfully",
-                                    )
-                                    await self.logger.write_to_dut_runtime_log(
-                                        dut_id,
-                                        "INFO",
-                                        "DUTManager",
-                                        f"Transferred {source} to {local_path}",
-                                    )
-                        finally:
-                            conn.close()
-                            await conn.wait_closed()
                     else:
-                        # Use paramiko for file transfer
-                        client = paramiko.SSHClient()
-                        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-                        connect_kwargs = {
-                            "hostname": dut.credentials.host_ip,
-                            "port": dut.credentials.host_ssh_port,
-                            "username": username,
-                            "timeout": 30,
-                        }
                         await self.logger.write_to_dut_runtime_log(
                             dut_id,
                             "DEBUG",
                             "DUTManager",
-                            f"paramiko connect_kwargs: hostname={dut.credentials.host_ip}, port={dut.credentials.host_ssh_port}, username={username}",
+                            "Using password authentication for host file transfer",
                         )
 
-                        if password:
-                            connect_kwargs["password"] = password
+                    await self.logger.write_to_dut_runtime_log(
+                        dut_id,
+                        "DEBUG",
+                        "DUTManager",
+                        f"Attempting asyncssh connection to {dut.credentials.host_ip}",
+                    )
+                    conn = await asyncssh.connect(**connect_kwargs)
+                    try:
+                        async with conn.start_sftp_client() as sftp:
                             await self.logger.write_to_dut_runtime_log(
                                 dut_id,
                                 "DEBUG",
                                 "DUTManager",
-                                "Using password authentication for paramiko host file transfer",
-                            )
-                        elif dut.credentials.host_ssh_key_path:
-                            connect_kwargs["key_filename"] = (
-                                dut.credentials.host_ssh_key_path
-                            )
-                            await self.logger.write_to_dut_runtime_log(
-                                dut_id,
-                                "DEBUG",
-                                "DUTManager",
-                                f"Using SSH key authentication for paramiko host file transfer: {dut.credentials.host_ssh_key_path}",
-                            )
-
-                        await self.logger.write_to_dut_runtime_log(
-                            dut_id,
-                            "DEBUG",
-                            "DUTManager",
-                            f"Attempting paramiko connection to {dut.credentials.host_ip}",
-                        )
-                        client.connect(**connect_kwargs)
-                        try:
-                            await self.logger.write_to_dut_runtime_log(
-                                dut_id,
-                                "DEBUG",
-                                "DUTManager",
-                                f"paramiko connection successful",
-                            )
-                            sftp = client.open_sftp()
-                            await self.logger.write_to_dut_runtime_log(
-                                dut_id,
-                                "DEBUG",
-                                "DUTManager",
-                                f"paramiko SFTP client opened successfully",
+                                "SFTP client started successfully",
                             )
                             file_name = os.path.basename(source)
                             remote_path = f"{destination_directory}/{file_name}"
@@ -6235,11 +6857,10 @@ class DUTManager:
                                     dut_id,
                                     "DEBUG",
                                     "DUTManager",
-                                    f"paramiko: Copying local file {source} to remote {remote_path}",
+                                    f"Copying local file {source} to remote {remote_path}",
                                 )
-                                sftp.put(source, remote_path)
-                                await self.logger.write_to_dut_runtime_log(
-                                    dut_id,
+                                await sftp.put(source, remote_path)
+                                await self.logger.log_runtime(
                                     "INFO",
                                     "DUTManager",
                                     f"Transferred {source} to {remote_path}",
@@ -6247,32 +6868,32 @@ class DUTManager:
                             else:
                                 # Copy remote file to local
                                 local_path = f"{destination_directory}/{file_name}"
-                                await self.logger.write_to_dut_runtime_log(
-                                    dut_id,
+                                await self.logger.log_runtime(
                                     "DEBUG",
                                     "DUTManager",
-                                    f"paramiko: Copying remote file {source} to local {local_path}",
-                                )
-                                await self.logger.write_to_dut_runtime_log(
-                                    dut_id,
-                                    "DEBUG",
-                                    "DUTManager",
-                                    f"paramiko: About to call sftp.get({source}, {local_path})",
-                                )
-                                sftp.get(source, local_path)
-                                await self.logger.write_to_dut_runtime_log(
-                                    dut_id,
-                                    "DEBUG",
-                                    "DUTManager",
-                                    f"paramiko SFTP get operation completed successfully",
+                                    f"Copying remote file {source} to local {local_path}",
                                 )
                                 await self.logger.log_runtime(
+                                    "DEBUG",
+                                    "DUTManager",
+                                    f"About to call sftp.get({source}, {local_path})",
+                                )
+                                await sftp.get(source, local_path)
+                                await self.logger.write_to_dut_runtime_log(
+                                    dut_id,
+                                    "DEBUG",
+                                    "DUTManager",
+                                    "SFTP get operation completed successfully",
+                                )
+                                await self.logger.write_to_dut_runtime_log(
+                                    dut_id,
                                     "INFO",
                                     "DUTManager",
                                     f"Transferred {source} to {local_path}",
                                 )
-                        finally:
-                            client.close()
+                    finally:
+                        conn.close()
+                        await conn.wait_closed()
 
                     # If we get here, transfer was successful
                     await self.logger.log_runtime(
@@ -6315,7 +6936,7 @@ class DUTManager:
         max_retries: int = 3,
     ) -> Tuple[bool, str]:
         """
-        Enhanced file transfer with multiple fallback approaches.
+        Enhanced file transfer with multiple fallback approaches (ported from legacy nvdebug).
 
         Uses multiple approaches to download files:
         1. Direct SFTP download
@@ -6332,21 +6953,32 @@ class DUTManager:
             Tuple of (success, error_message)
         """
         dut = self.get_dut(dut_id)
+
+        if dut.config and dut.config.get("local", False):
+            await self.logger.write_to_dut_runtime_log(
+                dut_id,
+                "INFO",
+                "DUTManager",
+                "Local mode detected - using local file copy instead of SFTP",
+            )
+            return await self._copy_local_files_to_destination(
+                dut_id, sources, destination_directory
+            )
+
         username = dut.credentials.host_username
         password = dut.credentials.host_password
 
         await self.logger.write_to_dut_runtime_log(
             dut_id,
-            "INFO",
+            "DEBUG",
             "DUTManager",
             f"Starting enhanced file transfer with fallback for {len(sources)} files",
         )
 
         # Create a unique temp directory using timestamp and random string
+        # Note: preamble logs above are DEBUG-level; per-file results below are also DEBUG
         timestamp = int(time.time())
-        random_str = "".join(
-            random.choices(string.ascii_lowercase + string.digits, k=8)
-        )
+        random_str = secrets.token_hex(8)
         temp_dir = f"/tmp/nvdebug_transfer_{timestamp}_{random_str}"
 
         try:
@@ -6358,7 +6990,7 @@ class DUTManager:
 
             # Step 1: Try direct SFTP download first
             await self.logger.write_to_dut_runtime_log(
-                dut_id, "INFO", "DUTManager", "Attempting direct SFTP download..."
+                dut_id, "DEBUG", "DUTManager", "Attempting direct SFTP download..."
             )
 
             # Pre-transfer diagnostics
@@ -6403,7 +7035,7 @@ class DUTManager:
                     )
 
                     # Check file existence and permissions
-                    file_check_cmd = f"test -f '{source}' && ls -la '{source}' || echo 'File does not exist: {source}'"
+                    file_check_cmd = f"test -f {shlex.quote(str(source))} && ls -la {shlex.quote(str(source))} || echo {shlex.quote('File does not exist: ' + str(source))}"
                     file_exit_code, file_stdout, _ = await self.execute_host_command(
                         dut_id, file_check_cmd, timeout=30, use_sudo=False
                     )
@@ -6416,7 +7048,7 @@ class DUTManager:
                         )
 
                     # Check if we can read the file
-                    read_test_cmd = f"head -c 100 '{source}' > /dev/null 2>&1 && echo 'File readable' || echo 'File not readable'"
+                    read_test_cmd = f"head -c 100 {shlex.quote(str(source))} > /dev/null 2>&1 && echo 'File readable' || echo 'File not readable'"
                     read_exit_code, read_stdout, _ = await self.execute_host_command(
                         dut_id, read_test_cmd, timeout=30, use_sudo=False
                     )
@@ -6437,9 +7069,9 @@ class DUTManager:
                         successful_downloads.append(source)
                         await self.logger.write_to_dut_runtime_log(
                             dut_id,
-                            "INFO",
+                            "DEBUG",
                             "DUTManager",
-                            f"Direct download successful for {source}",
+                            f"Downloaded {source}",
                         )
                     else:
                         failed_paths.append(source)
@@ -6461,9 +7093,9 @@ class DUTManager:
             if not failed_paths:
                 await self.logger.write_to_dut_runtime_log(
                     dut_id,
-                    "INFO",
+                    "DEBUG",
                     "DUTManager",
-                    "All files downloaded successfully via direct SFTP",
+                    "All files downloaded via SFTP",
                 )
                 return True, ""
 
@@ -6475,8 +7107,8 @@ class DUTManager:
                 f"Attempting permission-based fallback for {len(failed_paths)} failed files",
             )
 
-            # Create the temporary directory with sudo
-            mkdir_cmd = f"mkdir -p {temp_dir}"
+            # Create a private temporary directory owned by the SSH/SFTP user.
+            mkdir_cmd = f"mkdir -p {shlex.quote(str(temp_dir))}"
             exit_code, _, stderr_mkdir = await self.execute_host_command(
                 dut_id, mkdir_cmd, timeout=60, use_sudo=True
             )
@@ -6488,8 +7120,21 @@ class DUTManager:
                 )
                 return False, error_msg
 
-            # Set directory permissions to 777
-            chmod_dir_cmd = f"chmod 777 {temp_dir}"
+            chown_dir_cmd = (
+                f"chown {shlex.quote(str(username))} {shlex.quote(str(temp_dir))}"
+            )
+            exit_code, _, stderr_chown = await self.execute_host_command(
+                dut_id, chown_dir_cmd, timeout=60, use_sudo=True
+            )
+
+            if exit_code != 0:
+                error_msg = f"Failed to set temp directory owner: {stderr_chown}"
+                await self.logger.write_to_dut_runtime_log(
+                    dut_id, "ERROR", "DUTManager", error_msg
+                )
+                return False, error_msg
+
+            chmod_dir_cmd = f"chmod 700 {shlex.quote(str(temp_dir))}"
             exit_code, _, stderr_chmod = await self.execute_host_command(
                 dut_id, chmod_dir_cmd, timeout=60, use_sudo=True
             )
@@ -6512,82 +7157,6 @@ class DUTManager:
                     dut_id, cp_cmd, timeout=60, use_sudo=True
                 )
 
-                # If copy failed, try multiple permission-related fixes
-                if exit_code != 0 and any(
-                    perm_error in stderr_cp.lower()
-                    for perm_error in [
-                        "permission denied",
-                        "operation not permitted",
-                        "access denied",
-                    ]
-                ):
-                    await self.logger.write_to_dut_runtime_log(
-                        dut_id,
-                        "INFO",
-                        "DUTManager",
-                        f"Copy failed due to permissions, attempting to fix permissions on {remote_path}",
-                    )
-
-                    # First, try to get file info to understand the issue
-                    info_cmd = f"ls -la {shlex.quote(remote_path)} 2>/dev/null || echo 'File not accessible'"
-                    info_exit_code, info_stdout, _ = await self.execute_host_command(
-                        dut_id, info_cmd, timeout=30, use_sudo=True
-                    )
-
-                    if info_exit_code == 0:
-                        await self.logger.write_to_dut_runtime_log(
-                            dut_id,
-                            "DEBUG",
-                            "DUTManager",
-                            f"File info before permission fix: {info_stdout.strip()}",
-                        )
-
-                    # Try multiple permission fixes in order of preference
-                    permission_fixes = [
-                        ("chmod 644", f"chmod 644 {shlex.quote(remote_path)}"),
-                        ("chmod 755", f"chmod 755 {shlex.quote(remote_path)}"),
-                        (
-                            "chmod o+r",
-                            f"chmod o+r {shlex.quote(remote_path)}",
-                        ),  # Add read for others
-                    ]
-
-                    for fix_name, chmod_cmd in permission_fixes:
-                        chmod_exit_code, _, chmod_stderr = (
-                            await self.execute_host_command(
-                                dut_id, chmod_cmd, timeout=60, use_sudo=True
-                            )
-                        )
-
-                        if chmod_exit_code == 0:
-                            await self.logger.write_to_dut_runtime_log(
-                                dut_id,
-                                "DEBUG",
-                                "DUTManager",
-                                f"Successfully applied {fix_name} to {remote_path}",
-                            )
-
-                            # Retry the copy after fixing permissions
-                            exit_code, _, stderr_cp = await self.execute_host_command(
-                                dut_id, cp_cmd, timeout=60, use_sudo=True
-                            )
-
-                            if exit_code == 0:
-                                await self.logger.write_to_dut_runtime_log(
-                                    dut_id,
-                                    "INFO",
-                                    "DUTManager",
-                                    f"Copy succeeded after applying {fix_name}",
-                                )
-                                break
-                        else:
-                            await self.logger.write_to_dut_runtime_log(
-                                dut_id,
-                                "DEBUG",
-                                "DUTManager",
-                                f"Failed to apply {fix_name}: {chmod_stderr}",
-                            )
-
                 if exit_code != 0:
                     await self.logger.write_to_dut_runtime_log(
                         dut_id,
@@ -6597,8 +7166,23 @@ class DUTManager:
                     )
                     continue
 
-                # Set file permissions to 644 on the copied file
-                chmod_file_cmd = f"chmod 644 {shlex.quote(temp_file)}"
+                chown_file_cmd = (
+                    f"chown {shlex.quote(str(username))} {shlex.quote(temp_file)}"
+                )
+                exit_code, _, stderr_file_chown = await self.execute_host_command(
+                    dut_id, chown_file_cmd, timeout=60, use_sudo=True
+                )
+
+                if exit_code != 0:
+                    await self.logger.write_to_dut_runtime_log(
+                        dut_id,
+                        "WARNING",
+                        "DUTManager",
+                        f"Failed to set file owner: {stderr_file_chown}",
+                    )
+                    continue
+
+                chmod_file_cmd = f"chmod 600 {shlex.quote(temp_file)}"
                 exit_code, _, stderr_file_chmod = await self.execute_host_command(
                     dut_id, chmod_file_cmd, timeout=60, use_sudo=True
                 )
@@ -6619,11 +7203,11 @@ class DUTManager:
                 )
 
                 if exit_code != 0:
-                    await self.logger.log_runtime(
+                    await self.logger.write_to_dut_runtime_log(
+                        dut_id,
                         "WARNING",
                         "DUTManager",
                         f"Empty temp file: {temp_file}",
-                        dut_id,
                     )
                     # Clean up empty temp file
                     await self.execute_host_command(
@@ -6674,7 +7258,7 @@ class DUTManager:
                     dut_id,
                     "INFO",
                     "DUTManager",
-                    "All files downloaded successfully via permission-based fallback",
+                    "All files downloaded via permission-based fallback",
                 )
                 return True, ""
 
@@ -6692,8 +7276,21 @@ class DUTManager:
                 # Create tar in the temp directory to avoid permission issues
                 # Use -h flag to follow symlinks (dereference) to ensure actual data is archived
                 # Important: -h must come before -f, not after it
+
+                # Get tar command with fallback to bundled busybox
+                try:
+                    tar_binary = get_tar_command()
+                except RuntimeError as e:
+                    await self.logger.write_to_dut_runtime_log(
+                        dut_id,
+                        "ERROR",
+                        "DUTManager",
+                        f"tar not available: {e}",
+                    )
+                    return False, ""
+
                 files_str = " ".join(shlex.quote(f) for f in failed_paths)
-                tar_cmd = f"cd {temp_dir} && sudo tar -h -czf {os.path.basename(temp_tar)} {files_str}"
+                tar_cmd = f"cd {shlex.quote(str(temp_dir))} && sudo {tar_binary} -h -czf {shlex.quote(os.path.basename(temp_tar))} {files_str}"
 
                 await self.logger.write_to_dut_runtime_log(
                     dut_id, "DEBUG", "DUTManager", f"Tar command: {tar_cmd}"
@@ -6708,8 +7305,22 @@ class DUTManager:
                         dut_id, "INFO", "DUTManager", "Remote tar creation successful"
                     )
 
-                    # Set permissions on the tar file
-                    chmod_cmd = f"sudo chmod 644 {temp_tar}"
+                    chown_cmd = (
+                        f"chown {shlex.quote(str(username))} {shlex.quote(str(temp_tar))}"
+                    )
+                    chown_exit_code, _, chown_stderr = await self.execute_host_command(
+                        dut_id, chown_cmd, timeout=60, use_sudo=True
+                    )
+
+                    if chown_exit_code != 0:
+                        await self.logger.write_to_dut_runtime_log(
+                            dut_id,
+                            "WARNING",
+                            "DUTManager",
+                            f"Failed to set owner on tar file: {chown_stderr}",
+                        )
+
+                    chmod_cmd = f"chmod 600 {shlex.quote(str(temp_tar))}"
                     chmod_exit_code, _, chmod_stderr = await self.execute_host_command(
                         dut_id, chmod_cmd, timeout=60, use_sudo=True
                     )
@@ -6737,7 +7348,7 @@ class DUTManager:
                             with tarfile.open(local_tar, "r:gz") as tar:
                                 tar.extractall(
                                     path=destination_directory,
-                                    filter=lambda m: self._safe_tar_filter(
+                                    filter=lambda m, p: self._safe_tar_filter(
                                         m, destination_directory
                                     ),
                                 )
@@ -6789,7 +7400,10 @@ class DUTManager:
 
                     # Clean up remote tar
                     await self.execute_host_command(
-                        dut_id, f"sudo rm -f {temp_tar}", timeout=60, use_sudo=True
+                        dut_id,
+                        f"sudo rm -f {shlex.quote(str(temp_tar))}",
+                        timeout=60,
+                        use_sudo=True,
                     )
                 else:
                     await self.logger.write_to_dut_runtime_log(
@@ -6832,7 +7446,10 @@ class DUTManager:
             # Clean up temp directory if it exists
             try:
                 await self.execute_host_command(
-                    dut_id, f"sudo rm -rf {temp_dir}", timeout=60, use_sudo=True
+                    dut_id,
+                    f"sudo rm -rf {shlex.quote(str(temp_dir))}",
+                    timeout=60,
+                    use_sudo=True,
                 )
             except Exception as e:
                 await self.logger.write_to_dut_runtime_log(
@@ -6842,11 +7459,85 @@ class DUTManager:
                     f"Failed to clean up temp directory {temp_dir}: {str(e)}",
                 )
 
+    async def _copy_local_files_to_destination(
+        self, dut_id: str, sources: List[str], destination_directory: str
+    ) -> Tuple[bool, str]:
+        """
+        Copy files locally when running in local mode (no SFTP required).
+
+        Args:
+            dut_id: DUT identifier.
+            sources: List of source file paths on the local system.
+            destination_directory: Local directory to store copied files.
+
+        Returns:
+            Tuple of (success, error_message).
+        """
+        try:
+            os.makedirs(destination_directory, exist_ok=True)
+        except Exception as e:
+            error_msg = (
+                f"Failed to create destination directory {destination_directory}: {e}"
+            )
+            await self.logger.write_to_dut_runtime_log(
+                dut_id, "ERROR", "DUTManager", error_msg
+            )
+            return False, error_msg
+
+        user = getpass.getuser()
+        group = grp.getgrgid(os.getgid()).gr_name
+        failed_paths = []
+
+        for source in sources:
+            if not os.path.exists(source):
+                failed_paths.append(source)
+                await self.logger.write_to_dut_runtime_log(
+                    dut_id,
+                    "ERROR",
+                    "DUTManager",
+                    f"Source file does not exist: {source}",
+                )
+                continue
+
+            dest_path = os.path.join(destination_directory, os.path.basename(source))
+
+            if os.path.isfile(source):
+                cmd = f"install -m 0644 -o {shlex.quote(user)} -g {shlex.quote(group)} {shlex.quote(source)} {shlex.quote(dest_path)}"
+            else:
+                cmd = f"cp -a {shlex.quote(source)} {shlex.quote(dest_path)}"
+
+            exit_code, _, stderr = await self.execute_host_command(
+                dut_id, cmd, timeout=60, use_sudo=True
+            )
+            if exit_code != 0:
+                failed_paths.append(source)
+                await self.logger.write_to_dut_runtime_log(
+                    dut_id,
+                    "ERROR",
+                    "DUTManager",
+                    f"Local copy failed for {source}: {stderr}",
+                )
+            else:
+                await self.logger.write_to_dut_runtime_log(
+                    dut_id,
+                    "INFO",
+                    "DUTManager",
+                    f"Local copy successful: {source} -> {dest_path}",
+                )
+
+        if failed_paths:
+            return (
+                False,
+                f"Failed to copy files locally: {', '.join(failed_paths)}",
+            )
+
+        return True, ""
+
     async def _create_connection_with_proxy(
         self,
         dut_id: str,
         use_proxy: bool = True,
-    ) -> Tuple[Union[asyncssh.SSHClientConnection, paramiko.SSHClient], str]:
+    ) -> Tuple[asyncssh.SSHClientConnection, str]:
         """
         Create SSH connection with optional proxy support.
 
@@ -6874,62 +7565,24 @@ class DUTManager:
                 )
 
         try:
-            if self.ssh_backend == "asyncssh":
-                # Use asyncssh for file transfer
-                connect_kwargs = {
-                    "host": dut.credentials.host_ip,
-                    "port": dut.credentials.host_ssh_port,
-                    "username": username,
-                    "connect_timeout": 30,
-                    "known_hosts": None,
-                }
+            connect_kwargs = self._build_ssh_connect_kwargs(
+                host=dut.credentials.host_ip,
+                port=dut.credentials.host_ssh_port,
+                username=username,
+                password=password,
+                ssh_key_path=dut.credentials.host_ssh_key_path,
+                passwordless=dut.credentials.host_ssh_passwordless,
+                connect_timeout=30,
+            )
 
-                if password:
-                    connect_kwargs["password"] = password
-                elif dut.credentials.host_ssh_key_path:
-                    connect_kwargs["client_keys"] = [dut.credentials.host_ssh_key_path]
-
-                # If proxy is available, use it
-                if proxy_client and hasattr(proxy_client, "get_extra_info"):
-                    # asyncssh proxy connection
-                    conn = await asyncssh.connect(**connect_kwargs, proxy=proxy_client)
-                else:
-                    # Direct connection
-                    conn = await asyncssh.connect(**connect_kwargs)
-
-                return conn, "asyncssh"
+            # If proxy is available, use it
+            if proxy_client:
+                conn = await asyncssh.connect(**connect_kwargs, tunnel=proxy_client)
             else:
-                # Use paramiko for file transfer
-                client = paramiko.SSHClient()
-                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                # Direct connection
+                conn = await asyncssh.connect(**connect_kwargs)
 
-                connect_kwargs = {
-                    "hostname": dut.credentials.host_ip,
-                    "port": dut.credentials.host_ssh_port,
-                    "username": username,
-                    "timeout": 30,
-                }
-
-                if password:
-                    connect_kwargs["password"] = password
-                elif dut.credentials.host_ssh_key_path:
-                    connect_kwargs["key_filename"] = dut.credentials.host_ssh_key_path
-
-                # If proxy is available, use it
-                if proxy_client and hasattr(proxy_client, "get_transport"):
-                    # paramiko proxy connection
-                    proxy_transport = proxy_client.get_transport()
-                    proxy_channel = proxy_transport.open_channel(
-                        "direct-tcpip",
-                        (dut.credentials.host_ip, dut.credentials.host_ssh_port),
-                        ("", 0),
-                    )
-                    client.connect(**connect_kwargs, sock=proxy_channel)
-                else:
-                    # Direct connection
-                    client.connect(**connect_kwargs)
-
-                return client, "paramiko"
+            return conn, "asyncssh"
 
         except Exception as e:
             await self.logger.write_to_dut_runtime_log(
@@ -6962,90 +7615,20 @@ class DUTManager:
                 dut_id, use_proxy
             )
 
-            if conn_type == "asyncssh":
-                # Use asyncssh for file transfer
-                try:
-                    async with conn.start_sftp_client() as sftp:
-                        file_name = os.path.basename(source)
-                        local_path = f"{destination_directory}/{file_name}"
-
-                        # Check if source file exists on remote system
-                        try:
-                            stat_result = await sftp.stat(source)
-                            # asyncssh uses 'size' attribute, paramiko uses 'st_size'
-                            file_size = getattr(
-                                stat_result,
-                                "size",
-                                getattr(stat_result, "st_size", "unknown"),
-                            )
-                            await self.logger.write_to_dut_runtime_log(
-                                dut_id,
-                                "DEBUG",
-                                "DUTManager",
-                                f"Remote file {source} exists, size: {file_size} bytes",
-                            )
-                        except FileNotFoundError:
-                            error_msg = (
-                                f"Source file {source} does not exist on remote system"
-                            )
-                            await self.logger.write_to_dut_runtime_log(
-                                dut_id, "ERROR", "DUTManager", error_msg
-                            )
-                            return False, error_msg
-                        except Exception as e:
-                            error_msg = (
-                                f"Failed to check remote file {source}: {str(e)}"
-                            )
-                            await self.logger.write_to_dut_runtime_log(
-                                dut_id, "ERROR", "DUTManager", error_msg
-                            )
-                            return False, error_msg
-
-                        # Download remote file to local
-                        await self.logger.write_to_dut_runtime_log(
-                            dut_id,
-                            "DEBUG",
-                            "DUTManager",
-                            f"Downloading {source} to {local_path}",
-                        )
-                        await sftp.get(source, local_path)
-
-                        # Verify file was downloaded and has content
-                        if self._verify_file_content(local_path):
-                            await self.logger.write_to_dut_runtime_log(
-                                dut_id,
-                                "DEBUG",
-                                "DUTManager",
-                                f"Successfully downloaded and verified {local_path}",
-                            )
-                            return True, ""
-                        else:
-                            error_msg = (
-                                f"Downloaded file {local_path} is empty or missing"
-                            )
-                            await self.logger.write_to_dut_runtime_log(
-                                dut_id, "ERROR", "DUTManager", error_msg
-                            )
-                            return False, error_msg
-
-                finally:
-                    conn.close()
-                    await conn.wait_closed()
-            else:
-                # Use paramiko for file transfer
-                try:
-                    sftp = conn.open_sftp()
+            try:
+                async with conn.start_sftp_client() as sftp:
                     file_name = os.path.basename(source)
                     local_path = f"{destination_directory}/{file_name}"
 
                     # Check if source file exists on remote system
                     try:
-                        stat_result = sftp.stat(source)
+                        stat_result = await sftp.stat(source)
+                        file_size = getattr(stat_result, "size", "unknown")
                         await self.logger.write_to_dut_runtime_log(
                             dut_id,
                             "DEBUG",
                             "DUTManager",
-                            f"Remote file {source} exists, size: {stat_result.st_size} bytes",
+                            f"Remote file {source} exists, size: {file_size} bytes",
                         )
                     except FileNotFoundError:
                         error_msg = (
@@ -7056,11 +7639,22 @@ class DUTManager:
                         )
                         return False, error_msg
                     except Exception as e:
-                        error_msg = f"Failed to check remote file {source}: {str(e)}"
+                        error_msg = (
+                            f"Failed to check remote file {source}: {str(e)}"
+                        )
                         await self.logger.write_to_dut_runtime_log(
                             dut_id, "ERROR", "DUTManager", error_msg
                         )
                         return False, error_msg
+
+                    # Capture the remote size before the transfer so we can
+                    # distinguish "remote was already 0 bytes" from "transfer
+                    # silently dropped bytes due to read-permission failure".
+                    # The symptom in B6099139 (H16 archives appearing empty
+                    # locally despite being valid remotely) collapsed into a
+                    # single generic message here; the split below preserves
+                    # the useful triage signal.
+                    remote_size_before = getattr(stat_result, "size", None)
 
                     # Download remote file to local
                     await self.logger.write_to_dut_runtime_log(
@@ -7069,7 +7663,7 @@ class DUTManager:
                         "DUTManager",
                         f"Downloading {source} to {local_path}",
                     )
-                    sftp.get(source, local_path)
+                    await sftp.get(source, local_path)
 
                     # Verify file was downloaded and has content
                     if self._verify_file_content(local_path):
@@ -7081,14 +7675,40 @@ class DUTManager:
                         )
                         return True, ""
                     else:
-                        error_msg = f"Downloaded file {local_path} is empty or missing"
+                        local_exists = os.path.exists(local_path)
+                        local_size = (
+                            os.path.getsize(local_path) if local_exists else None
+                        )
+                        if (
+                            local_exists
+                            and local_size == 0
+                            and isinstance(remote_size_before, int)
+                            and remote_size_before > 0
+                        ):
+                            error_msg = (
+                                f"Downloaded file {local_path} is 0 bytes locally "
+                                f"but remote {source} was {remote_size_before} bytes "
+                                "— likely the SFTP user cannot read the remote file "
+                                "(wrong ownership or permissions)"
+                            )
+                        elif not local_exists:
+                            error_msg = (
+                                f"Downloaded file {local_path} is missing "
+                                "(sftp.get completed but the local file was not created)"
+                            )
+                        else:
+                            error_msg = (
+                                f"Downloaded file {local_path} is empty (remote size "
+                                f"{remote_size_before} bytes)"
+                            )
                         await self.logger.write_to_dut_runtime_log(
                             dut_id, "ERROR", "DUTManager", error_msg
                         )
                         return False, error_msg
 
-                finally:
-                    conn.close()
+            finally:
+                conn.close()
+                await conn.wait_closed()
 
         except Exception as e:
             error_msg = f"SFTP download failed: {str(e)}"
@@ -7099,7 +7719,7 @@ class DUTManager:
 
     def _verify_file_content(self, file_path: str) -> bool:
         """
-        Verify that a file exists and has content.
+        Verify that a file exists and has content (ported from legacy nvdebug).
 
         Args:
             file_path: Path to the file to verify
@@ -7117,7 +7737,7 @@ class DUTManager:
         Check if SSH client connection is still active
 
         Args:
-            ssh_client: SSH client to check (paramiko.SSHClient or asyncssh.SSHClientConnection)
+            ssh_client: SSH client to check (asyncssh.SSHClientConnection)
 
         Returns:
             True if connection is active, False otherwise
@@ -7126,17 +7746,7 @@ class DUTManager:
             return False
 
         try:
-            if hasattr(ssh_client, "get_transport"):  # paramiko
-                transport = ssh_client.get_transport()
-                if transport:
-                    transport.send_ignore()
-                    return True
-                return False
-            elif hasattr(ssh_client, "get_extra_info"):  # asyncssh
-                # For asyncssh, we can check if the connection is still open
-                return not ssh_client.is_closing()
-            else:
-                return False
+            return not ssh_client.is_closing()
         except (EOFError, Exception):
             return False
 
@@ -7165,7 +7775,11 @@ class DUTManager:
         """
 
         ping_option = "-n" if platform.system().lower() == "windows" else "-c"
-        ping_cmd = f"ping {ping_option} 2 {ip_address}"
+        network_type = str(self.tool_config.get("IP_NETWORK", "ipv4")).lower()
+        network_arg = "-6" if network_type == "ipv6" else "-4"
+        ping_cmd = (
+            f"ping {network_arg} {ping_option} 2 {shlex.quote(str(ip_address))}"
+        )
 
         if ssh_pass:
             if not ssh_server_ip or not ssh_username or not ssh_password:
@@ -7175,7 +7789,10 @@ class DUTManager:
                     "SSH ping requires server IP, username, and password",
                 )
                 return False
-            sshpass_ping_cmd = f"sshpass -p {ssh_password} ssh -o StrictHostKeyChecking=no {ssh_username}@{ssh_server_ip} -p {ssh_port} "
+            sshpass_ping_cmd = (
+                f"sshpass -p {shlex.quote(str(ssh_password))} ssh -o StrictHostKeyChecking=no "
+                f"{shlex.quote(str(ssh_username))}@{shlex.quote(str(ssh_server_ip))} -p {int(ssh_port)} "
+            )
         else:
             sshpass_ping_cmd = ""
 
@@ -7185,7 +7802,7 @@ class DUTManager:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await process.communicate()
+            stdout, stderr = await _communicate_subprocess(process)
 
             if process.returncode == 0:
                 return True
@@ -7201,136 +7818,6 @@ class DUTManager:
                 "ERROR", "DUTManager", f"Ping error for {ip_address}: {e}"
             )
             return False
-
-    async def create_standalone_ssh_client(
-        self,
-        host_ip: str,
-        host_user: str,
-        host_password: Optional[str] = None,
-        ssh_key_path: Optional[str] = None,
-        proxy: Optional[paramiko.SSHClient] = None,
-        max_retries: int = 2,
-        timeout: int = 20,
-        passwordless: bool = False,
-        shell: bool = True,
-        ssh_port: int = 22,
-    ) -> Optional[paramiko.SSHClient]:
-        """
-        Create a standalone SSH client to connect to host IP
-
-        Args:
-            host_ip: Target machine IP address
-            host_user: Target machine SSH Username
-            host_password: Target machine SSH Password
-            ssh_key_path: Target machine SSH Key filepath
-            proxy: Proxy SSH client to be used as jumpbox
-            max_retries: Maximum number of retries
-            timeout: Timeout for SSH client creation
-            passwordless: Enable passwordless SSH
-            shell: Use shell when running commands
-            ssh_port: SSH port to connect to
-
-        Returns:
-            SSH client if successful, None if failed
-        """
-        if not passwordless:
-            if not host_ip or not host_user or (not host_password and not ssh_key_path):
-                await self.logger.log_runtime(
-                    "ERROR",
-                    "DUTManager",
-                    "Host IP and/or credentials are missing",
-                )
-                return None
-
-        retry_count = 0
-        while retry_count < max_retries:
-            try:
-                # Check ping if no proxy
-                if not proxy and not await self.check_ping_status(
-                    host_ip, ssh_port=ssh_port
-                ):
-                    await self.logger.log_runtime(
-                        "WARNING",
-                        "DUTManager",
-                        f"Host {host_ip} is not reachable",
-                    )
-                    retry_count += 1
-                    continue
-
-                ssh_client = paramiko.SSHClient()
-                ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-                connect_kwargs = {
-                    "hostname": host_ip,
-                    "port": ssh_port,
-                    "username": host_user,
-                    "timeout": timeout,
-                }
-
-                # Handle proxy
-                if proxy:
-                    proxy_socket = proxy.get_transport().open_channel(
-                        kind="direct-tcpip",
-                        dest_addr=(host_ip, ssh_port),
-                        src_addr=("", 0),
-                    )
-                    connect_kwargs["sock"] = proxy_socket
-                else:
-                    # Clear SSH key for this host
-                    try:
-                        process = await asyncio.create_subprocess_shell(
-                            f"ssh-keygen -R {host_ip}",
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE,
-                        )
-                        await process.communicate()
-                    except Exception:
-                        pass  # Ignore errors in key clearing
-
-                # Handle authentication
-                if ssh_key_path:
-                    try:
-                        key = paramiko.RSAKey.from_private_key_file(
-                            ssh_key_path, password=host_password
-                        )
-                        connect_kwargs["pkey"] = key
-                    except Exception as e:
-                        await self.logger.log_runtime(
-                            "ERROR",
-                            "DUTManager",
-                            f"Failed to load SSH key: {e}",
-                        )
-                        retry_count += 1
-                        continue
-                elif host_password:
-                    connect_kwargs["password"] = host_password
-
-                ssh_client.connect(**connect_kwargs)
-                await self.logger.log_runtime(
-                    "INFO",
-                    "DUTManager",
-                    f"Successfully connected to {host_ip}:{ssh_port}",
-                )
-                return ssh_client
-
-            except Exception as e:
-                if "ssh_client" in locals():
-                    ssh_client.close()
-                await self.logger.log_runtime(
-                    "WARNING",
-                    "DUTManager",
-                    f"SSH connection attempt {retry_count + 1}/{max_retries} failed: {e}",
-                )
-                retry_count += 1
-                if retry_count < max_retries:
-                    await asyncio.sleep(2**retry_count)  # Exponential backoff
-
-        await self.logger.log_runtime(
-            "ERROR",
-            "DUTManager",
-            f"Failed to connect to {host_ip}:{ssh_port} after {max_retries} attempts",
-        )
-        return None
 
     def get_info_from_ipmi_output(
         self, ipmi_response: str = None, keyword_phrase: str = None
@@ -7372,35 +7859,18 @@ class DUTManager:
             True if passwordless SSH is set up, False otherwise
         """
         try:
-            if self.ssh_backend == "asyncssh":
-                # Use asyncssh for passwordless check
-                try:
-                    conn = await asyncio.wait_for(
-                        asyncssh.connect(
-                            host=ip,
-                            username=username,
-                            known_hosts=None,
-                            connect_timeout=timeout,
-                        ),
-                        timeout=timeout,
-                    )
-                    conn.close()
-                    await conn.wait_closed()
-                    return True
-                except Exception:
-                    return False
-            else:
-                # Use paramiko for passwordless check
-                client = paramiko.SSHClient()
-                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                try:
-                    client.connect(ip, username=username, timeout=timeout)
-                    client.close()
-                    return True
-                except paramiko.AuthenticationException:
-                    return False
-                except Exception:
-                    return False
+            conn = await asyncio.wait_for(
+                asyncssh.connect(
+                    host=ip,
+                    username=username,
+                    known_hosts=None,
+                    connect_timeout=timeout,
+                ),
+                timeout=timeout,
+            )
+            conn.close()
+            await conn.wait_closed()
+            return True
         except Exception:
             return False
 
@@ -7442,8 +7912,12 @@ class DUTManager:
                     if input_val:
                         sudo_input += input_val
                 else:
-                    # No sudo password provided - assume passwordless sudo (e.g., in local mode)
-                    # Just run the command as-is with sudo
+                    # No sudo password provided: force non-interactive sudo so
+                    # local commands fail instead of blocking on a password prompt.
+                    if "sudo -S" in command:
+                        command = command.replace("sudo -S", "sudo -n", 1)
+                    elif "sudo -n" not in command:
+                        command = command.replace("sudo ", "sudo -n ", 1)
                     sudo_input = input_val
             else:
                 sudo_input = input_val
@@ -7480,17 +7954,16 @@ class DUTManager:
             # Wait for completion with timeout
             try:
                 if sudo_input:
-                    stdout, stderr = await asyncio.wait_for(
-                        process.communicate(input=sudo_input.encode()),
+                    stdout, stderr = await _communicate_subprocess(
+                        process,
                         timeout=timeout,
+                        input_data=sudo_input.encode(),
                     )
                 else:
-                    stdout, stderr = await asyncio.wait_for(
-                        process.communicate(), timeout=timeout
+                    stdout, stderr = await _communicate_subprocess(
+                        process, timeout=timeout
                     )
             except asyncio.TimeoutError:
-                process.kill()
-                await process.wait()
                 return -1, "", f"Command timed out after {timeout} seconds"
 
             # Decode the output using robust method
@@ -7779,6 +8252,10 @@ class DUTManager:
                         f"Error cleaning up HMC port forwarding for {dut_id}: {str(e)}",
                     )
 
+        # Drain pending log tasks from the baseboard manager
+        if self._baseboard_manager is not None:
+            await self._baseboard_manager.drain_pending_logs()
+
     async def _ensure_connection(
         self, dut_id: str, connection_type: str, test_method_name: str
     ) -> Tuple[bool, str]:
@@ -7802,7 +8279,7 @@ class DUTManager:
                 await self.logger.log_runtime(
                     "INFO",
                     "DUTManager",
-                    f"IPMI connection check skipped for local mode without BMC IP - will execute locally via sudo",
+                    "IPMI connection check skipped for local mode without BMC IP - will execute locally via sudo",
                 )
                 return (
                     True,
