@@ -21,24 +21,6 @@ and standardization of values.
 """
 
 from enum import Enum
-from typing import Dict
-
-
-class DutNodeType(Enum):
-    """
-    DUT node types.
-
-    Defines the hardware node types that can be collected from.
-
-    Attributes:
-        COMPUTE: Compute node with GPUs.
-        SWITCH_TRAY: Network switch tray.
-        POWER_SHELF: Power distribution shelf.
-    """
-
-    COMPUTE = "Compute"
-    SWITCH_TRAY = "SwitchTray"
-    POWER_SHELF = "PowerShelf"
 
 
 class DutExecutionMode(Enum):
@@ -71,25 +53,6 @@ class NetworkType(Enum):
     IPV6 = "ipv6"
 
 
-class RedfishHmcAccess(Enum):
-    """
-    Redfish HMC access methods.
-
-    Defines how BMC Redfish API is accessed through HMC.
-
-    Attributes:
-        PORTFORWARDING: TCP port forwarding through host.
-        AGGREGATION: BMC aggregation through host.
-        SSHACCESS: SSH tunneling through host.
-        NOTAPPLICABLE: Direct BMC access (no HMC).
-    """
-
-    PORTFORWARDING = "HostBmcTcpPortForwarding"
-    AGGREGATION = "HostBmcAggregation"
-    SSHACCESS = "HostBmcSshAccess"
-    NOTAPPLICABLE = "None"
-
-
 class CollectionLevel(Enum):
     """
     Collection levels.
@@ -97,11 +60,13 @@ class CollectionLevel(Enum):
     Defines the depth/completeness of log collection.
 
     Attributes:
+        L0: Special collectors - require explicit specification, may interrupt system/require reboot.
         L1: Basic collection - minimal essential logs.
         L2: Standard collection - typical debugging logs.
         L3: Comprehensive collection - complete system dump.
     """
 
+    L0 = "L0"  # Special collectors - only run when explicitly specified
     L1 = "L1"  # Basic collection
     L2 = "L2"  # Standard collection
     L3 = "L3"  # Comprehensive collection

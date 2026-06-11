@@ -1,0 +1,38 @@
+@media print {
+  /* Hide non-printable elements */
+  .navbar, .sidebar, .directory-picker, .modal-overlay,
+  button, select, input[type="text"], input[type="checkbox"] {
+    display: none !important;
+  }
+
+  /* Reset backgrounds for print */
+  body, [data-theme] {
+    background: white !important;
+    color: black !important;
+  }
+
+  /* Tables print-friendly */
+  table {
+    border-collapse: collapse;
+    width: 100%;
+  }
+  th, td {
+    border: 1px solid #ddd;
+    padding: 4px 8px;
+    font-size: 10pt;
+  }
+
+  /* Charts: show at reasonable size */
+  canvas {
+    max-width: 100%;
+    page-break-inside: avoid;
+  }
+
+  /* Page breaks */
+  h2, h3 {
+    page-break-after: avoid;
+  }
+  .card, .chart-card {
+    page-break-inside: avoid;
+  }
+}

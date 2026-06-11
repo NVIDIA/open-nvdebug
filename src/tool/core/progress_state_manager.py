@@ -20,7 +20,6 @@ Tracks progress and timing information across all DUTs and collectors with
 thread-safe state management for concurrent operations.
 """
 
-import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -270,25 +269,6 @@ class ProgressStateManager:
         else:
             print(f"{level.upper()}: {message}")
 
-    def add_progress_callback(self, callback: callable) -> None:
-        """
-        Add a callback to be called when progress updates.
-
-        Args:
-            callback: Callable to invoke on progress updates.
-        """
-        self._progress_callbacks.append(callback)
-
-    def remove_progress_callback(self, callback: callable) -> None:
-        """
-        Remove a progress callback.
-
-        Args:
-            callback: Callback to remove.
-        """
-        if callback in self._progress_callbacks:
-            self._progress_callbacks.remove(callback)
-
     def _notify_progress_update(self) -> None:
         """
         Notify all progress callbacks of an update.
@@ -509,44 +489,6 @@ class ProgressStateManager:
         """
         return self.dut_progress.get(dut_id)
 
-    def get_collector_progress(
-        self, collector_id: str, dut_id: str
-    ) -> Optional[CollectorProgress]:
-        """
-        Get progress for a specific collector on a specific DUT.
-
-        Args:
-            collector_id: Collector ID.
-            dut_id: DUT ID.
-
-        Returns:
-            CollectorProgress object or None if not found.
-        """
-        return self.collector_progress.get(collector_id, {}).get(dut_id)
-
-    def get_current_context(self, dut_id: str) -> Dict[str, Any]:
-        """
-        Get current execution context for a DUT.
-
-        Args:
-            dut_id: DUT ID.
-
-        Returns:
-            Dictionary containing current execution context.
-        """
-        if dut_id not in self.dut_progress:
-            return {}
-
-        dut_progress = self.dut_progress[dut_id]
-        return {
-            "current_service": dut_progress.current_service,
-            "current_bucket": dut_progress.current_bucket,
-            "running_collectors": list(dut_progress.running_collectors),
-            "progress_percentage": dut_progress.progress_percentage,
-            "completed_count": dut_progress.completed_count,
-            "total_collectors": dut_progress.total_collectors,
-        }
-
     def get_remaining_collectors(
         self, dut_id: str = None, max_display: int = 5
     ) -> List[str]:
@@ -593,42 +535,3 @@ class ProgressStateManager:
                 f"... and {len(remaining) - max_display} more"
             ]
         return remaining
-
-    def get_summary(self) -> Dict[str, Any]:
-        """
-        Get comprehensive progress summary.
-
-        Returns:
-            Dictionary containing overall, per-DUT, and per-collector summaries.
-        """
-        summary = {
-            "overall": self.get_overall_progress(),
-            "duts": {},
-            "collectors": {},
-        }
-
-        # Add DUT summaries
-        for dut_id, dut_progress in self.dut_progress.items():
-            summary["duts"][dut_id] = {
-                "progress_percentage": dut_progress.progress_percentage,
-                "completed_count": dut_progress.completed_count,
-                "total_collectors": dut_progress.total_collectors,
-                "start_time": dut_progress.start_time,
-                "end_time": dut_progress.end_time,
-                "duration": dut_progress.duration,
-                "current_context": self.get_current_context(dut_id),
-            }
-
-        # Add collector summaries
-        for collector_id, dut_progress in self.collector_progress.items():
-            summary["collectors"][collector_id] = {}
-            for dut_id, progress in dut_progress.items():
-                summary["collectors"][collector_id][dut_id] = {
-                    "status": progress.status.value,
-                    "start_time": progress.start_time,
-                    "end_time": progress.end_time,
-                    "execution_time": progress.execution_time,
-                    "reason": progress.reason,
-                }
-
-        return summary

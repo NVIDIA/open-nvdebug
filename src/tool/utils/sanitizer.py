@@ -23,7 +23,6 @@ IP addresses, MAC addresses, credentials, and custom patterns.
 import logging
 import re
 from enum import Enum
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
@@ -117,9 +116,13 @@ class LogSanitizer(logging.Formatter):
         if string_list:
             for string in string_list:
                 if string:
-                    # Escape the string and add word boundaries
                     escaped = re.escape(string)
-                    patterns.append(rf"\b{escaped}\b")
+                    # Use word boundaries only if the string starts/ends with
+                    # word characters; otherwise use the raw escaped pattern
+                    # so passwords with special chars (@ ! # $) are matched.
+                    start = r"\b" if re.match(r"\w", string) else ""
+                    end = r"\b" if re.search(r"\w$", string) else ""
+                    patterns.append(f"{start}{escaped}{end}")
 
         # Add built-in patterns
         if additional_regex:
@@ -234,9 +237,29 @@ def extract_sensitive_fields_from_dut_config(
         "RF_Pass",
         "BMC_SSH_USERNAME",
         "BMC_SSH_PASSWORD",
+        "HOST_SSH_USERNAME",
+        "HOST_SSH_PASSWORD",
+        "SSH_PROXY_USERNAME",
+        "SSH_PROXY_PASSWORD",
         "HMC_IP",
         "HMC_USERNAME",
         "HMC_PASSWORD",
+        "HMC_SSH_USERNAME",
+        "HMC_SSH_PASSWORD",
+        "hmc_user",
+        "hmc_pass",
+        "hmc_ssh_user",
+        "hmc_ssh_pass",
+        "hmc_username",
+        "hmc_password",
+        "hmc_ssh_username",
+        "hmc_ssh_password",
+        "SSH_PROXY_HOST",
+        "ssh_proxy_host",
+        "ssh_proxy_user",
+        "ssh_proxy_pass",
+        "ssh_proxy_username",
+        "ssh_proxy_password",
         "serial_number",
         "part_number",
         # "baseboard",  # Removed - baseboard names are not sensitive
@@ -320,24 +343,6 @@ def create_sanitizer_from_config(
     )
 
 
-def setup_sanitized_logging(logger: logging.Logger, sanitizer: LogSanitizer) -> None:
-    """
-    Set up sanitized logging for a logger
-
-    Args:
-        logger: Logger to configure
-        sanitizer: Sanitizer to use
-    """
-    # Remove existing handlers
-    for handler in logger.handlers[:]:
-        logger.removeHandler(handler)
-
-    # Create new handler with sanitizer
-    handler = logging.StreamHandler()
-    handler.setFormatter(sanitizer)
-    logger.addHandler(handler)
-
-
 def patch_print_with_sanitizer(sanitizer: LogSanitizer) -> None:
     """
     Patch the global print function to use sanitization
@@ -348,3 +353,40 @@ def patch_print_with_sanitizer(sanitizer: LogSanitizer) -> None:
     import builtins
 
     builtins.print = SanitizedPrinter(sanitizer)
+
+
+# ----------------------------
+# Config file sanitization
+# ----------------------------
+_CONFIG_CRED_KEY_RE = re.compile(
+    # Match YAML/INI-ish "key: value" or "key = value" where key contains credential-ish tokens.
+    # We intentionally do NOT require word boundaries so identifiers like "BMC_USERNAME" match.
+    r"(?im)^(\s*[^#\n:=]*"
+    r"(?:password|passwd|pwd|secret|token|auth|credential|api[_-]?key|access[_-]?key|secret[_-]?key|user|username)"
+    r"[^#\n:=]*\s*[:=]\s*)([^\n#]+)"
+)
+
+_IPV4_RE = re.compile(LogSanitizer.builtin_regex[BuiltInSanitizers.IPV4])
+_IPV6_RE = re.compile(LogSanitizer.builtin_regex[BuiltInSanitizers.IPV6])
+
+
+def sanitize_config_text(text: str, replacement: str = "XXXX") -> str:
+    """
+    Sanitize config *text* while preserving structure.
+
+    - Redacts values of any lines whose *key* contains user/password/token/etc (case-insensitive)
+      while preserving the key portion.
+    - Redacts IPv4/IPv6 addresses anywhere in the text.
+
+    This is intended for archiving `dut_config.yaml` / `tool_config.yaml` into run directories.
+    """
+    if not text:
+        return text
+
+    # Redact credential-ish key/value lines but preserve the key
+    text = _CONFIG_CRED_KEY_RE.sub(rf"\1{replacement}", text)
+
+    # Redact IPs anywhere (including inside URLs)
+    text = _IPV4_RE.sub(replacement, text)
+    text = _IPV6_RE.sub(replacement, text)
+    return text

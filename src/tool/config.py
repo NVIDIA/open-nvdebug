@@ -21,20 +21,20 @@ This module handles loading and validation of configuration files.
 """
 
 import getpass
+import ipaddress
 import os
 import tempfile
-from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Set, Union
 
-import pandas as pd
 import yaml
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .utils import excel_reader
 from .utils.enums import CollectionLevel
 from .utils.enums import DutExecutionMode as ExecutionMode
-from .utils.enums import DutNodeType, NetworkType, RedfishHmcAccess
+from .utils.enums import NetworkType
 from .utils.sanitizer import create_sanitizer_from_config
 
 # Global variable to track sanitization setting for early print statements
@@ -75,38 +75,135 @@ def _sanitize_print_message(message: str) -> str:
         return message
 
 
-class Credentials(BaseModel):
+def _validate_ip_network_fields(values: Dict[str, Any]) -> None:
+    network = str(values.get("IP_NETWORK") or NetworkType.IPV4.value).strip().lower()
+    valid_networks = {NetworkType.IPV4.value, NetworkType.IPV6.value}
+    if network not in valid_networks:
+        raise ValueError(
+            f"IP_NETWORK must be one of {sorted(valid_networks)}, got '{network}'"
+        )
+
+    values["IP_NETWORK"] = network
+    expected_version = 6 if network == NetworkType.IPV6.value else 4
+
+    for field_name in (
+        "BMC_IP",
+        "HOST_IP",
+        "HMC_IP",
+        "SSH_PROXY_HOST",
+        "bmc_ip",
+        "host_ip",
+        "hmc_ip",
+        "ssh_proxy_host",
+    ):
+        value = values.get(field_name)
+        if value in (None, ""):
+            continue
+
+        address = str(value).strip().strip("[]")
+        try:
+            parsed = ipaddress.ip_address(address)
+        except ValueError:
+            # Hostnames are still valid here; the selected family is enforced
+            # by ping/connection behavior at runtime.
+            continue
+
+        if parsed.version != expected_version:
+            raise ValueError(
+                f"{field_name}={value!r} is IPv{parsed.version}, "
+                f"but IP_NETWORK is '{network}'"
+            )
+
+
+LEGACY_FIELD_MAPPINGS: Dict[str, str] = {
+    # BMC fields
+    "bmc_ip": "BMC_IP",
+    "bmc_user": "BMC_USERNAME",
+    "bmc_pass": "BMC_PASSWORD",
+    "bmc_ssh_user": "BMC_SSH_USERNAME",
+    "bmc_ssh_pass": "BMC_SSH_PASSWORD",
+    "bmc_ssh_port": "BMC_SSH_PORT",
+    "bmc_ssh_key_path": "BMC_SSH_KEY_PATH",
+    "bmc_ssh_passwordless": "BMC_SSH_PASSWORDLESS",
+    "bmc_ssh_max_retries": "BMC_SSH_MAX_RETRIES",
+    "bmc_rf_user": "RF_User",
+    "bmc_rf_pass": "RF_Pass",
+    "bmc_rf_port": "BMC_RF_PORT",
+    "bmc_use_https": "BMC_USE_HTTPS",
+    # Host fields
+    "host_ip": "HOST_IP",
+    "host_user": "HOST_USERNAME",
+    "host_pass": "HOST_PASSWORD",
+    "host_ssh_port": "HOST_SSH_PORT",
+    "host_ssh_key_path": "HOST_SSH_KEY_PATH",
+    "host_ssh_passwordless": "HOST_SSH_PASSWORDLESS",
+    "host_ssh_max_retries": "HOST_SSH_MAX_RETRIES",
+    # HMC fields
+    "hmc_ip": "HMC_IP",
+    "hmc_user": "HMC_USERNAME",
+    "hmc_pass": "HMC_PASSWORD",
+    "hmc_ssh_user": "HMC_SSH_USERNAME",
+    "hmc_ssh_pass": "HMC_SSH_PASSWORD",
+    "hmc_ssh_port": "HMC_SSH_PORT",
+    "hmc_ssh_key_path": "HMC_SSH_KEY_PATH",
+    "hmc_ssh_passwordless": "HMC_SSH_PASSWORDLESS",
+    "hmc_ssh_max_retries": "HMC_SSH_MAX_RETRIES",
+    "hmc_http_port": "HMC_HTTP_PORT",
+    "hmc_https_port": "HMC_HTTPS_PORT",
+    "hmc_use_https": "HMC_USE_HTTPS",
+    "hmc_access_method": "RF_HMC_ACCESS_METHOD",
+    "use_port_forwarding": "USE_PORT_FORWARDING",
+    "setup_port_forwarding": "SETUP_PORT_FORWARDING",
+    "force_port_fw": "FORCE_PORT_FW",
+    "tunnel_tcp_port": "TUNNEL_TCP_PORT",
+    # SSH Proxy fields
+    "ssh_proxy_host": "SSH_PROXY_HOST",
+    "ssh_proxy_port": "SSH_PROXY_PORT",
+    "ssh_proxy_user": "SSH_PROXY_USERNAME",
+    "ssh_proxy_pass": "SSH_PROXY_PASSWORD",
+    "ssh_proxy_key_path": "SSH_PROXY_KEY_PATH",
+    "ssh_proxy_passwordless": "SSH_PROXY_PASSWORDLESS",
+    "ssh_proxy_max_retries": "SSH_PROXY_MAX_RETRIES",
+}
+
+
+def sync_legacy_fields(
+    values: Dict[str, Any], explicit_fields: Optional[Set[str]] = None
+) -> Dict[str, Any]:
     """
-    Credentials for authentication.
+    Synchronize new/legacy field pairs with explicit precedence.
 
-    Attributes:
-        username (str): Username for authentication.
-        password (Optional[str]): Password for authentication.
-        key_file (Optional[Path]): Path to SSH key file.
+    Args:
+        values: config dictionary to update in-place.
+        explicit_fields: fields explicitly provided by caller (used to
+            decide precedence when both new and legacy values exist).
+
+    Returns:
+        dict: Updated values.
     """
+    if not isinstance(values, dict):
+        return values
 
-    username: str
-    password: Optional[str] = None
-    key_file: Optional[Path] = None
+    explicit_fields = explicit_fields or set(values.keys())
 
+    for new_field, legacy_field in LEGACY_FIELD_MAPPINGS.items():
+        new_is_explicit = new_field in explicit_fields
+        legacy_is_explicit = legacy_field in explicit_fields
 
-class ConnectionConfig(BaseModel):
-    """
-    Connection configuration.
+        new_value = values.get(new_field)
+        legacy_value = values.get(legacy_field)
 
-    Attributes:
-        host (str): Hostname or IP address.
-        port (int): Port number (default: 22).
-        credentials (Credentials): Authentication credentials.
-        network_type (NetworkType): Network type (IPv4/IPv6).
-        timeout (int): Connection timeout in seconds.
-    """
+        if new_field in values and legacy_field not in values:
+            values[legacy_field] = new_value
+        if legacy_field in values and new_field not in values:
+            values[new_field] = legacy_value
 
-    host: str
-    port: int = 22
-    credentials: Credentials
-    network_type: NetworkType = NetworkType.IPV4
-    timeout: int = 30
+        if new_is_explicit and new_value is not None and new_value != "":
+            values[legacy_field] = new_value
+        elif legacy_is_explicit and legacy_value is not None and legacy_value != "":
+            values[new_field] = legacy_value
+
+    return values
 
 
 class DUTConfig(BaseModel):
@@ -155,7 +252,7 @@ class DUTConfig(BaseModel):
     host_ip: Optional[str] = None
     host_user: Optional[str] = None
     host_pass: Optional[str] = None
-    host_ssh_port: Optional[str] = None
+    host_ssh_port: Optional[int] = None
     host_ssh_key_path: Optional[str] = None
     host_ssh_passwordless: bool = False
     host_ssh_max_retries: int = 3
@@ -172,9 +269,13 @@ class DUTConfig(BaseModel):
     hmc_ssh_max_retries: int = 3
     hmc_http_port: Optional[int] = 80
     hmc_https_port: Optional[int] = 443
-    hmc_use_https: bool = True
-    hmc_use_port_forwarding: bool = False
+    hmc_use_https: bool = False
     hmc_access_method: Optional[str] = None
+    # Port forwarding configuration
+    use_port_forwarding: bool = False
+    setup_port_forwarding: bool = False
+    force_port_fw: bool = False
+    tunnel_tcp_port: Optional[Union[int, str]] = None
 
     # SSH Proxy Configuration
     ssh_proxy_host: Optional[str] = None
@@ -202,6 +303,11 @@ class DUTConfig(BaseModel):
     CHASSIS_ID_TO_SKIP: List[str] = Field(default_factory=list)
     MANAGER_ID_TO_SKIP: List[str] = Field(default_factory=list)
 
+    # Entity ID Overrides — bypasses dynamic discovery and uses these values directly
+    SYSTEM_ID_OVERRIDE: List[str] = Field(default_factory=list)
+    MANAGER_ID_OVERRIDE: List[str] = Field(default_factory=list)
+    CHASSIS_ID_OVERRIDE: List[str] = Field(default_factory=list)
+
     # Expand Query Fields
     EXPAND_QUERY_CHASSIS_LEVEL: int = 1
     EXPAND_QUERY_FIRMWARE_INVENTORY_LEVEL: int = 1
@@ -218,6 +324,11 @@ class DUTConfig(BaseModel):
 
     # Directory Fields
     BMC_TEMP_DIR: str = "/tmp"
+    TASK_ID_PREFIX: str = ""
+    TOOL_TEMP_DIR: str = "/tmp"
+
+    # I2C Configuration
+    i2c_config: Dict[str, Any] = Field(default_factory=dict)
 
     # Firmware Inventory Configuration
     FW_INVENTORY_TABLE_PROPERTIES: List[str] = Field(default_factory=list)
@@ -229,7 +340,7 @@ class DUTConfig(BaseModel):
     NVLINK_OOB_URI: List[str] = Field(default_factory=list)
 
     # Custom Dump Services Configuration
-    CUSTOM_DUMP_SERVICES: List[str] = Field(default_factory=list)
+    CUSTOM_DUMP_SERVICES: List[Dict[str, Any]] = Field(default_factory=list)
 
     # Post Codes URI Configuration
     POST_CODES_URI: List[str] = Field(default_factory=list)
@@ -245,9 +356,13 @@ class DUTConfig(BaseModel):
     BMC_SSH_PASSWORDLESS: Optional[bool] = False
     BMC_SSH_MAX_RETRIES: Optional[int] = 3
     BMC_RF_PORT: Optional[int] = None  # Will be set to 443 in validator
+    BMC_USE_HTTPS: Optional[bool] = None
     RF_User: Optional[str] = None  # Will fall back to BMC_USERNAME in validator
     RF_Pass: Optional[str] = None  # Will fall back to BMC_PASSWORD in validator
     RF_DEFAULT_PREFIX: str = "/redfish/v1"
+    RF_HMC_DEFAULT_PREFIX: Optional[str] = (
+        None  # HMC-specific prefix for HGX_* resource URIs (arm64 aggregation). Overrides RF_DEFAULT_PREFIX for HMC collectors only.
+    )
     RF_AUTH: bool = True
     RF_HMC_ACCESS_METHOD: Optional[str] = (
         None  # Will be set to NOTAPPLICABLE in validator
@@ -309,64 +424,20 @@ class DUTConfig(BaseModel):
             Any: Validated and converted configuration values.
         """
         if isinstance(values, dict):
-            # Map new fields to legacy fields for backward compatibility
-            field_mappings = {
-                # BMC fields
-                "bmc_ip": "BMC_IP",
-                "bmc_user": "BMC_USERNAME",
-                "bmc_pass": "BMC_PASSWORD",
-                "bmc_ssh_user": "BMC_SSH_USERNAME",
-                "bmc_ssh_pass": "BMC_SSH_PASSWORD",
-                "bmc_ssh_port": "BMC_SSH_PORT",
-                "bmc_ssh_key_path": "BMC_SSH_KEY_PATH",
-                "bmc_ssh_passwordless": "BMC_SSH_PASSWORDLESS",
-                "bmc_ssh_max_retries": "BMC_SSH_MAX_RETRIES",
-                "bmc_rf_user": "RF_User",
-                "bmc_rf_pass": "RF_Pass",
-                "bmc_rf_port": "BMC_RF_PORT",
-                # Host fields
-                "host_ip": "HOST_IP",
-                "host_user": "HOST_USERNAME",
-                "host_pass": "HOST_PASSWORD",
-                "host_ssh_port": "HOST_SSH_PORT",
-                "host_ssh_key_path": "HOST_SSH_KEY_PATH",
-                "host_ssh_passwordless": "HOST_SSH_PASSWORDLESS",
-                "host_ssh_max_retries": "HOST_SSH_MAX_RETRIES",
-                # HMC fields
-                "hmc_ip": "HMC_IP",
-                "hmc_user": "HMC_USERNAME",
-                "hmc_pass": "HMC_PASSWORD",
-                "hmc_ssh_user": "HMC_SSH_USERNAME",
-                "hmc_ssh_pass": "HMC_SSH_PASSWORD",
-                "hmc_ssh_port": "HMC_SSH_PORT",
-                "hmc_ssh_key_path": "HMC_SSH_KEY_PATH",
-                "hmc_ssh_passwordless": "HMC_SSH_PASSWORDLESS",
-                "hmc_ssh_max_retries": "HMC_SSH_MAX_RETRIES",
-                "hmc_http_port": "HMC_HTTP_PORT",
-                "hmc_https_port": "HMC_HTTPS_PORT",
-                "hmc_use_https": "HMC_USE_HTTPS",
-                "hmc_use_port_forwarding": "USE_PORT_FORWARDING",
-                "use_port_forwarding": "USE_PORT_FORWARDING",
-                "hmc_access_method": "RF_HMC_ACCESS_METHOD",
-                # SSH Proxy fields
-                "ssh_proxy_host": "SSH_PROXY_HOST",
-                "ssh_proxy_port": "SSH_PROXY_PORT",
-                "ssh_proxy_user": "SSH_PROXY_USERNAME",
-                "ssh_proxy_pass": "SSH_PROXY_PASSWORD",
-                "ssh_proxy_key_path": "SSH_PROXY_KEY_PATH",
-                "ssh_proxy_passwordless": "SSH_PROXY_PASSWORDLESS",
-                "ssh_proxy_max_retries": "SSH_PROXY_MAX_RETRIES",
-            }
+            explicit_fields = set(values.keys())
 
-            # Copy new fields to legacy fields if legacy fields don't exist
-            for new_field, legacy_field in field_mappings.items():
-                if new_field in values and legacy_field not in values:
-                    values[legacy_field] = values[new_field]
+            # Sync legacy/new fields (new fields take precedence when explicit)
+            sync_legacy_fields(values, explicit_fields=explicit_fields)
+            _validate_ip_network_fields(values)
 
-            # Copy legacy fields to new fields if new fields don't exist
-            for new_field, legacy_field in field_mappings.items():
-                if legacy_field in values and new_field not in values:
-                    values[new_field] = values[legacy_field]
+            if values.get("local") is True:
+                values["ExecutionMode"] = ExecutionMode.LOCAL.value
+            elif (
+                isinstance(values.get("ExecutionMode"), str)
+                and values["ExecutionMode"].strip().lower()
+                == ExecutionMode.LOCAL.value.lower()
+            ):
+                values["local"] = True
 
             # Handle credential fallbacks (matching legacy dut.py behavior)
             # Replace RF credentials with BMC credentials if not provided
@@ -391,12 +462,62 @@ class DUTConfig(BaseModel):
             if values.get("BMC_RF_PORT") is None:
                 values["BMC_RF_PORT"] = 443
 
-            # Set HMC TCP port based on protocol
-            if values.get("HMC_TCP_PORT") is None:
-                if values.get("HMC_RF_PROTOCOL") == "http":
-                    values["HMC_TCP_PORT"] = 80
+            # Normalize legacy HMC Redfish protocol/TCP port fields into the
+            # newer HMC_HTTP_PORT/HMC_HTTPS_PORT/HMC_USE_HTTPS fields consumed
+            # by HMCService.
+            hmc_protocol_explicit = "HMC_RF_PROTOCOL" in explicit_fields
+            hmc_use_https_explicit = (
+                "HMC_USE_HTTPS" in explicit_fields or "hmc_use_https" in explicit_fields
+            )
+            hmc_tcp_port_explicit = (
+                "HMC_TCP_PORT" in explicit_fields
+                and values.get("HMC_TCP_PORT") not in (None, "")
+            )
+            hmc_http_port_explicit = (
+                "HMC_HTTP_PORT" in explicit_fields or "hmc_http_port" in explicit_fields
+            ) and (values.get("HMC_HTTP_PORT") not in (None, ""))
+            hmc_https_port_explicit = (
+                "HMC_HTTPS_PORT" in explicit_fields
+                or "hmc_https_port" in explicit_fields
+            ) and (values.get("HMC_HTTPS_PORT") not in (None, ""))
+
+            hmc_protocol = values.get("HMC_RF_PROTOCOL")
+            if not hmc_protocol_explicit and (
+                values.get("HMC_USE_HTTPS") or values.get("hmc_use_https")
+            ):
+                hmc_protocol = "https"
+            if hmc_protocol in (None, ""):
+                hmc_protocol = "http"
+            hmc_protocol = str(hmc_protocol).strip().lower()
+            values["HMC_RF_PROTOCOL"] = hmc_protocol
+
+            if values.get("HMC_TCP_PORT") in (None, ""):
+                if hmc_protocol == "https" and hmc_https_port_explicit:
+                    values["HMC_TCP_PORT"] = values["HMC_HTTPS_PORT"]
+                elif hmc_protocol == "http" and hmc_http_port_explicit:
+                    values["HMC_TCP_PORT"] = values["HMC_HTTP_PORT"]
                 else:
-                    values["HMC_TCP_PORT"] = 443
+                    values["HMC_TCP_PORT"] = 443 if hmc_protocol == "https" else 80
+
+            try:
+                hmc_tcp_port = int(values["HMC_TCP_PORT"])
+            except (TypeError, ValueError):
+                hmc_tcp_port = values["HMC_TCP_PORT"]
+
+            if hmc_protocol == "https":
+                if hmc_tcp_port_explicit or values.get("HMC_HTTPS_PORT") in (None, ""):
+                    values["HMC_HTTPS_PORT"] = hmc_tcp_port
+                    values["hmc_https_port"] = hmc_tcp_port
+                if not hmc_use_https_explicit:
+                    values["HMC_USE_HTTPS"] = True
+                    values["hmc_use_https"] = True
+            else:
+                if hmc_tcp_port_explicit or values.get("HMC_HTTP_PORT") in (None, ""):
+                    values["HMC_HTTP_PORT"] = hmc_tcp_port
+                    values["hmc_http_port"] = hmc_tcp_port
+                if not hmc_use_https_explicit:
+                    values["HMC_USE_HTTPS"] = False
+                    values["hmc_use_https"] = False
 
             # Set RF_HMC_ACCESS_METHOD to NOTAPPLICABLE if not provided
             if not values.get("RF_HMC_ACCESS_METHOD"):
@@ -439,49 +560,6 @@ class DUTConfig(BaseModel):
         return values
 
 
-class CollectorConfig(BaseModel):
-    """
-    Collector configuration.
-
-    Attributes:
-        id (str): Collector unique identifier.
-        name (str): Collector display name.
-        group (str): Collector group name.
-        enabled (bool): Whether collector is enabled.
-        priority (int): Collection priority.
-        workflow_type (str): Workflow type.
-        action_type (str): Action type for collection.
-        parser_type (str): Parser type for output.
-        output_format (str): Output format.
-        collection_level (CollectionLevel): Collection level (L1/L2/L3).
-        timeout (int): Timeout in seconds.
-        retry_count (int): Number of retry attempts.
-    """
-
-    id: str
-    name: str
-    group: str
-    enabled: bool = True
-    priority: int = 1
-    workflow_type: str = "simple"
-    action_type: str
-    parser_type: str
-    output_format: str = "json"
-    collection_level: CollectionLevel = CollectionLevel.L1
-    timeout: int = 300
-    retry_count: int = 3
-    tags: Dict[str, Any] = Field(default_factory=dict)
-    dependencies: Dict[str, Any] = Field(default_factory=dict)
-    description: str = ""
-    action_uri: str = ""
-    action_payload: Dict[str, Any] = Field(default_factory=dict)
-    parser_config: Dict[str, Any] = Field(default_factory=dict)
-    platform_config: Dict[str, Any] = Field(default_factory=dict)
-
-    # Dynamic baseboard applicability - will be populated from spreadsheet
-    applicable_baseboards: Dict[str, bool] = Field(default_factory=dict)
-
-
 class OutputConfig(BaseModel):
     """
     Output configuration.
@@ -498,7 +576,7 @@ class OutputConfig(BaseModel):
 
     directory: Path = Path("/tmp/nvdebug")
     create_zip: bool = True
-    create_split_zip: bool = False
+    create_split_zip: bool = True
     zip_split_threshold: float = 200.0  # MB
     generate_html: bool = True
     generate_json: bool = True
@@ -525,25 +603,6 @@ class OutputConfig(BaseModel):
         self.directory = Path(value)
 
 
-class LoggingConfig(BaseModel):
-    """
-    Logging configuration.
-
-    Attributes:
-        level (str): Logging level.
-        file (Optional[Path]): Logging file path.
-        format (str): Logging format.
-        max_size (int): Maximum size of logging file in bytes.
-        backup_count (int): Number of backup files to keep.
-    """
-
-    level: str = "INFO"
-    file: Optional[Path] = None
-    format: str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    max_size: int = 10 * 1024 * 1024  # 10MB
-    backup_count: int = 5
-
-
 class RedfishSessionConfig(BaseModel):
     """
     Redfish session configuration for connection pooling and timeouts.
@@ -553,7 +612,7 @@ class RedfishSessionConfig(BaseModel):
         connection_pool_limit_per_host (int): Connection pool limit per host.
         session_timeout (int): Session timeout in seconds.
         keepalive_timeout (int): Keepalive timeout in seconds.
-        ssl (bool): SSL verification.
+        ssl_verify (bool): SSL certificate verification (False for BMC self-signed certs).
         ttl_dns_cache (int): TTL DNS cache in seconds.
         use_dns_cache (bool): Use DNS cache.
         force_close (bool): Force close.
@@ -569,7 +628,18 @@ class RedfishSessionConfig(BaseModel):
     keepalive_timeout: int = 300  # 5 minutes
 
     # TCP Connector settings
-    ssl: bool = False  # Disable SSL verification for BMC self-signed certs
+    ssl_verify: bool = (
+        False  # SSL certificate verification (False for BMC self-signed certs)
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_ssl_field(cls, values):
+        """Backward compat: map old 'ssl' field to ssl_verify."""
+        if isinstance(values, dict) and "ssl" in values and "ssl_verify" not in values:
+            values["ssl_verify"] = values.pop("ssl")
+        return values
+
     ttl_dns_cache: int = 300  # DNS cache TTL in seconds
     use_dns_cache: bool = True  # Enable DNS caching
     force_close: bool = False  # Keep connections alive
@@ -578,6 +648,7 @@ class RedfishSessionConfig(BaseModel):
     # Fallback session settings (more conservative)
     fallback_connection_pool_limit: int = 15
     fallback_connection_pool_limit_per_host: int = 6
+    handle_session_conflicts: bool = True
 
 
 class PreflightConfig(BaseModel):
@@ -608,9 +679,9 @@ class Config(BaseSettings):
         execution_mode (ExecutionMode): Execution mode.
         auto_parse (bool): Auto parse.
         duts (List[DUTConfig]): DUT configurations.
-        collectors (List[CollectorConfig]): Collector configurations.
+        collectors (List[Dict]): Collector configurations.
         output (OutputConfig): Output configuration.
-        logging (LoggingConfig): Logging configuration.
+        logging (Dict): Logging configuration.
         redfish_session_config (RedfishSessionConfig): Redfish session configuration.
         preflight_config (PreflightConfig): Preflight credential validation configuration.
     """
@@ -633,13 +704,13 @@ class Config(BaseSettings):
     duts: List[DUTConfig] = Field(default_factory=list)
 
     # Collector configurations
-    collectors: List[CollectorConfig] = Field(default_factory=list)
+    collectors: List[Dict[str, Any]] = Field(default_factory=list)
 
     # Output configuration
     output: OutputConfig = Field(default_factory=OutputConfig)
 
     # Logging configuration
-    logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    logging: Dict[str, Any] = Field(default_factory=dict)
 
     # Redfish session configuration
     redfish_session_config: RedfishSessionConfig = Field(
@@ -666,7 +737,7 @@ class Config(BaseSettings):
     NVLINK_OOB_URI: List[str] = Field(default_factory=list)
 
     # Custom Dump Services Configuration
-    CUSTOM_DUMP_SERVICES: List[str] = Field(default_factory=list)
+    CUSTOM_DUMP_SERVICES: List[Dict[str, Any]] = Field(default_factory=list)
 
     # Post Codes URI Configuration
     POST_CODES_URI: List[str] = Field(default_factory=list)
@@ -681,7 +752,7 @@ class Config(BaseSettings):
     skip_collectors: List[str] = Field(default_factory=list)
     include_collectors: List[str] = Field(default_factory=list)
 
-    # Skip Flags
+    # Legacy Skip Flags (from legacy NVDebug)
     SKIP_PORT_FW: bool = False
     SKIP_BMC_SSH_LOGS: bool = True
     SKIP_HOST_LOGS: bool = False
@@ -746,6 +817,7 @@ class Config(BaseSettings):
     retry_count: int = 3
 
     # Parallelization configuration
+    execution_scheduler: str = "per_dut"
     PARALLEL_DUT_SEQUENTIAL_COLLECTORS: bool = True
     SERVICE_GROUPED_SEQUENTIAL_COLLECTORS: bool = True
 
@@ -793,6 +865,16 @@ class Config(BaseSettings):
             Any: Validated values.
         """
         if isinstance(values, dict):
+            scheduler = (
+                str(values.get("execution_scheduler", "per_dut")).strip().lower()
+            )
+            if scheduler not in {"per_dut", "legacy_global"}:
+                raise ValueError(
+                    "Invalid execution_scheduler value "
+                    f"{scheduler!r}; expected 'per_dut' or 'legacy_global'"
+                )
+            values["execution_scheduler"] = scheduler
+
             # Baseboard mapping - handle precedence: baseboard > TargetBaseboard
             # If baseboard is not set but TargetBaseboard is, use TargetBaseboard
             if values.get("TargetBaseboard") and not values.get("baseboard"):
@@ -802,9 +884,16 @@ class Config(BaseSettings):
 
             # Output settings
             if values.get("GENERATE_HTML_REPORTS") is not None:
-                if "output" not in values:
-                    values["output"] = {}
-                values["output"]["generate_html"] = values["GENERATE_HTML_REPORTS"]
+                output_setting = values.get("output")
+                if output_setting is None:
+                    values["output"] = {
+                        "generate_html": values["GENERATE_HTML_REPORTS"]
+                    }
+                elif isinstance(output_setting, dict):
+                    output_setting["generate_html"] = values["GENERATE_HTML_REPORTS"]
+                else:
+                    # Handle already-initialized OutputConfig instances during assignment validation
+                    output_setting.generate_html = values["GENERATE_HTML_REPORTS"]
 
         return values
 
@@ -839,58 +928,6 @@ class Config(BaseSettings):
             raise ValueError(f"Invalid YAML in configuration file: {error_msg}")
         except Exception as e:
             raise ValueError(f"Error loading configuration: {e}")
-
-    def to_file(self, file_path: Union[str, Path]) -> None:
-        """
-        Save configuration to file.
-
-        Args:
-            file_path (Union[str, Path]): Output file path.
-
-        Raises:
-            ValueError: If file cannot be saved.
-        """
-        file_path = Path(file_path)
-
-        try:
-            # Ensure directory exists
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-
-            with open(file_path, "w", encoding="utf-8") as f:
-                yaml.dump(
-                    self.model_dump(),
-                    f,
-                    default_flow_style=False,
-                    sort_keys=False,
-                )
-        except Exception as e:
-            raise ValueError(f"Error saving configuration: {e}")
-
-    @classmethod
-    def create_template(cls) -> "Config":
-        """
-        Create a template configuration.
-
-        Returns:
-            Config: Template configuration object.
-        """
-        return cls(
-            baseboard="compute",  # Will be validated against spreadsheet
-            duts=[
-                DUTConfig(
-                    name="example-dut",
-                    baseboard="compute",
-                    bmc_connection=ConnectionConfig(
-                        host="192.168.1.100",
-                        credentials=Credentials(username="admin"),
-                    ),
-                    host_connection=ConnectionConfig(
-                        host="192.168.1.101",
-                        credentials=Credentials(username="root"),
-                    ),
-                )
-            ],
-        )
 
 
 def load_config(
@@ -963,9 +1000,9 @@ def load_dut_config(
                 )
             elif isinstance(data, list):
                 raise ValueError(
-                    f"Invalid DUT configuration format: The file contains a list but DUT configuration files "
-                    f"must contain YAML mappings (key-value pairs).\n"
-                    f"Please restructure your config file to use dictionary format with DUT definitions."
+                    "Invalid DUT configuration format: The file contains a list but DUT configuration files "
+                    "must contain YAML mappings (key-value pairs).\n"
+                    "Please restructure your config file to use dictionary format with DUT definitions."
                 )
             else:
                 raise ValueError(
@@ -990,8 +1027,57 @@ def load_dut_config(
             duts = []
             for name, dut_data in data.items():
                 if name != "DUT_Defaults":
-                    # Merge defaults with individual DUT data (DUT data takes precedence)
+                    if dut_data is None:
+                        dut_data = {}
+                    if not isinstance(dut_data, dict):
+                        raise ValueError(
+                            f"Invalid DUT configuration for '{name}': expected a YAML mapping"
+                        )
+
+                    # Merge defaults with individual DUT data first so
+                    # ConfigFileToUse can be inherited from DUT_Defaults.
                     merged_data = {**defaults, **dut_data}
+
+                    config_file_path = merged_data.get("ConfigFileToUse")
+                    if config_file_path:
+                        resolved_config_file = Path(str(config_file_path))
+                        if not resolved_config_file.is_absolute():
+                            resolved_config_file = file_path.parent / resolved_config_file
+                        resolved_config_file = resolved_config_file.resolve()
+
+                        try:
+                            if resolved_config_file.exists():
+                                with open(
+                                    resolved_config_file, "r", encoding="utf-8"
+                                ) as f:
+                                    config_data = yaml.safe_load(f) or {}
+
+                                if not isinstance(config_data, dict):
+                                    raise ValueError(
+                                        "referenced config must contain a YAML mapping"
+                                    )
+
+                                # Precedence:
+                                # DUT_Defaults < ConfigFileToUse < direct DUT YAML.
+                                merged_data = {**defaults, **config_data, **dut_data}
+                                merged_data["ConfigFileToUse"] = str(
+                                    resolved_config_file
+                                )
+                            else:
+                                if not quiet_mode:
+                                    print(
+                                        _sanitize_print_message(
+                                            f"Warning: ConfigFileToUse '{config_file_path}' for DUT '{name}' does not exist"
+                                        )
+                                    )
+                        except Exception as e:
+                            if not quiet_mode:
+                                print(
+                                    _sanitize_print_message(
+                                        f"Warning: Could not load ConfigFileToUse '{config_file_path}' for DUT '{name}': {e}"
+                                    )
+                                )
+
                     merged_data["name"] = name
 
                     # Use baseboard from defaults if not specified in individual DUT
@@ -1065,55 +1151,6 @@ def load_dut_config(
         raise ValueError(f"Error loading DUT configuration: {e}")
 
 
-def load_dut_config_legacy(file_path: Union[str, Path]) -> Dict[str, Any]:
-    """
-    Load DUT configuration in raw format for backward compatibility.
-
-    This function returns the raw dictionary format.
-
-    In the legacy format:
-    - Baseboard is stored in config.yaml as 'TargetBaseboard', not in DUT config
-    - DUT config only contains connection details (IPs, credentials, etc.)
-    - DUT_Defaults can contain default values for all DUTs
-
-    Args:
-        file_path (Union[str, Path]): Path to DUT configuration file.
-
-    Returns:
-        Dict[str, Any]: Raw dictionary format.
-    """
-    file_path = Path(file_path)
-    if not file_path.exists():
-        raise FileNotFoundError(f"DUT configuration file not found: {file_path}")
-
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            dut_config_data = yaml.safe_load(f)
-    except yaml.YAMLError as e:
-        from .utils.yaml_manager import YAMLManager
-
-        error_msg = YAMLManager._format_yaml_error(e)
-        raise ValueError(f"Invalid YAML in DUT configuration file: {error_msg}")
-    except Exception as e:
-        raise ValueError(f"Error loading DUT configuration: {e}")
-
-    # If there's no data in the dut config file or it couldn't be loaded, initialize with an empty dict
-    if not dut_config_data:
-        dut_config_data = {"DUT": {}}
-
-    # Remove Default DUT if multiple are specified (legacy behavior)
-    if len(dut_config_data) >= 2:
-        dut_config_data.pop("DUT_Defaults", None)
-        if len(dut_config_data) >= 2:
-            print(
-                _sanitize_print_message("Multiple DUTs found. Ignoring CLI DUT details")
-            )
-    elif len(dut_config_data) == 0:
-        dut_config_data["DUT"] = {}
-
-    return dut_config_data
-
-
 def get_available_baseboards(spreadsheet_path: Union[str, Path]) -> List[str]:
     """
     Get available baseboards from the collector spreadsheet (Excel only).
@@ -1136,7 +1173,9 @@ def get_available_baseboards(spreadsheet_path: Union[str, Path]) -> List[str]:
             )
 
         # Read from the Log Collection Catalog sheet
-        df = pd.read_excel(spreadsheet_path, sheet_name="Log Collection Catalog")
+        df = excel_reader.read_excel(
+            spreadsheet_path, sheet_name="Log Collection Catalog"
+        )
 
         # Find columns that start with various applicable prefixes
         baseboard_columns = []
@@ -1194,300 +1233,6 @@ def validate_baseboard(baseboard: str, spreadsheet_path: Union[str, Path]) -> bo
         return baseboard.lower() in [b.lower() for b in available_baseboards]
     except Exception:
         return False
-
-
-def load_collectors_from_spreadsheet(
-    spreadsheet_path: Union[str, Path],
-) -> List[CollectorConfig]:
-    """
-    Load collector configurations from spreadsheet (Excel only).
-
-    Args:
-        spreadsheet_path (Union[str, Path]): Path to spreadsheet file.
-
-    Returns:
-        List[CollectorConfig]: List of collector configuration objects.
-
-    Raises:
-        ValueError: If file format is not supported or cannot be read.
-    """
-    try:
-        spreadsheet_path = Path(spreadsheet_path)
-
-        if spreadsheet_path.suffix.lower() not in [".xlsx", ".xls"]:
-            raise ValueError(
-                f"Only Excel files (.xlsx, .xls) are supported, got: {spreadsheet_path.suffix}"
-            )
-
-        # Read from the Log Collection Catalog sheet
-        df = pd.read_excel(spreadsheet_path, sheet_name="Log Collection Catalog")
-
-        collectors = []
-        for _, row in df.iterrows():
-            try:
-                collector = CollectorConfig(
-                    id=row.get("ID", ""),
-                    name=row.get("Collector Name", ""),
-                    group=row.get("Collection Group", ""),
-                    action_type=row.get("Action Type", ""),
-                    parser_type=row.get("Parser Type", ""),
-                    description=row.get("Description", ""),
-                    action_uri=row.get("action_uri", ""),
-                    enabled=row.get("Enabled", True),
-                    priority=row.get("priority", 1),
-                    timeout=row.get("Timeout", 300),
-                    retry_count=row.get("Retry Count", 3),
-                    collection_level=CollectionLevel(row.get("Collection Level", "L1")),
-                )
-                collectors.append(collector)
-            except Exception as e:
-                # Skip invalid collector configurations
-                continue
-
-        return collectors
-    except Exception as e:
-        raise ValueError(f"Error reading collectors from spreadsheet: {e}")
-
-
-def get_collector_applicability_from_spreadsheet(
-    spreadsheet_path: Union[str, Path], collector_id: str, baseboard: str
-) -> bool:
-    """
-    Get collector applicability for a specific baseboard from spreadsheet.
-
-    Args:
-        spreadsheet_path (Union[str, Path]): Path to spreadsheet file.
-        collector_id (str): Collector ID to check.
-        baseboard (str): Baseboard name.
-
-    Returns:
-        bool: True if collector is applicable for baseboard.
-
-    Raises:
-        ValueError: If spreadsheet cannot be read.
-    """
-    try:
-        spreadsheet_path = Path(spreadsheet_path)
-
-        if spreadsheet_path.suffix.lower() not in [".xlsx", ".xls"]:
-            raise ValueError(
-                f"Only Excel files (.xlsx, .xls) are supported, got: {spreadsheet_path.suffix}"
-            )
-
-        # Read from the Log Collection Catalog sheet
-        df = pd.read_excel(spreadsheet_path, sheet_name="Log Collection Catalog")
-
-        # Find the collector row
-        collector_row = df[df["ID"] == collector_id]
-        if collector_row.empty:
-            return False
-
-        # Try different column name formats
-        possible_columns = [
-            f"Applicable for {baseboard}",
-            f"Available for {baseboard}",
-            f"applicable_for_{baseboard}",
-            f"available_for_{baseboard}",
-        ]
-
-        # Find the first column that exists
-        column_name = None
-        for col in possible_columns:
-            if col in collector_row.columns:
-                column_name = col
-                break
-
-        if column_name is None:
-            return False
-
-        # Get the value and check applicability
-        cell_value = collector_row.iloc[0][column_name]
-        return _is_applicable_value(cell_value)
-
-    except Exception as e:
-        raise ValueError(f"Error reading collector applicability from spreadsheet: {e}")
-
-
-def get_all_collector_applicability_from_spreadsheet(
-    spreadsheet_path: Union[str, Path],
-) -> Dict[str, Dict[str, bool]]:
-    """
-    Get all collector applicability from spreadsheet.
-
-    Args:
-        spreadsheet_path (Union[str, Path]): Path to spreadsheet file.
-
-    Returns:
-        Dict[str, Dict[str, bool]]: Nested dict mapping collector_id -> baseboard -> applicable.
-
-    Raises:
-        ValueError: If spreadsheet cannot be read.
-    """
-    try:
-        spreadsheet_path = Path(spreadsheet_path)
-
-        if spreadsheet_path.suffix.lower() not in [".xlsx", ".xls"]:
-            raise ValueError(
-                f"Only Excel files (.xlsx, .xls) are supported, got: {spreadsheet_path.suffix}"
-            )
-
-        # Read from the Log Collection Catalog sheet
-        df = pd.read_excel(spreadsheet_path, sheet_name="Log Collection Catalog")
-
-        # Find all applicable columns with various formats
-        applicable_columns = []
-        for col in df.columns:
-            if any(
-                col.startswith(prefix)
-                for prefix in [
-                    "Applicable for",
-                    "Available for",
-                    "applicable_for_",
-                    "available_for_",
-                ]
-            ):
-                applicable_columns.append(col)
-
-        # Extract baseboard names from column names
-        baseboards = []
-        for col in applicable_columns:
-            # Remove various prefixes
-            baseboard_name = col
-            for prefix in [
-                "Applicable for",
-                "Available for",
-                "applicable_for_",
-                "available_for_",
-            ]:
-                if col.startswith(prefix):
-                    baseboard_name = col.replace(prefix, "").strip().strip("\n")
-                    break
-            baseboards.append(baseboard_name)
-
-        # Build applicability dictionary
-        applicability = {}
-        for _, row in df.iterrows():
-            collector_id = row.get("ID", "")
-            if not collector_id:
-                continue
-
-            applicability[collector_id] = {}
-            for col in applicable_columns:
-                # Extract baseboard name
-                baseboard_name = col
-                for prefix in [
-                    "Applicable for",
-                    "Available for",
-                    "applicable_for_",
-                    "available_for_",
-                ]:
-                    if col.startswith(prefix):
-                        baseboard_name = col.replace(prefix, "").strip().strip("\n")
-                        break
-
-                # Get value and check applicability
-                cell_value = row.get(col, "N/A")
-                applicability[collector_id][baseboard_name] = _is_applicable_value(
-                    cell_value
-                )
-
-        return applicability
-
-    except Exception as e:
-        raise ValueError(
-            f"Error reading all collector applicability from spreadsheet: {e}"
-        )
-
-
-def _normalize_column_name(column_name: str) -> str:
-    """
-    Normalize column name to standard format.
-
-    Args:
-        column_name (str): Column name to normalize.
-
-    Returns:
-        str: Normalized column name in format "Applicable for {baseboard}".
-    """
-    # Remove common variations and normalize to "Applicable for {baseboard}"
-    for prefix in ["applicable_for_", "available_for_", "Available for"]:
-        if column_name.startswith(prefix):
-            baseboard = column_name.replace(prefix, "").strip().strip("\n")
-            return f"Applicable for {baseboard}"
-
-    # If it already starts with "Applicable for", return as is
-    if column_name.startswith("Applicable for"):
-        return column_name
-
-    return column_name
-
-
-def _normalize_applicability_value(value) -> str:
-    """
-    Normalize applicability value to 'Yes' or 'N/A'.
-
-    Args:
-        value: Value to normalize (bool, str, or None).
-
-    Returns:
-        str: Normalized value ('Yes' or 'N/A').
-    """
-    if isinstance(value, bool):
-        return "Yes" if value else "N/A"
-    elif isinstance(value, str):
-        value = value.strip().lower()
-        if value in ["yes", "true", "1", "y", "applicable", "available"]:
-            return "Yes"
-        else:
-            return "N/A"
-    elif value is None:
-        return "N/A"
-    else:
-        # Handle pandas NaN values
-        try:
-            if pd.isna(value):
-                return "N/A"
-        except (ImportError, NameError):
-            # If pandas is not available, just check for None
-            pass
-
-        # Try to convert to string and check
-        value = str(value).strip().lower()
-        if value in ["yes", "true", "1", "y", "applicable", "available"]:
-            return "Yes"
-        else:
-            return "N/A"
-
-
-def _is_applicable_value(value) -> bool:
-    """
-    Check if a value indicates applicability.
-
-    Args:
-        value: Value to check (bool, str, or None).
-
-    Returns:
-        bool: True if value indicates applicability.
-    """
-    if isinstance(value, bool):
-        return value
-    elif isinstance(value, str):
-        value = value.strip().lower()
-        return value in ["yes", "true", "1", "y", "applicable", "available"]
-    elif value is None:
-        return False
-    else:
-        # Handle pandas NaN values
-        try:
-            if pd.isna(value):
-                return False
-        except (ImportError, NameError):
-            # If pandas is not available, just check for None
-            pass
-
-        # Try to convert to string and check
-        value = str(value).strip().lower()
-        return value in ["yes", "true", "1", "y", "applicable", "available"]
 
 
 def auto_assign_config_file_to_use(
@@ -1582,6 +1327,8 @@ def auto_assign_config_file_to_use(
                 temp_fd, temp_path = tempfile.mkstemp(
                     prefix="dut_config_", suffix=".yaml", text=True
                 )
+                # Restrict permissions immediately for credential-containing file
+                os.chmod(temp_path, 0o600)
                 temp_file = Path(temp_path)
 
                 # Write the modified config to the temp file

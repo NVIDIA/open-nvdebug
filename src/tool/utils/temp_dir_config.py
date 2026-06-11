@@ -15,16 +15,73 @@
 # limitations under the License.
 
 """
-Temporary directory configuration utilities for open-nvdebugtool.
+Temporary directory management for open-nvdebugtool.
 
-This module provides utilities for handling temporary directory configuration
-and creation based on tool and DUT configuration.
+Provides:
+- TempManager: Centralized temp dir creation, tracking, and cleanup
+- get_tool_temp_dir(): Legacy helper (kept for backward compatibility)
 """
 
 import os
-import tempfile
+import secrets
+import shutil
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional
+
+
+class TempManager:
+    """
+    Single source of truth for all temporary directory operations.
+
+    Creates temp dirs with restricted permissions (0o700), tracks them
+    for cleanup, and provides standardized remote temp path generation.
+
+    Usage:
+        with TempManager(base_dir=Path("/tmp")) as mgr:
+            local_dir = mgr.create_temp_dir("transfer")
+            remote_path = mgr.get_remote_temp_path("collection")
+        # All local temp dirs cleaned up automatically
+    """
+
+    def __init__(self, base_dir: Path, tool_name: str = "nvdebug"):
+        self.base_dir = Path(base_dir)
+        self.tool_name = tool_name
+        self._tracked_dirs: List[Path] = []
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.base_dir, 0o700)
+
+    @property
+    def tracked_dirs(self) -> List[Path]:
+        return list(self._tracked_dirs)
+
+    def create_temp_dir(self, purpose: str, permissions: int = 0o700) -> Path:
+        """Create a tracked temporary directory with the given purpose label."""
+        suffix = secrets.token_hex(4)
+        dir_name = f"{self.tool_name}_{purpose}_{suffix}"
+        temp_dir = self.base_dir / dir_name
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(temp_dir, permissions)
+        self._tracked_dirs.append(temp_dir)
+        return temp_dir
+
+    def get_remote_temp_path(self, purpose: str, remote_temp_dir: str = "/tmp") -> str:
+        """Generate a unique remote temp path string (does not create locally)."""
+        suffix = secrets.token_hex(4)
+        return f"{remote_temp_dir}/{self.tool_name}_{purpose}_{suffix}"
+
+    def cleanup(self) -> None:
+        """Remove all tracked temporary directories."""
+        for d in self._tracked_dirs:
+            if d.exists():
+                shutil.rmtree(d, ignore_errors=True)
+        self._tracked_dirs.clear()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.cleanup()
+        return False
 
 
 def get_tool_temp_dir(
@@ -48,173 +105,3 @@ def get_tool_temp_dir(
         return tool_temp_dir
 
     return default_temp_dir
-
-
-def get_bmc_temp_dir(dut_config: Dict[str, Any], default_temp_dir: str = "/tmp") -> str:
-    """
-    Get the BMC temporary directory from DUT configuration.
-
-    Args:
-        dut_config: DUT configuration dictionary
-        default_temp_dir: Default temporary directory if not configured
-
-    Returns:
-        str: The BMC temporary directory path
-    """
-    if not dut_config:
-        return default_temp_dir
-
-    bmc_temp_dir = dut_config.get("BMC_TEMP_DIR")
-    if bmc_temp_dir and isinstance(bmc_temp_dir, str):
-        return bmc_temp_dir
-
-    return default_temp_dir
-
-
-def create_temp_directory(
-    base_dir: str,
-    prefix: str = "nvdebug_",
-    suffix: str = "",
-    create_parents: bool = True,
-) -> str:
-    """
-    Create a temporary directory with the specified configuration.
-
-    Args:
-        base_dir: Base directory for temporary directory creation
-        prefix: Prefix for the temporary directory name
-        suffix: Suffix for the temporary directory name
-        create_parents: Whether to create parent directories if they don't exist
-
-    Returns:
-        str: Path to the created temporary directory
-
-    Raises:
-        OSError: If directory creation fails
-    """
-    # Ensure base directory exists
-    base_path = Path(base_dir)
-    if create_parents:
-        base_path.mkdir(parents=True, exist_ok=True)
-    elif not base_path.exists():
-        raise OSError(f"Base directory does not exist: {base_dir}")
-
-    # Create temporary directory
-    temp_dir = tempfile.mkdtemp(prefix=prefix, suffix=suffix, dir=str(base_path))
-
-    return temp_dir
-
-
-def get_task_id_prefix(tool_config: Dict[str, Any], default_prefix: str = "") -> str:
-    """
-    Get the task ID prefix from tool configuration.
-
-    Args:
-        tool_config: Tool configuration dictionary
-        default_prefix: Default prefix if not configured
-
-    Returns:
-        str: The task ID prefix
-    """
-    if not tool_config:
-        return default_prefix
-
-    task_prefix = tool_config.get("TASK_ID_PREFIX")
-    if task_prefix and isinstance(task_prefix, str):
-        return task_prefix
-
-    return default_prefix
-
-
-def create_task_temp_dir(
-    tool_config: Dict[str, Any],
-    task_id: Optional[str] = None,
-    prefix: str = "nvdebug_",
-    suffix: str = "",
-) -> str:
-    """
-    Create a temporary directory for a specific task.
-
-    Args:
-        tool_config: Tool configuration dictionary
-        task_id: Optional task ID to include in directory name
-        prefix: Prefix for the temporary directory name
-        suffix: Suffix for the temporary directory name
-
-    Returns:
-        str: Path to the created temporary directory
-    """
-    # Get tool temp directory
-    tool_temp_dir = get_tool_temp_dir(tool_config)
-
-    # Get task ID prefix
-    task_prefix = get_task_id_prefix(tool_config)
-
-    # Build directory name
-    dir_name = prefix
-    if task_prefix:
-        dir_name += f"{task_prefix}_"
-    if task_id:
-        dir_name += f"{task_id}_"
-    dir_name += suffix if suffix else "temp"
-
-    # Create temporary directory
-    return create_temp_directory(
-        base_dir=tool_temp_dir, prefix=dir_name, create_parents=True
-    )
-
-
-def cleanup_temp_directory(temp_dir: str, logger=None) -> bool:
-    """
-    Clean up a temporary directory.
-
-    Args:
-        temp_dir: Path to the temporary directory to clean up
-        logger: Optional logger for error reporting
-
-    Returns:
-        bool: True if cleanup was successful, False otherwise
-    """
-    try:
-        import shutil
-
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
-            if logger:
-                logger.log_runtime(
-                    "DEBUG",
-                    "TempDirConfig",
-                    f"Cleaned up temporary directory: {temp_dir}",
-                )
-            return True
-    except Exception as e:
-        if logger:
-            logger.log_runtime(
-                "WARNING",
-                "TempDirConfig",
-                f"Failed to clean up temporary directory {temp_dir}: {e}",
-            )
-        return False
-
-    return True
-
-
-def get_temp_file_path(
-    base_dir: str, filename: str, create_parents: bool = True
-) -> str:
-    """
-    Get a temporary file path within the specified base directory.
-
-    Args:
-        base_dir: Base directory for the temporary file
-        filename: Name of the temporary file
-        create_parents: Whether to create parent directories if they don't exist
-
-    Returns:
-        str: Full path to the temporary file
-    """
-    base_path = Path(base_dir)
-    if create_parents:
-        base_path.mkdir(parents=True, exist_ok=True)
-
-    return str(base_path / filename)

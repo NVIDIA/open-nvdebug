@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 """
 Cleanup Manager for NVDebug Tool.
 
@@ -20,10 +21,12 @@ Handles directory cleanup, empty directory removal, and zip archive creation
 for collected logs with support for split archives.
 """
 
+from __future__ import annotations
+
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Optional
 
 from ..utils.file_utils import cleanup_empty_directories
 from ..utils.zip_utils import (
@@ -114,6 +117,9 @@ class CleanupManager:
                         f"Failed to discover DUT IDs from log directory: {e}",
                     )
 
+            if dut_ids:
+                dut_ids = sorted(dut_ids)
+
             await self.logger.log_runtime(
                 "DEBUG",
                 "CleanupManager",
@@ -203,7 +209,7 @@ class CleanupManager:
                     await self.logger.log_runtime(
                         "INFO",
                         "CleanupManager",
-                        f"Split zip archive created with {len(zip_result)} files",
+                        f"Split archive created with {len(zip_result)} files",
                     )
                     return zip_result
                 else:

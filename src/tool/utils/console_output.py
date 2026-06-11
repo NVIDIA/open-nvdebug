@@ -23,7 +23,6 @@ with automatic data sanitization.
 from typing import Optional
 
 from rich.console import Console
-from rich.text import Text
 
 from .sanitizer import LogSanitizer
 

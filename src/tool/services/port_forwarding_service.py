@@ -24,6 +24,8 @@ integrating with sps-tools-utils for BMC connectivity through host systems.
 import asyncio
 import logging
 import os
+import re
+import shlex
 import subprocess
 from typing import Any, Dict, Optional, Tuple
 
@@ -52,9 +54,11 @@ class PortForwardingService:
         dut_id: str,
         ssh_server_ip: str,
         ssh_username: str,
-        ssh_password: str,
+        ssh_password: Optional[str],
         destination_server_ip: str,
         ssh_port: int = 22,
+        ssh_key_path: Optional[str] = None,
+        ssh_passwordless: bool = False,
         remote_port: Optional[int] = None,
         local_ports: list = None,
         remote_tcp_protocol: str = "https",
@@ -72,6 +76,8 @@ class PortForwardingService:
             ssh_password: SSH password.
             destination_server_ip: Destination server IP.
             ssh_port: SSH port.
+            ssh_key_path: SSH private key path.
+            ssh_passwordless: Use SSH agent or default key auth without a password.
             remote_port: Remote port.
             local_ports: Local ports.
             remote_tcp_protocol: Remote TCP protocol.
@@ -88,6 +94,15 @@ class PortForwardingService:
 
             if remote_port is None:
                 remote_port = 443 if remote_tcp_protocol == "https" else 80
+
+            if not ssh_username:
+                return False, None, "SSH username not configured"
+            if not (ssh_key_path or ssh_passwordless or ssh_password):
+                return (
+                    False,
+                    None,
+                    "SSH password, key path, or passwordless auth required for port forwarding",
+                )
 
             # Enhanced logging for better debugging
             await self.logger.write_to_dut_runtime_log(
@@ -142,14 +157,27 @@ class PortForwardingService:
                     # Get tunnel configuration with defaults
                     tunnel_config = tunnel_config or {}
                     local_host = tunnel_config.get("TUNNEL_LOCAL_HOST", "localhost")
+                    # Omit BatchMode=yes so keyboard-interactive auth works (e.g. proxy/jump hosts)
                     ssh_options = tunnel_config.get(
                         "SSH_TUNNEL_OPTIONS",
-                        "-4 -o StrictHostKeyChecking=no -o LogLevel=ERROR -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o BatchMode=yes -fNT",
+                        "-4 -o StrictHostKeyChecking=no -o LogLevel=ERROR -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o PreferredAuthentications=keyboard-interactive,password -fNT",
                     )
                     ssh_prefix = tunnel_config.get("SSH_TUNNEL_PREFIX", "sshpass -p")
 
-                    # Create SSH tunnel command with configurable parameters
-                    ssh_cmd = f"{ssh_prefix} {ssh_password} nohup ssh {ssh_options} -L {local_host}:{port}:{destination_server_ip}:{remote_port} {ssh_username}@{ssh_server_ip} -p {ssh_port}"
+                    ssh_cmd = self._build_ssh_tunnel_command(
+                        ssh_server_ip=ssh_server_ip,
+                        ssh_username=ssh_username,
+                        ssh_password=ssh_password,
+                        destination_server_ip=destination_server_ip,
+                        ssh_port=ssh_port,
+                        ssh_key_path=ssh_key_path,
+                        ssh_passwordless=ssh_passwordless,
+                        local_host=local_host,
+                        local_port=port,
+                        remote_port=remote_port,
+                        ssh_options=ssh_options,
+                        ssh_prefix=ssh_prefix,
+                    )
 
                     await self.logger.write_to_dut_runtime_log(
                         dut_id,
@@ -308,6 +336,65 @@ class PortForwardingService:
             )
             return False, None, f"Port forwarding setup failed: {str(e)}"
 
+    @staticmethod
+    def _with_preferred_authentications(
+        ssh_options: str, preferred_authentications: str
+    ) -> str:
+        """
+        Replace any existing PreferredAuthentications option in an ssh option string.
+        """
+        cleaned = re.sub(
+            r"(?:^|\s)-o\s+PreferredAuthentications=\S+",
+            " ",
+            ssh_options or "",
+        ).strip()
+        preferred = f"-o PreferredAuthentications={preferred_authentications}"
+        return f"{cleaned} {preferred}".strip() if cleaned else preferred
+
+    @classmethod
+    def _build_ssh_tunnel_command(
+        cls,
+        ssh_server_ip: str,
+        ssh_username: str,
+        ssh_password: Optional[str],
+        destination_server_ip: str,
+        ssh_port: int,
+        ssh_key_path: Optional[str],
+        ssh_passwordless: bool,
+        local_host: str,
+        local_port: int,
+        remote_port: int,
+        ssh_options: str,
+        ssh_prefix: str,
+    ) -> str:
+        """
+        Build the ssh command for a tunnel using key, passwordless, or password auth.
+        """
+        if ssh_key_path:
+            auth_options = (
+                f"-i {shlex.quote(str(ssh_key_path))} "
+                "-o IdentitiesOnly=yes -o BatchMode=yes"
+            )
+            effective_options = cls._with_preferred_authentications(
+                ssh_options, "publickey"
+            )
+            ssh_invocation = f"nohup ssh {effective_options} {auth_options}"
+        elif ssh_passwordless:
+            effective_options = cls._with_preferred_authentications(
+                ssh_options, "publickey"
+            )
+            ssh_invocation = f"nohup ssh {effective_options} -o BatchMode=yes"
+        else:
+            ssh_invocation = (
+                f"{ssh_prefix} {shlex.quote(str(ssh_password))} nohup ssh {ssh_options}"
+            )
+
+        return (
+            f"{ssh_invocation} "
+            f"-L {shlex.quote(str(local_host))}:{int(local_port)}:{shlex.quote(str(destination_server_ip))}:{int(remote_port)} "
+            f"{shlex.quote(str(ssh_username))}@{shlex.quote(str(ssh_server_ip))} -p {int(ssh_port)}"
+        )
+
     async def kill_port_forwarding(
         self,
         dut_id: str,
@@ -408,9 +495,10 @@ class PortForwardingService:
                         pid_int = int(pid.strip())
                         # Make sure to not kill this running process (like sps-tools-utils)
                         if pid_int != my_pid:
-                            kill_cmd = f"kill {pid_int}"
                             kill_result = subprocess.run(
-                                kill_cmd, shell=True, capture_output=True, text=True
+                                ["kill", str(int(pid_int))],
+                                capture_output=True,
+                                text=True,
                             )
 
                             if kill_result.returncode == 0:
@@ -492,22 +580,35 @@ class PortForwardingService:
             # Method 1: Check if there's an SSH process with port forwarding to our destination
             # Look for SSH processes that forward to our specific destination
             # The pattern should match: ssh -L localhost:port:destination:remote_port
-            target_pattern = f"ssh.*-L.*{port}:{destination_server_ip}"
-            cmd = f"ps aux | grep '{target_pattern}' | grep -v grep"
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            safe_port = str(int(port))
+            safe_ip = str(destination_server_ip)
+            target_pattern = f"ssh.*-L.*{safe_port}:{safe_ip}"
+            result = subprocess.run(
+                ["ps", "aux"], capture_output=True, text=True, check=False
+            )
+            pattern = re.compile(
+                r"ssh.*-L.*{port}:{ip}".format(port=safe_port, ip=re.escape(safe_ip))
+            )
+            matching_lines = "\n".join(
+                line
+                for line in result.stdout.splitlines()
+                if pattern.search(line) and "grep" not in line
+            )
 
-            if result.returncode == 0 and result.stdout.strip():
+            if matching_lines.strip():
                 await self.logger.write_to_dut_runtime_log(
                     dut_id,
                     "DEBUG",
                     "PortForwardingService",
-                    f"Found SSH tunnel to {destination_server_ip} on port {port}: {result.stdout.strip()}",
+                    f"Found SSH tunnel to {destination_server_ip} on port {port}: {matching_lines.strip()}",
                 )
 
-                # Kill the SSH process
-                kill_cmd = f"pkill -f '{target_pattern}'"
+                # Kill the SSH process (no shell needed — pkill accepts pattern directly)
                 kill_result = subprocess.run(
-                    kill_cmd, shell=True, capture_output=True, text=True
+                    ["pkill", "-f", target_pattern],
+                    capture_output=True,
+                    text=True,
+                    check=False,
                 )
 
                 if kill_result.returncode == 0:
@@ -542,9 +643,8 @@ class PortForwardingService:
             # Method 2: Check if the process using the port is actually forwarding to our destination
             # This is more complex but safer - we need to verify the tunnel destination
             try:
-                lsof_cmd = f"lsof -ti :{port}"
                 lsof_result = subprocess.run(
-                    lsof_cmd, shell=True, capture_output=True, text=True
+                    ["lsof", "-ti", f":{int(port)}"], capture_output=True, text=True
                 )
 
                 if lsof_result.returncode == 0 and lsof_result.stdout.strip():
@@ -559,9 +659,11 @@ class PortForwardingService:
                     for pid in pids:
                         if pid.strip():
                             # Check if this PID is an SSH process
-                            ps_cmd = f"ps -p {pid.strip()} -o comm="
+                            safe_pid = str(int(pid.strip()))
                             ps_result = subprocess.run(
-                                ps_cmd, shell=True, capture_output=True, text=True
+                                ["ps", "-p", safe_pid, "-o", "comm="],
+                                capture_output=True,
+                                text=True,
                             )
 
                             if (
@@ -569,10 +671,8 @@ class PortForwardingService:
                                 and "ssh" in ps_result.stdout.strip()
                             ):
                                 # Check if this SSH process is forwarding to our destination
-                                ps_full_cmd = f"ps -p {pid.strip()} -o args="
                                 ps_full_result = subprocess.run(
-                                    ps_full_cmd,
-                                    shell=True,
+                                    ["ps", "-p", safe_pid, "-o", "args="],
                                     capture_output=True,
                                     text=True,
                                 )
@@ -592,10 +692,8 @@ class PortForwardingService:
                                         )
 
                                         # Kill this specific process
-                                        kill_cmd = f"kill {pid.strip()}"
                                         kill_result = subprocess.run(
-                                            kill_cmd,
-                                            shell=True,
+                                            ["kill", safe_pid],
                                             capture_output=True,
                                             text=True,
                                         )
@@ -679,21 +777,31 @@ class PortForwardingService:
             )
 
             # Method 1: Find and kill SSH processes with the specific port forwarding
-            cmd = f"ps aux | grep 'ssh.*-L.*{port}:' | grep -v grep"
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            safe_port = str(int(port))
+            result = subprocess.run(
+                ["ps", "aux"], capture_output=True, text=True, check=False
+            )
+            pattern = re.compile(r"ssh.*-L.*{port}:".format(port=safe_port))
+            matching_lines = "\n".join(
+                line
+                for line in result.stdout.splitlines()
+                if pattern.search(line) and "grep" not in line
+            )
 
-            if result.returncode == 0 and result.stdout.strip():
+            if matching_lines.strip():
                 await self.logger.write_to_dut_runtime_log(
                     dut_id,
                     "DEBUG",
                     "PortForwardingService",
-                    f"Found SSH processes using port {port}: {result.stdout.strip()}",
+                    f"Found SSH processes using port {port}: {matching_lines.strip()}",
                 )
 
-                # Kill the SSH process
-                kill_cmd = f"pkill -f 'ssh.*-L.*{port}:'"
+                # Kill the SSH process (no shell needed — pkill accepts pattern directly)
                 kill_result = subprocess.run(
-                    kill_cmd, shell=True, capture_output=True, text=True
+                    ["pkill", "-f", f"ssh.*-L.*{safe_port}:"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
                 )
 
                 if kill_result.returncode == 0 or kill_result.returncode == -15:
@@ -714,9 +822,8 @@ class PortForwardingService:
 
             # Method 2: Try to kill by port number using lsof and kill
             try:
-                lsof_cmd = f"lsof -ti :{port}"
                 lsof_result = subprocess.run(
-                    lsof_cmd, shell=True, capture_output=True, text=True
+                    ["lsof", "-ti", f":{int(port)}"], capture_output=True, text=True
                 )
 
                 if lsof_result.returncode == 0 and lsof_result.stdout.strip():
@@ -730,9 +837,9 @@ class PortForwardingService:
 
                     for pid in pids:
                         if pid.strip():
-                            kill_pid_cmd = f"kill -9 {pid.strip()}"
+                            safe_pid = str(int(pid.strip()))
                             kill_pid_result = subprocess.run(
-                                kill_pid_cmd, shell=True, capture_output=True, text=True
+                                ["kill", "-9", safe_pid], capture_output=True, text=True
                             )
 
                             if kill_pid_result.returncode == 0:
@@ -769,9 +876,8 @@ class PortForwardingService:
 
             # Method 3: Try to kill any process using the port with fuser
             try:
-                fuser_cmd = f"fuser -k {port}/tcp"
                 fuser_result = subprocess.run(
-                    fuser_cmd, shell=True, capture_output=True, text=True
+                    ["fuser", "-k", f"{int(port)}/tcp"], capture_output=True, text=True
                 )
 
                 if fuser_result.returncode == 0:

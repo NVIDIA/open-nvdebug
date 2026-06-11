@@ -26,17 +26,14 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
-import pandas as pd
-import yaml
-
+from ..config import sync_legacy_fields
 from ..services.base_service import BaseService
 from ..services.bmc_ssh_service import BMCSSHService
 from ..services.health_check_service import HealthCheckService
 from ..services.host_service import HostService
 from ..services.ipmi_service import IPMIService
 from ..services.redfish_service import RedfishService
-from ..utils import get_tool_resource, get_tool_resource_content
-from ..utils.dependency_checker import DependencyChecker
+from ..utils import excel_reader
 from ..utils.enums import CollectorServiceMapping
 from ..utils.resources import find_config_directory
 from ..utils.uri_config_manager import URIConfigManager
@@ -85,6 +82,7 @@ class ConfigurationManager:
         self.tool_config: Dict[str, Any] = {}
         self.dut_config: Dict[str, Any] = {}
         self.collector_definitions: Dict[str, Any] = {}
+        self._generated_collector_definitions_cache: Optional[Dict[str, Any]] = None
 
         # Service instances
         self.services: Dict[str, BaseService] = {}
@@ -184,22 +182,39 @@ class ConfigurationManager:
                 "skip_preflight": getattr(tool_config, "skip_preflight", False),
                 "skip_sanitization": getattr(tool_config, "skip_sanitization", False),
                 "skip_html_reports": getattr(tool_config, "skip_html_reports", False),
+                "report_format": getattr(tool_config, "report_format", "spa"),
                 "skip_auto_parse": getattr(tool_config, "skip_auto_parse", False),
                 "collector_id": getattr(tool_config, "collector_id", None),
                 "collector_group": getattr(tool_config, "collector_group", None),
                 "skip_collectors": getattr(tool_config, "skip_collectors", None),
                 "include_collectors": getattr(tool_config, "include_collectors", None),
+                "streaming_only": getattr(tool_config, "streaming_only", False),
+                "stream_begin": getattr(tool_config, "stream_begin", "24"),
+                "stream_end": getattr(tool_config, "stream_end", "0"),
+                "stream_destination": getattr(tool_config, "stream_destination", None),
+                "append": getattr(tool_config, "append", False),
+                "rack_id": getattr(tool_config, "rack_id", None),
                 "enable_status_tracking": getattr(
                     tool_config, "enable_status_tracking", True
                 ),
                 "disable_live_display": getattr(
                     tool_config, "disable_live_display", False
                 ),
+                "execution_scheduler": getattr(
+                    tool_config, "execution_scheduler", "per_dut"
+                ),
                 "parallel_dut_sequential_collectors": getattr(
                     tool_config, "parallel_dut_sequential_collectors", True
                 ),
                 "service_grouped_sequential_collectors": getattr(
                     tool_config, "service_grouped_sequential_collectors", True
+                ),
+                "uri_overrides": getattr(tool_config, "uri_overrides", None),
+                "max_pagination_pages": getattr(
+                    tool_config, "max_pagination_pages", 100
+                ),
+                "max_duplicate_url_retries": getattr(
+                    tool_config, "max_duplicate_url_retries", 3
                 ),
                 # Legacy field names for backward compatibility
                 "skip_zip": getattr(tool_config, "skip_zip", False),
@@ -210,7 +225,7 @@ class ConfigurationManager:
                 "GENERATE_HTML_REPORTS": not getattr(
                     tool_config, "skip_html_reports", False
                 ),
-                # Skip Flags
+                # Legacy Skip Flags (from legacy NVDebug)
                 "SKIP_PORT_FW": getattr(tool_config, "SKIP_PORT_FW", False),
                 "SKIP_BMC_SSH_LOGS": getattr(tool_config, "SKIP_BMC_SSH_LOGS", True),
                 "SKIP_HOST_LOGS": getattr(tool_config, "SKIP_HOST_LOGS", False),
@@ -223,6 +238,14 @@ class ConfigurationManager:
                 "SYSTEM_ID_TO_SKIP": getattr(tool_config, "SYSTEM_ID_TO_SKIP", None),
                 "CHASSIS_ID_TO_SKIP": getattr(tool_config, "CHASSIS_ID_TO_SKIP", None),
                 "MANAGER_ID_TO_SKIP": getattr(tool_config, "MANAGER_ID_TO_SKIP", None),
+                # Entity ID Overrides
+                "SYSTEM_ID_OVERRIDE": getattr(tool_config, "SYSTEM_ID_OVERRIDE", None),
+                "MANAGER_ID_OVERRIDE": getattr(
+                    tool_config, "MANAGER_ID_OVERRIDE", None
+                ),
+                "CHASSIS_ID_OVERRIDE": getattr(
+                    tool_config, "CHASSIS_ID_OVERRIDE", None
+                ),
                 # Expand Query Fields
                 "EXPAND_QUERY_CHASSIS_LEVEL": getattr(
                     tool_config, "EXPAND_QUERY_CHASSIS_LEVEL", 1
@@ -238,7 +261,7 @@ class ConfigurationManager:
                 ),
                 # Timeout Fields
                 "NVOS_TECH_DUMP_TIMEOUT": getattr(
-                    tool_config, "NVOS_TECH_DUMP_TIMEOUT", 450
+                    tool_config, "NVOS_TECH_DUMP_TIMEOUT", 600
                 ),
                 "REDFISH_DUMP_TIMEOUT": getattr(
                     tool_config, "REDFISH_DUMP_TIMEOUT", 300
@@ -272,6 +295,26 @@ class ConfigurationManager:
                     tool_config, "EXTRA_LOG_COLLECTION", None
                 ),
             }
+            # Include i2c_config overrides if present (avoid inserting None)
+            _i2c = getattr(tool_config, "i2c_config", None)
+            if _i2c:
+                tool_config_dict["i2c_config"] = _i2c
+            # Include preflight_config if present (credential validation settings)
+            _preflight = getattr(tool_config, "preflight_config", None)
+            if _preflight:
+                tool_config_dict["preflight_config"] = (
+                    _preflight.model_dump()
+                    if hasattr(_preflight, "model_dump")
+                    else _preflight
+                )
+            # Include redfish_session_config if present (connection pool settings)
+            _redfish_session = getattr(tool_config, "redfish_session_config", None)
+            if _redfish_session:
+                tool_config_dict["redfish_session_config"] = (
+                    _redfish_session.model_dump()
+                    if hasattr(_redfish_session, "model_dump")
+                    else _redfish_session
+                )
         else:
             tool_config_dict = tool_config
 
@@ -290,16 +333,38 @@ class ConfigurationManager:
                 # dut_configs is already a dictionary of {dut_name: config}
                 for dut_name, dut_config in dut_configs.items():
                     if hasattr(dut_config, "__dict__"):
-                        dut_config_dict[dut_name] = dut_config.__dict__
+                        if hasattr(dut_config, "model_dump"):
+                            dut_values = dut_config.model_dump()
+                            explicit = getattr(dut_config, "model_fields_set", set())
+                            normalized = sync_legacy_fields(
+                                dut_values, explicit_fields=explicit
+                            )
+                            normalized["__explicit_fields"] = sorted(explicit)
+                            dut_config_dict[dut_name] = normalized
+                        else:
+                            dut_config_dict[dut_name] = sync_legacy_fields(
+                                dict(dut_config.__dict__)
+                            )
                     else:
-                        dut_config_dict[dut_name] = dut_config
+                        dut_config_dict[dut_name] = sync_legacy_fields(dut_config)
             else:
                 # dut_configs is a list of objects
                 for dut in dut_configs:
                     if hasattr(dut, "__dict__"):
-                        dut_config_dict[dut.name] = dut.__dict__
+                        if hasattr(dut, "model_dump"):
+                            dut_values = dut.model_dump()
+                            explicit = getattr(dut, "model_fields_set", set())
+                            normalized = sync_legacy_fields(
+                                dut_values, explicit_fields=explicit
+                            )
+                            normalized["__explicit_fields"] = sorted(explicit)
+                            dut_config_dict[dut.name] = normalized
+                        else:
+                            dut_config_dict[dut.name] = sync_legacy_fields(
+                                dict(dut.__dict__)
+                            )
                     else:
-                        dut_config_dict[dut.name] = dut
+                        dut_config_dict[dut.name] = sync_legacy_fields(dut)
             instance.dut_config = dut_config_dict
         else:
             instance.dut_config = {}
@@ -346,7 +411,7 @@ class ConfigurationManager:
                 "EXPAND_QUERY_FIRMWARE_INVENTORY_LEVEL": 1,
                 "EXPAND_QUERY_MANAGER_LEVEL": 1,
                 "EXPAND_QUERY_SYSTEM_LEVEL": 1,
-                "NVOS_TECH_DUMP_TIMEOUT": 450,
+                "NVOS_TECH_DUMP_TIMEOUT": 600,
                 "REDFISH_DUMP_TIMEOUT": 1500,
                 "REDFISH_DEVICE_DUMP_SLEEP_DURATION": 60,
                 "BMC_TEMP_DIR": "/tmp",
@@ -357,6 +422,8 @@ class ConfigurationManager:
                 "NVLINK_OOB_URI": [],
                 "CUSTOM_DUMP_SERVICES": [],
                 "POST_CODES_URI": [],
+                "max_pagination_pages": 100,
+                "max_duplicate_url_retries": 3,
             }
 
             # Add default values for any missing skip fields
@@ -478,6 +545,48 @@ class ConfigurationManager:
                 )
         await self._load_from_spreadsheet(spreadsheet_path)
 
+    def _get_generated_collector_stages(self, collector_id: str) -> Dict[str, Any]:
+        """
+        Return collector stages from the generated YAML catalog as a fallback.
+
+        Some spreadsheet cells exceed Excel's cell-size limit and can contain
+        truncated JSON. The generated YAML catalog preserves those stages in a
+        structured form, so use it only when the spreadsheet stage JSON cannot
+        be parsed.
+        """
+        if not collector_id:
+            return {}
+
+        if self._generated_collector_definitions_cache is None:
+            generated_path = (
+                Path(__file__).resolve().parents[3]
+                / "generation_config"
+                / "collector_definitions.yaml"
+            )
+            try:
+                generated_data = YAMLManager.load_yaml(
+                    generated_path, "generated collector definitions"
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Unable to load generated collector definitions fallback: %s",
+                    exc,
+                )
+                self._generated_collector_definitions_cache = {}
+            else:
+                collectors = generated_data.get("collectors", {})
+                self._generated_collector_definitions_cache = (
+                    collectors if isinstance(collectors, dict) else {}
+                )
+
+        collector_def = self._generated_collector_definitions_cache.get(
+            str(collector_id), {}
+        )
+        stages = (
+            collector_def.get("stages", {}) if isinstance(collector_def, dict) else {}
+        )
+        return stages if isinstance(stages, dict) else {}
+
     async def _initialize_uri_config_manager(self) -> None:
         """
         Initialize URI configuration manager with tool and DUT-specific overrides.
@@ -498,6 +607,8 @@ class ConfigurationManager:
                 # Create a temporary config structure for the URI manager
                 temp_uri_config = {
                     "prefix_override": uri_overrides.get("prefix_override"),
+                    "hmc_prefix_override": uri_overrides.get("hmc_prefix_override"),
+                    "hmc_resource_prefix": uri_overrides.get("hmc_resource_prefix"),
                     "default_uris": uri_overrides.get("default_uris", {}),
                     "baseboard_overrides": uri_overrides.get("baseboard_overrides", {}),
                     "platform_overrides": uri_overrides.get("platform_overrides", {}),
@@ -609,7 +720,7 @@ class ConfigurationManager:
 
             # Read the spreadsheet
             # Don't treat "N/A" as NaN since it's a valid value meaning "not applicable"
-            df = pd.read_excel(
+            df = excel_reader.read_excel(
                 spreadsheet_path,
                 sheet_name="Log Collection Catalog",
                 keep_default_na=False,
@@ -628,29 +739,41 @@ class ConfigurationManager:
                     dependencies = {}
                     stages = {}
                     try:
-                        if pd.notna(row.get("Dependencies")):
+                        if excel_reader.notna(row.get("Dependencies")):
                             dependencies = json.loads(str(row.get("Dependencies")))
                     except (json.JSONDecodeError, TypeError):
                         dependencies = {}
 
                     try:
-                        if pd.notna(row.get("Stages")):
+                        if excel_reader.notna(row.get("Stages")):
                             stages = json.loads(str(row.get("Stages")))
-                    except (json.JSONDecodeError, TypeError):
-                        stages = {}
+                    except (json.JSONDecodeError, TypeError) as exc:
+                        stages = self._get_generated_collector_stages(
+                            str(collector_id)
+                        )
+                        if stages:
+                            await self._log_runtime(
+                                "WARNING",
+                                f"Failed to parse Stages JSON for collector {collector_id}; "
+                                f"using generated YAML fallback: {exc}",
+                            )
 
                     # Parse applicable baseboards
                     applicable_baseboards = []
 
-                    # First try the single column format
-                    if pd.notna(row.get("applicable_baseboards")):
-                        applicable_str = str(row.get("applicable_baseboards"))
-                        if applicable_str:
-                            applicable_baseboards = [
-                                b.strip()
-                                for b in applicable_str.split(",")
-                                if b.strip()
-                            ]
+                    # First try the single column format. Blank strings are
+                    # common in catalog sheets that use per-baseboard columns,
+                    # so only treat the single column as authoritative when it
+                    # contains at least one baseboard name.
+                    applicable_str = ""
+                    raw_applicable = row.get("applicable_baseboards")
+                    if excel_reader.notna(raw_applicable):
+                        applicable_str = str(raw_applicable).strip()
+
+                    if applicable_str:
+                        applicable_baseboards = [
+                            b.strip() for b in applicable_str.split(",") if b.strip()
+                        ]
                     else:
                         # Try the individual column format (e.g., "Applicable for Blackwell-HGX-8-GPU")
                         for col in df.columns:
@@ -658,7 +781,7 @@ class ConfigurationManager:
                                 value = row.get(col)
                                 # Skip if cell is empty (NaN) or contains "N/A" (not applicable)
                                 if (
-                                    pd.notna(value)
+                                    excel_reader.notna(value)
                                     and str(value).strip().upper() != "N/A"
                                 ):
                                     value_str = str(value).strip().lower()
@@ -685,7 +808,7 @@ class ConfigurationManager:
                                     break
 
                     collectors[collector_id] = {
-                        "collector_id": collector_id,  # Add the collector_id field for compatibility
+                        "collector_id": collector_id,
                         "name": row.get("Collector Name", ""),
                         "group": row.get("Collection Group", ""),
                         "description": row.get("Description", ""),
@@ -699,8 +822,32 @@ class ConfigurationManager:
                         "dependencies": dependencies,
                         "stages": stages,
                         "enabled": row.get("Enabled", True),
-                        "use_sudo": use_sudo,  # Add use_sudo parameter
+                        "streaming_candidate": bool(
+                            row.get("Streaming Candidate", False)
+                        ),
+                        "use_sudo": use_sudo,
                     }
+                    execution_phase = row.get("Execution Phase", "")
+                    if (
+                        excel_reader.notna(execution_phase)
+                        and str(execution_phase).strip()
+                    ):
+                        collectors[collector_id]["execution_phase"] = str(
+                            execution_phase
+                        ).strip()
+                    execution_order = row.get("Execution Order", "")
+                    if (
+                        excel_reader.notna(execution_order)
+                        and str(execution_order).strip()
+                    ):
+                        try:
+                            collectors[collector_id]["execution_order"] = int(
+                                execution_order
+                            )
+                        except (TypeError, ValueError):
+                            collectors[collector_id]["execution_order"] = str(
+                                execution_order
+                            ).strip()
 
             self.collector_definitions = {"collectors": collectors}
             if not self.quiet_mode:
@@ -1027,6 +1174,15 @@ class ConfigurationManager:
                 # Global fields that can be overridden per-DUT
                 "TASK_ID_PREFIX",
                 "TOOL_TEMP_DIR",
+                # Streaming configuration
+                "streaming_only",
+                "stream_begin",
+                "stream_end",
+                "stream_destination",
+                "append",
+                "rack_id",
+                # I2C configuration (device addresses, bus numbers, etc.)
+                "i2c_config",
             ]
 
             # Merge tool config sections from DUT-specific config

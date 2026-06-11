@@ -14,6 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 """
 Resource manager using importlib.resources for PyInstaller compatibility.
 
@@ -25,7 +27,9 @@ import os
 import sys
 from importlib import resources
 from pathlib import Path
-from typing import Optional, Union
+from typing import List, Optional, Union
+
+from .frozen_path import get_base_path, is_frozen, safe_resource_path
 
 
 class ResourceManager:
@@ -51,20 +55,29 @@ class ResourceManager:
         Raises:
             FileNotFoundError: If the resource doesn't exist
         """
-        if hasattr(sys, "_MEIPASS"):
-            # PyInstaller: resources are extracted to _MEIPASS
-            resource_path = os.path.join(sys._MEIPASS, package_name, resource_name)
+        if is_frozen():
+            resource_path = str(safe_resource_path(get_base_path(), package_name, resource_name))
         else:
             # Development: use importlib.resources
             try:
                 resource_path = str(resources.files(package_name) / resource_name)
-            except (ImportError, AttributeError):
-                # Fallback for older Python versions
-                import pkg_resources
+            except (ImportError, AttributeError, ModuleNotFoundError):
+                # Fallback for older Python versions (pkg_resources may be absent)
+                try:
+                    import pkg_resources
+                except ImportError as exc:
+                    raise FileNotFoundError(
+                        f"Resource not found: {package_name}/{resource_name}"
+                    ) from exc
 
-                resource_path = pkg_resources.resource_filename(
-                    package_name, resource_name
-                )
+                try:
+                    resource_path = pkg_resources.resource_filename(
+                        package_name, resource_name
+                    )
+                except (ImportError, ModuleNotFoundError, FileNotFoundError) as exc:
+                    raise FileNotFoundError(
+                        f"Resource not found: {package_name}/{resource_name}"
+                    ) from exc
 
         if not os.path.exists(resource_path):
             raise FileNotFoundError(
@@ -109,7 +122,7 @@ class ResourceManager:
             return f.read()
 
     @staticmethod
-    def list_resources(package_name: str, subdirectory: str = "") -> list[str]:
+    def list_resources(package_name: str, subdirectory: str = "") -> List[str]:
         """
         List all resources in a package or subdirectory.
 
@@ -120,18 +133,17 @@ class ResourceManager:
         Returns:
             List of resource names
         """
-        if hasattr(sys, "_MEIPASS"):
-            # PyInstaller: list files in _MEIPASS
-            base_path = os.path.join(sys._MEIPASS, package_name, subdirectory)
+        if is_frozen():
+            base_path = str(get_base_path() / package_name / subdirectory)
             if not os.path.exists(base_path):
                 return []
 
-            resources = []
+            resource_list = []
             for root, dirs, files in os.walk(base_path):
                 for file in files:
                     rel_path = os.path.relpath(os.path.join(root, file), base_path)
-                    resources.append(rel_path)
-            return resources
+                    resource_list.append(rel_path)
+            return resource_list
         else:
             # Development: use importlib.resources
             try:
@@ -142,18 +154,18 @@ class ResourceManager:
                 if not package.exists():
                     return []
 
-                resources_list = []
+                resource_list = []
                 for item in package.iterdir():
                     if item.is_file():
-                        resources_list.append(item.name)
+                        resource_list.append(item.name)
                     elif item.is_dir():
                         # Recursively list subdirectory contents
                         for subitem in item.rglob("*"):
                             if subitem.is_file():
                                 rel_path = subitem.relative_to(package)
-                                resources_list.append(str(rel_path))
+                                resource_list.append(str(rel_path))
 
-                return resources_list
+                return resource_list
             except (ImportError, AttributeError):
                 # Fallback for older Python versions
                 import pkg_resources
@@ -178,7 +190,7 @@ class ResourceManager:
         try:
             ResourceManager.get_resource_path(package_name, resource_name)
             return True
-        except FileNotFoundError:
+        except (FileNotFoundError, ImportError, ModuleNotFoundError):
             return False
 
 

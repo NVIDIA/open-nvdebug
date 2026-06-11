@@ -20,28 +20,16 @@ Builds platform-baseboard mapping from spreadsheet configuration and provides
 interactive user prompts for platform and baseboard selection.
 """
 
-import asyncio
 import logging
 import re
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from rich.panel import Panel
-from rich.progress import (
-    BarColumn,
-    Progress,
-    SpinnerColumn,
-    TaskProgressColumn,
-    TextColumn,
-    TimeElapsedColumn,
-)
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
 from rich.text import Text
 
-from ..utils import get_tool_resource_content
 from ..utils.console_output import create_sanitized_console
-from ..utils.resources import find_config_directory
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +57,343 @@ class AutoDetectionService:
             else create_sanitized_console()
         )
         self.platform_mappings = []  # Will be populated in async_init
+
+    @staticmethod
+    def _identity_is_present(value: Any) -> bool:
+        if not isinstance(value, str):
+            return False
+        normalized = value.strip()
+        return normalized not in ("", "$", "null", "NULL")
+
+    @staticmethod
+    def _model_is_generic(model: str) -> bool:
+        normalized = model.strip().lower()
+        return normalized in {
+            "",
+            "$",
+            "null",
+            "na",
+            "n/a",
+            "none",
+            "unknown",
+            "openbmc",
+            "ami redfish server",
+            "gb hmc",
+            "gb bmc",
+        } or normalized.startswith("unknownmodel")
+
+    def _extract_first_string_field(
+        self, payload: Any, field_name: str
+    ) -> Optional[str]:
+        if isinstance(payload, dict):
+            value = payload.get(field_name)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            for nested in payload.values():
+                found = self._extract_first_string_field(nested, field_name)
+                if found:
+                    return found
+        elif isinstance(payload, list):
+            for item in payload:
+                found = self._extract_first_string_field(item, field_name)
+                if found:
+                    return found
+        return None
+
+    @staticmethod
+    def _candidate_score(uri: str, signal: str) -> int:
+        if uri.startswith("/redfish/v1/Systems/HGX_Baseboard_"):
+            score = 700
+        elif "/Systems/" in uri and "HGX_Baseboard" in uri:
+            score = 690
+        elif uri.startswith("/redfish/v1/Chassis/HGX_Chassis_") and uri.endswith(
+            "/Assembly"
+        ):
+            score = 610
+        elif uri.startswith("/redfish/v1/Chassis/HGX_Chassis_"):
+            score = 620
+        elif uri.startswith("/redfish/v1/Systems/System_"):
+            score = 560
+        elif uri.startswith("/redfish/v1/Systems/"):
+            score = 520
+        elif uri.startswith("/redfish/v1/Chassis/Chassis_") and uri.endswith(
+            "/Assembly"
+        ):
+            score = 490
+        elif uri.startswith("/redfish/v1/Chassis/Chassis_"):
+            score = 500
+        elif uri.startswith("/redfish/v1/Chassis/") and "BMC" in uri:
+            score = 320
+        elif uri.startswith("/redfish/v1/Chassis/HMC_"):
+            score = 300
+        elif uri.startswith("/redfish/v1/Chassis/"):
+            score = 440
+        elif uri == "/redfish/v1":
+            score = 250
+        else:
+            score = 200
+
+        if signal == "manufacturer":
+            score -= 40
+        return score
+
+    @staticmethod
+    def _extract_redfish_success_payload(response: Any) -> Tuple[bool, Optional[Any]]:
+        if not isinstance(response, tuple) or len(response) < 2:
+            return False, None
+        success = response[0]
+        payload = response[1]
+        return (success, payload) if isinstance(success, bool) else (False, None)
+
+    @staticmethod
+    def _mapping_specificity(mapping: Dict[str, Any], pattern: str, value: str) -> Tuple[int, int, int]:
+        """Rank a matching mapping so the most-specific one wins a tie.
+
+        Order, highest first:
+          1. Baseboard name appears as a case-insensitive substring of the
+             observed value (e.g. model "MGX-GH200 System" contains the
+             baseboard name "MGX-GH200"). This is a strong signal the mapping
+             is the intended target.
+          2. Longer baseboard name (ties broken by name length).
+          3. Longer matching pattern (a broad ".*GH200.*" loses to a more
+             specific ".*GH200-NVL2.*").
+        """
+        baseboard_name = (mapping.get("baseboards") or [""])[0] or ""
+        value_lower = (value or "").lower()
+        name_lower = baseboard_name.lower()
+        name_in_value = 1 if name_lower and name_lower in value_lower else 0
+        return (name_in_value, len(baseboard_name), len(pattern or ""))
+
+    async def try_manufacturer_matching(
+        self, dut_id: str, manufacturer: str, info_dict: Dict[str, Any]
+    ) -> bool:
+        if not manufacturer:
+            return False
+
+        await self.logger.write_to_dut_runtime_log(
+            dut_id,
+            "DEBUG",
+            "AutoDetection",
+            f"Trying to match manufacturer: '{manufacturer}'",
+        )
+
+        exact_matches = []
+        regex_matches = []
+        for mapping in self.platform_mappings:
+            patterns = mapping.get("manufacturer", []) or []
+            for pattern in patterns:
+                if not pattern:
+                    continue
+                if pattern == manufacturer:
+                    exact_matches.append((mapping, pattern))
+                else:
+                    regex_matches.append((mapping, pattern))
+
+        if exact_matches:
+            best_mapping, best_pattern = max(
+                exact_matches,
+                key=lambda mp: self._mapping_specificity(mp[0], mp[1], manufacturer),
+            )
+            await self.logger.write_to_dut_runtime_log(
+                dut_id,
+                "INFO",
+                "AutoDetection",
+                f"EXACT MANUFACTURER MATCH FOUND! '{manufacturer}' matches '{best_pattern}'",
+            )
+            info_dict["platform"] = best_mapping["platform"]
+            info_dict["node_type"] = best_mapping["node_type"]
+            if best_mapping["baseboards"]:
+                info_dict["baseboard"] = best_mapping["baseboards"][0]
+            return True
+
+        valid_regex_hits = []
+        for mapping, pattern in regex_matches:
+            try:
+                if re.search(pattern, manufacturer, re.IGNORECASE):
+                    valid_regex_hits.append((mapping, pattern))
+            except re.error as e:
+                await self.logger.write_to_dut_runtime_log(
+                    dut_id,
+                    "WARNING",
+                    "AutoDetection",
+                    f"Invalid manufacturer regex pattern '{pattern}' in platform mapping: {e}",
+                )
+
+        if not valid_regex_hits:
+            return False
+
+        best_mapping, best_pattern = max(
+            valid_regex_hits,
+            key=lambda mp: self._mapping_specificity(mp[0], mp[1], manufacturer),
+        )
+        await self.logger.write_to_dut_runtime_log(
+            dut_id,
+            "INFO",
+            "AutoDetection",
+            f"REGEX MANUFACTURER MATCH FOUND! Pattern '{best_pattern}' matches manufacturer '{manufacturer}' "
+            f"(selected most specific of {len(valid_regex_hits)} candidate mapping(s))",
+        )
+        info_dict["platform"] = best_mapping["platform"]
+        info_dict["node_type"] = best_mapping["node_type"]
+        if best_mapping["baseboards"]:
+            info_dict["baseboard"] = best_mapping["baseboards"][0]
+        return True
+
+    async def _evaluate_redfish_candidate(
+        self, dut_id: str, uri: str, payload: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        model = self._extract_first_string_field(payload, "Model")
+        manufacturer = self._extract_first_string_field(payload, "Manufacturer")
+        part_number = self._extract_first_string_field(payload, "PartNumber")
+
+        if uri.startswith("/redfish/v1/Chassis/PowerShelf") or (
+            isinstance(manufacturer, str) and manufacturer.strip().lower() == "delta"
+        ):
+            return {
+                "uri": uri,
+                "signal": "heuristic",
+                "score": self._candidate_score(uri, "model"),
+                "platform": "PowerShelf",
+                "baseboard": "PowerShelf",
+                "node_type": "PowerShelf",
+                "model": model,
+                "manufacturer": manufacturer,
+            }
+
+        match_info: Dict[str, Optional[str]] = {
+            "platform": None,
+            "baseboard": None,
+            "node_type": None,
+        }
+        signal = None
+
+        if self._identity_is_present(model) and not self._model_is_generic(model):
+            if await self.try_model_matching(dut_id, model, match_info):
+                signal = "model"
+
+        # PartNumber is more specific than Model when both are present: the FRU
+        # PartNumber identifies the exact PCB SKU/stepping while Model often
+        # collapses related products into a single marketing string (e.g.
+        # GB200 NVL and GB200 NVL4 both publish Model="GB200 NVL"). If a
+        # PartNumber pattern explicitly matches and resolves to a *different*
+        # baseboard than model matching did, prefer the PartNumber result.
+        # When model matching produced no result, PartNumber acts as the
+        # primary signal.
+        if self._identity_is_present(part_number):
+            pn_match: Dict[str, Optional[str]] = {
+                "platform": None,
+                "baseboard": None,
+                "node_type": None,
+            }
+            if await self.try_part_number_matching(dut_id, part_number, pn_match):
+                if signal is None or (
+                    pn_match.get("baseboard")
+                    and pn_match["baseboard"] != match_info.get("baseboard")
+                ):
+                    if signal == "model":
+                        await self.logger.write_to_dut_runtime_log(
+                            dut_id,
+                            "INFO",
+                            "AutoDetection",
+                            f"PartNumber '{part_number}' overrides model-matched "
+                            f"baseboard '{match_info.get('baseboard')}' with more specific "
+                            f"'{pn_match['baseboard']}'",
+                        )
+                    match_info = pn_match
+                    signal = "part_number"
+
+        if signal is None and self._identity_is_present(manufacturer):
+            if await self.try_manufacturer_matching(dut_id, manufacturer, match_info):
+                signal = "manufacturer"
+
+        if signal is None:
+            return None
+
+        return {
+            "uri": uri,
+            "signal": signal,
+            "score": self._candidate_score(uri, signal),
+            "platform": match_info["platform"],
+            "baseboard": match_info["baseboard"],
+            "node_type": match_info["node_type"],
+            "model": model,
+            "manufacturer": manufacturer,
+            "part_number": part_number,
+        }
+
+    async def _select_best_redfish_candidate(
+        self, dut_id: str
+    ) -> Optional[Dict[str, Any]]:
+        best_candidate: Optional[Dict[str, Any]] = None
+        seen_uris = set()
+
+        async def consider_uri(uri: str) -> None:
+            nonlocal best_candidate
+            if uri in seen_uris:
+                return
+            seen_uris.add(uri)
+
+            success, payload = self._extract_redfish_success_payload(
+                await self.dut_manager.execute_redfish_request(dut_id, "GET", uri)
+            )
+            if not success or not payload:
+                return
+
+            candidate = await self._evaluate_redfish_candidate(dut_id, uri, payload)
+            if candidate and (
+                best_candidate is None
+                or candidate["score"] > best_candidate["score"]
+            ):
+                best_candidate = candidate
+
+        primary_system_ids = ["HGX_Baseboard_0", "System_0", "DGX"]
+        primary_chassis_ids = [
+            "HGX_Chassis_0",
+            "Chassis_0",
+            "DGX",
+            "HGX_BMC_0",
+            "BMC_0",
+            "HMC_0",
+            "HGX",
+            "MGX_NVSwitch_0",
+            "MGX_NVSwitch_1",
+            "MGX_BMC_0",
+        ]
+        primary_chassis_assembly_ids = ["HGX_Chassis_0", "Chassis_0", "DGX"]
+
+        for system_id in primary_system_ids:
+            await consider_uri(f"/redfish/v1/Systems/{system_id}")
+
+        for chassis_id in primary_chassis_ids:
+            await consider_uri(f"/redfish/v1/Chassis/{chassis_id}")
+
+        for chassis_id in primary_chassis_assembly_ids:
+            await consider_uri(f"/redfish/v1/Chassis/{chassis_id}/Assembly")
+
+        success, systems_payload = self._extract_redfish_success_payload(
+            await self.dut_manager.execute_redfish_request(
+                dut_id, "GET", "/redfish/v1/Systems"
+            )
+        )
+        if success and systems_payload:
+            for member in systems_payload.get("Members", []):
+                uri = member.get("@odata.id")
+                if isinstance(uri, str) and uri.startswith("/redfish/v1/Systems/"):
+                    await consider_uri(uri)
+
+        success, chassis_payload = self._extract_redfish_success_payload(
+            await self.dut_manager.execute_redfish_request(
+                dut_id, "GET", "/redfish/v1/Chassis"
+            )
+        )
+        if success and chassis_payload:
+            for member in chassis_payload.get("Members", []):
+                uri = member.get("@odata.id")
+                if isinstance(uri, str) and uri.startswith("/redfish/v1/Chassis/"):
+                    await consider_uri(uri)
+
+        await consider_uri("/redfish/v1")
+        return best_candidate
 
     async def async_init(self):
         """
@@ -156,6 +481,7 @@ class AutoDetectionService:
                     "node_type": platform_detection.get("node_type", "Compute"),
                     "manufacturer": platform_detection.get("manufacturer", []),
                     "models": platform_detection.get("models", []),
+                    "part_numbers": platform_detection.get("part_numbers", []),
                     "baseboards": [baseboard_name],
                     "HMC_IP": platform_detection.get("hmc_ip"),
                     "product_family": platform_detection.get("product_family"),
@@ -369,6 +695,74 @@ class AutoDetectionService:
             )
             return self.display_manual_selection_prompt()
 
+    async def _finalize_detection_with_confirmation(
+        self,
+        dut_id: str,
+        info_dict: Dict[str, Any],
+        non_interactive: bool,
+    ) -> Tuple[bool, Dict[str, Any]]:
+        try:
+            detected_node_type = info_dict.get("node_type")
+            confirmed_platform, confirmed_baseboard = (
+                self.prompt_for_detection_confirmation(
+                    info_dict["platform"],
+                    info_dict.get("baseboard"),
+                    info_dict.get("node_type"),
+                    non_interactive,
+                )
+            )
+
+            info_dict["platform"] = confirmed_platform
+            info_dict["baseboard"] = confirmed_baseboard
+            info_dict["node_type"] = None
+
+            mapping_found = False
+            for mapping in self.platform_mappings:
+                if (
+                    confirmed_platform == mapping["platform"]
+                    and confirmed_baseboard in mapping.get("baseboards", [])
+                ):
+                    info_dict["node_type"] = mapping["node_type"]
+                    mapping_found = True
+                    break
+
+            if not info_dict.get("node_type"):
+                info_dict["node_type"] = detected_node_type or "unknown"
+                warning_message = (
+                    "No platform mapping found after confirmation - "
+                    f"Platform: {confirmed_platform}, Baseboard: {confirmed_baseboard}"
+                )
+                if hasattr(self.logger, "warning"):
+                    self.logger.warning(warning_message)
+                else:
+                    logging.warning(warning_message)
+
+                await self.logger.write_to_dut_runtime_log(
+                    dut_id,
+                    "WARNING",
+                    "AutoDetection",
+                    warning_message,
+                )
+
+            await self.logger.write_to_dut_runtime_log(
+                dut_id,
+                "INFO",
+                "AutoDetection",
+                f"User confirmed - Platform: {confirmed_platform}, Baseboard: {confirmed_baseboard}, NodeType: {info_dict.get('node_type')}",
+            )
+
+            self.console.print("[green]Auto-detection completed successfully![/green]")
+            return True, info_dict
+        except (KeyboardInterrupt, EOFError):
+            await self.logger.write_to_dut_runtime_log(
+                dut_id,
+                "INFO",
+                "AutoDetection",
+                "User cancelled auto-detection process",
+            )
+            info_dict["error"] = "User cancelled auto-detection process"
+            return False, info_dict
+
     # Helper function to validate against mapping
     async def validate_against_mapping(
         self,
@@ -424,6 +818,14 @@ class AutoDetectionService:
         """
         Try to match a model against the platform mapping.
 
+        Phase 1 finds literal exact matches; Phase 2 finds regex matches.
+        When multiple mappings match the same model, the most specific one
+        wins via `_mapping_specificity` (prefers a mapping whose baseboard
+        name is a substring of the model, then the longest baseboard name,
+        then the longest matching pattern). This prevents broad regexes
+        like ``.*GH200.*`` on a generically-named baseboard (e.g. "C2")
+        from shadowing a more specific mapping (e.g. "MGX-GH200").
+
         Args:
             dut_id: The DUT identifier
             model: The model to match
@@ -447,34 +849,36 @@ class AutoDetectionService:
             "Phase 1: Checking for exact matches across all mappings",
         )
 
+        exact_hits: List[Tuple[Dict[str, Any], str]] = []
         for mapping in self.platform_mappings:
-            # Skip power shelf entries
             if mapping["node_type"] == "PowerShelf":
                 continue
-
-            # Skip entries with empty models array
             if not mapping["models"]:
                 continue
-
-            # Check for exact matches first
             for model_pattern in mapping["models"]:
                 if not model_pattern:
                     continue
-
-                # Check if this is an exact match (no regex special characters)
                 if model_pattern == model:
-                    await self.logger.write_to_dut_runtime_log(
-                        dut_id,
-                        "INFO",
-                        "AutoDetection",
-                        f"EXACT MATCH FOUND! Model '{model}' exactly matches pattern '{model_pattern}' in mapping for platform: {mapping['platform']}, node_type: {mapping['node_type']}",
-                    )
-                    info_dict["platform"] = mapping["platform"]
-                    info_dict["node_type"] = mapping["node_type"]
-                    # Use the first baseboard from the mapping
-                    if mapping["baseboards"]:
-                        info_dict["baseboard"] = mapping["baseboards"][0]
-                    return True
+                    exact_hits.append((mapping, model_pattern))
+
+        if exact_hits:
+            best_mapping, best_pattern = max(
+                exact_hits,
+                key=lambda mp: self._mapping_specificity(mp[0], mp[1], model),
+            )
+            await self.logger.write_to_dut_runtime_log(
+                dut_id,
+                "INFO",
+                "AutoDetection",
+                f"EXACT MATCH FOUND! Model '{model}' exactly matches pattern '{best_pattern}' "
+                f"in mapping for platform: {best_mapping['platform']}, node_type: {best_mapping['node_type']} "
+                f"(selected most specific of {len(exact_hits)} exact match(es))",
+            )
+            info_dict["platform"] = best_mapping["platform"]
+            info_dict["node_type"] = best_mapping["node_type"]
+            if best_mapping["baseboards"]:
+                info_dict["baseboard"] = best_mapping["baseboards"][0]
+            return True
 
         # Phase 2: Try regex patterns only if no exact match was found
         await self.logger.write_to_dut_runtime_log(
@@ -484,8 +888,8 @@ class AutoDetectionService:
             "Phase 2: No exact matches found, trying regex patterns",
         )
 
+        regex_hits: List[Tuple[Dict[str, Any], str]] = []
         for mapping in self.platform_mappings:
-            # Skip entries with empty models array
             if not mapping["models"]:
                 continue
 
@@ -496,36 +900,16 @@ class AutoDetectionService:
                 f"Checking mapping for platform: {mapping['platform']}, node_type: {mapping['node_type']}",
             )
 
-            # Check if model matches any patterns in this mapping
             for model_pattern in mapping["models"]:
                 if not model_pattern:
                     continue
-
-                # Skip exact matches (already handled in Phase 1)
                 if model_pattern == model:
+                    # already handled in Phase 1
                     continue
-
-                await self.logger.write_to_dut_runtime_log(
-                    dut_id,
-                    "DEBUG",
-                    "AutoDetection",
-                    f"Trying regex pattern: '{model_pattern}'",
-                )
 
                 try:
                     if re.search(model_pattern, model, re.IGNORECASE):
-                        await self.logger.write_to_dut_runtime_log(
-                            dut_id,
-                            "INFO",
-                            "AutoDetection",
-                            f"REGEX MATCH FOUND! Pattern '{model_pattern}' matches model '{model}'",
-                        )
-                        info_dict["platform"] = mapping["platform"]
-                        info_dict["node_type"] = mapping["node_type"]
-                        # Use the first baseboard from the mapping
-                        if mapping["baseboards"]:
-                            info_dict["baseboard"] = mapping["baseboards"][0]
-                        return True
+                        regex_hits.append((mapping, model_pattern))
                 except re.error as e:
                     await self.logger.write_to_dut_runtime_log(
                         dut_id,
@@ -534,7 +918,115 @@ class AutoDetectionService:
                         f"Invalid regex pattern '{model_pattern}' in platform mapping: {e}",
                     )
                     continue
-        return False
+
+        if not regex_hits:
+            return False
+
+        best_mapping, best_pattern = max(
+            regex_hits,
+            key=lambda mp: self._mapping_specificity(mp[0], mp[1], model),
+        )
+        await self.logger.write_to_dut_runtime_log(
+            dut_id,
+            "INFO",
+            "AutoDetection",
+            f"REGEX MATCH FOUND! Pattern '{best_pattern}' matches model '{model}' "
+            f"(selected most specific of {len(regex_hits)} candidate mapping(s))",
+        )
+        info_dict["platform"] = best_mapping["platform"]
+        info_dict["node_type"] = best_mapping["node_type"]
+        if best_mapping["baseboards"]:
+            info_dict["baseboard"] = best_mapping["baseboards"][0]
+        return True
+
+    async def try_part_number_matching(
+        self, dut_id: str, part_number: str, info_dict: Dict[str, Any]
+    ) -> bool:
+        """
+        Try to match a Redfish PartNumber against the baseboard mapping's
+        ``part_numbers`` list.
+
+        Required when two baseboards publish the same Model string and can
+        only be told apart by their FRU PartNumber (e.g. GB200 NVL vs
+        GB200 NVL4 -- both publish ``Model="GB200 NVL"`` but their
+        HGX_Baseboard_0 PartNumbers differ at the ``-1201-`` vs ``-0201-``
+        infix). Like ``try_model_matching`` this runs Phase 1 (literal
+        equality) then Phase 2 (regex search) and uses the same
+        ``_mapping_specificity`` tie-break.
+
+        Args:
+            dut_id: The DUT identifier
+            part_number: The PartNumber string to match
+            info_dict: The info dictionary to update on a successful match
+        """
+        if not part_number:
+            return False
+
+        await self.logger.write_to_dut_runtime_log(
+            dut_id,
+            "DEBUG",
+            "AutoDetection",
+            f"Trying to match PartNumber: '{part_number}'",
+        )
+
+        exact_hits: List[Tuple[Dict[str, Any], str]] = []
+        for mapping in self.platform_mappings:
+            for pn_pattern in mapping.get("part_numbers") or []:
+                if pn_pattern and pn_pattern == part_number:
+                    exact_hits.append((mapping, pn_pattern))
+
+        if exact_hits:
+            best_mapping, best_pattern = max(
+                exact_hits,
+                key=lambda mp: self._mapping_specificity(mp[0], mp[1], part_number),
+            )
+            await self.logger.write_to_dut_runtime_log(
+                dut_id,
+                "INFO",
+                "AutoDetection",
+                f"EXACT PART-NUMBER MATCH FOUND! '{part_number}' matches '{best_pattern}'",
+            )
+            info_dict["platform"] = best_mapping["platform"]
+            info_dict["node_type"] = best_mapping["node_type"]
+            if best_mapping["baseboards"]:
+                info_dict["baseboard"] = best_mapping["baseboards"][0]
+            return True
+
+        regex_hits: List[Tuple[Dict[str, Any], str]] = []
+        for mapping in self.platform_mappings:
+            for pn_pattern in mapping.get("part_numbers") or []:
+                if not pn_pattern or pn_pattern == part_number:
+                    continue
+                try:
+                    if re.search(pn_pattern, part_number, re.IGNORECASE):
+                        regex_hits.append((mapping, pn_pattern))
+                except re.error as e:
+                    await self.logger.write_to_dut_runtime_log(
+                        dut_id,
+                        "WARNING",
+                        "AutoDetection",
+                        f"Invalid PartNumber regex pattern '{pn_pattern}' in platform mapping: {e}",
+                    )
+
+        if not regex_hits:
+            return False
+
+        best_mapping, best_pattern = max(
+            regex_hits,
+            key=lambda mp: self._mapping_specificity(mp[0], mp[1], part_number),
+        )
+        await self.logger.write_to_dut_runtime_log(
+            dut_id,
+            "INFO",
+            "AutoDetection",
+            f"REGEX PART-NUMBER MATCH FOUND! Pattern '{best_pattern}' matches PartNumber '{part_number}' "
+            f"(selected most specific of {len(regex_hits)} candidate mapping(s))",
+        )
+        info_dict["platform"] = best_mapping["platform"]
+        info_dict["node_type"] = best_mapping["node_type"]
+        if best_mapping["baseboards"]:
+            info_dict["baseboard"] = best_mapping["baseboards"][0]
+        return True
 
     async def detect_platform_and_baseboard(
         self,
@@ -574,9 +1066,8 @@ class AutoDetectionService:
         host_preflight_passed = (
             preflight_results.get("host", {}).get("status") == "pass"
         )
-        redfish_preflight_passed = (
-            preflight_results.get("redfish", {}).get("status") == "pass"
-        )
+        redfish_preflight_status = preflight_results.get("redfish", {}).get("status")
+        redfish_preflight_passed = redfish_preflight_status == "pass"
 
         await self.logger.write_to_dut_runtime_log(
             dut_id,
@@ -613,109 +1104,112 @@ class AutoDetectionService:
             )
             dut_config = {}
 
-        # Detection Strategy 1: Host-based detection
-        # Try host detection even if preflight didn't pass - preflight is just an optimization
-        if True:  # Always try host detection
+        _switch_detected = False
+        switch_baseboard_fallback = None
+
+        # Detection Strategy 1: BMC/Redfish detection
+        if dut_config.get("BMC_IP"):
             await self.logger.write_to_dut_runtime_log(
                 dut_id,
                 "DEBUG",
                 "AutoDetection",
-                "Attempting host-based detection",
+                "BMC IP is present - attempting Redfish detection",
             )
 
-            # First try to detect if it's a switch
+            if redfish_preflight_status == "pass":
+                await self.logger.write_to_dut_runtime_log(
+                    dut_id,
+                    "DEBUG",
+                    "AutoDetection",
+                    "Redfish preflight passed - attempting Redfish detection",
+                )
+                candidate = await self._select_best_redfish_candidate(dut_id)
+                if candidate:
+                    info_dict["platform"] = candidate["platform"]
+                    info_dict["baseboard"] = candidate["baseboard"]
+                    info_dict["node_type"] = candidate["node_type"]
+                    await self.logger.write_to_dut_runtime_log(
+                        dut_id,
+                        "INFO",
+                        "AutoDetection",
+                        "Selected Redfish detection candidate: "
+                        f"uri={candidate['uri']}, signal={candidate['signal']}, "
+                        f"model={candidate.get('model')}, manufacturer={candidate.get('manufacturer')}, "
+                        f"baseboard={candidate['baseboard']}, platform={candidate['platform']}",
+                    )
+            elif redfish_preflight_status == "fail":
+                await self.logger.write_to_dut_runtime_log(
+                    dut_id,
+                    "DEBUG",
+                    "AutoDetection",
+                    "Redfish preflight failed - skipping Redfish-based detection",
+                )
+            else:
+                await self.logger.write_to_dut_runtime_log(
+                    dut_id,
+                    "DEBUG",
+                    "AutoDetection",
+                    "No Redfish preflight results were provided - attempting Redfish detection as best-effort fallback",
+                )
+                candidate = await self._select_best_redfish_candidate(dut_id)
+                if candidate:
+                    info_dict["platform"] = candidate["platform"]
+                    info_dict["baseboard"] = candidate["baseboard"]
+                    info_dict["node_type"] = candidate["node_type"]
+                    await self.logger.write_to_dut_runtime_log(
+                        dut_id,
+                        "INFO",
+                        "AutoDetection",
+                        "Selected Redfish detection candidate: "
+                        f"uri={candidate['uri']}, signal={candidate['signal']}, "
+                        f"model={candidate.get('model')}, manufacturer={candidate.get('manufacturer')}, "
+                        f"baseboard={candidate['baseboard']}, platform={candidate['platform']}",
+                    )
+
+        # Detection Strategy 2: Host-based fallback
+        # Try host detection only if Redfish did not already determine the baseboard.
+        if not (info_dict["platform"] and info_dict["baseboard"]):
+            await self.logger.write_to_dut_runtime_log(
+                dut_id,
+                "DEBUG",
+                "AutoDetection",
+                "Attempting host-based fallback detection",
+            )
+
             try:
                 exit_code, output, stderr = await self.dut_manager.execute_host_command(
                     dut_id, "which nv"
                 )
                 if exit_code == 0 and output:
-                    # This is a switch node
+                    # Treat this as a provisional SwitchTray signal and keep going so
+                    # Redfish can refine the exact tray baseboard.
                     await self.logger.write_to_dut_runtime_log(
                         dut_id,
                         "DEBUG",
                         "AutoDetection",
-                        "NVIDIA GPU detected via 'which nv' command - this is a switch node",
+                        "NVIDIA GPU detected via 'which nv' command - switch node detected, deferring exact baseboard selection to Redfish if available",
                     )
 
-                    # Look for NVSwitch mappings in platform mappings
-                    for mapping in self.platform_mappings:
-                        if (
-                            mapping["node_type"] == "SwitchTray"
-                            and mapping["platform"] == "NVSwitch"
-                        ):
-                            info_dict["node_type"] = mapping["node_type"]
-                            info_dict["platform"] = mapping["platform"]
-                            if mapping["baseboards"]:
-                                info_dict["baseboard"] = mapping["baseboards"][0]
+                    info_dict["node_type"] = "SwitchTray"
+                    info_dict["platform"] = "NVSwitch"
+                    _switch_detected = True
 
-                                # Show detection results in the same panel format
-                                detection_text = Text()
-                                detection_text.append(
-                                    "Detection Results\n", style="bold"
-                                )
-                                detection_text.append(
-                                    f"Baseboard:    {info_dict['baseboard']}\n"
-                                )
-                                if info_dict.get("node_type"):
-                                    detection_text.append(
-                                        f"Node Type:    {info_dict['node_type']}"
-                                    )
-
-                                self.console.print(" ")
-                                self.console.print(" \n ")
-                                self.console.print(" \n ")
-                                self.console.print(" \n ")
-
-                                self.console.print(
-                                    Panel(
-                                        detection_text,
-                                        title="Platform and Baseboard Detection",
-                                        border_style="green",
-                                    )
-                                )
-
-                                if non_interactive:
-                                    self.console.print(
-                                        f"[green]Non-interactive mode: Using detected values - Platform: {info_dict.get('platform', 'Unknown')}, Baseboard: {info_dict['baseboard']}[/green]"
-                                    )
-
-                            return True, info_dict
-
-                    # Fallback if no specific mapping found
-                    if not info_dict.get("baseboard"):
-                        info_dict["node_type"] = "SwitchTray"
-                        info_dict["platform"] = "NVSwitch"
-
-                        # Show detection results in the same panel format
-                        detection_text = Text()
-                        detection_text.append("Detection Results\n", style="bold")
-                        detection_text.append(
-                            f"Baseboard:    {info_dict.get('baseboard', 'SwitchTray (Generic)')}\n"
+                    switch_mappings = [
+                        mapping
+                        for mapping in self.platform_mappings
+                        if mapping["node_type"] == "SwitchTray"
+                        and mapping["platform"] == "NVSwitch"
+                    ]
+                    if len(switch_mappings) == 1 and switch_mappings[0]["baseboards"]:
+                        info_dict["baseboard"] = switch_mappings[0]["baseboards"][0]
+                    elif switch_mappings and switch_mappings[0]["baseboards"]:
+                        switch_baseboard_fallback = switch_mappings[0]["baseboards"][0]
+                        await self.logger.write_to_dut_runtime_log(
+                            dut_id,
+                            "DEBUG",
+                            "AutoDetection",
+                            "Multiple NVSwitch tray mappings are available - waiting for Redfish to disambiguate before choosing a baseboard",
                         )
-                        if info_dict.get("node_type"):
-                            detection_text.append(
-                                f"Node Type:    {info_dict['node_type']}"
-                            )
-
-                        self.console.print(" ")
-                        self.console.print(" \n ")
-                        self.console.print(" \n ")
-                        self.console.print(" \n ")
-
-                        self.console.print(
-                            Panel(
-                                detection_text,
-                                title="Platform and Baseboard Detection",
-                                border_style="green",
-                            )
-                        )
-
-                        if non_interactive:
-                            self.console.print(
-                                f"[green]Non-interactive mode: Using detected values - Platform: {info_dict.get('platform', 'Unknown')}, Baseboard: {info_dict.get('baseboard', 'SwitchTray (Generic)')}[/green]"
-                            )
-
-                        return True, info_dict
             except Exception as e:
                 await self.logger.write_to_dut_runtime_log(
                     dut_id,
@@ -725,256 +1219,126 @@ class AutoDetectionService:
                 )
 
             # If not a switch, it must be a compute node
-            try:
-                exit_code, output, stderr = await self.dut_manager.execute_host_command(
-                    dut_id, "uname -m"
-                )
-                if exit_code == 0 and output:
-                    arch = output.strip()
-                    info_dict["node_type"] = "Compute"
-                    if arch == "x86_64":
-                        info_dict["platform"] = "x86_64"
-                    elif arch == "aarch64":
-                        info_dict["platform"] = "arm64"
-
-                    await self.logger.write_to_dut_runtime_log(
-                        dut_id,
-                        "DEBUG",
-                        "AutoDetection",
-                        f"Detected compute node with architecture: {arch}, platform: {info_dict['platform']}",
+            if not _switch_detected:
+                try:
+                    exit_code, output, stderr = await self.dut_manager.execute_host_command(
+                        dut_id, "uname -m"
                     )
+                    if exit_code == 0 and output:
+                        arch = output.strip()
+                        info_dict["node_type"] = "Compute"
+                        if arch == "x86_64":
+                            info_dict["platform"] = "x86_64"
+                        elif arch == "aarch64":
+                            info_dict["platform"] = "arm64"
 
-                    # Validate against mapping
-                    mapping = await self.validate_against_mapping(
-                        dut_id, platform=info_dict["platform"], node_type="Compute"
-                    )
-                    if mapping:
-                        # Set baseboard from mapping first (fallback)
-                        if mapping.get("baseboards"):
-                            info_dict["baseboard"] = mapping["baseboards"][0]
-                            await self.logger.write_to_dut_runtime_log(
-                                dut_id,
-                                "DEBUG",
-                                "AutoDetection",
-                                f"Set baseboard from mapping: {info_dict['baseboard']}",
-                            )
+                        await self.logger.write_to_dut_runtime_log(
+                            dut_id,
+                            "DEBUG",
+                            "AutoDetection",
+                            f"Detected compute node with architecture: {arch}, platform: {info_dict['platform']}",
+                        )
 
-                        # Try to detect baseboard via host for more specific matching
-                        try:
-                            exit_code, output, stderr = (
-                                await self.dut_manager.execute_host_command(
-                                    dut_id, "dmidecode -t 2", use_sudo=True
-                                )
-                            )
-                            success = exit_code == 0
-                            if success and output:
-                                # Parse dmidecode output for baseboard info
-                                for line in output.split("\n"):
-                                    if "Product Name:" in line:
-                                        detected_baseboard = line.split(
-                                            "Product Name:"
-                                        )[1].strip()
-                                        if detected_baseboard:
-                                            await self.logger.write_to_dut_runtime_log(
-                                                dut_id,
-                                                "DEBUG",
-                                                "AutoDetection",
-                                                f"Detected model via dmidecode: {detected_baseboard}",
-                                            )
-
-                                            # Try model matching for more specific baseboard
-                                            if await self.try_model_matching(
-                                                dut_id, detected_baseboard, info_dict
-                                            ):
-                                                await self.logger.write_to_dut_runtime_log(
-                                                    dut_id,
-                                                    "INFO",
-                                                    "AutoDetection",
-                                                    f"Successfully matched model '{detected_baseboard}' to platform '{info_dict['platform']}' and baseboard '{info_dict['baseboard']}'",
-                                                )
-                                                # Don't return here - let it flow to confirmation prompt
-                                            else:
-                                                # Model matching failed, but we still have a baseboard from mapping
-                                                await self.logger.write_to_dut_runtime_log(
-                                                    dut_id,
-                                                    "INFO",
-                                                    "AutoDetection",
-                                                    f"Model '{detected_baseboard}' didn't match specific patterns, but using baseboard from platform mapping: '{info_dict['baseboard']}'",
-                                                )
-                                                # Don't return here - let it flow to confirmation prompt
-                        except Exception as e:
-                            await self.logger.write_to_dut_runtime_log(
-                                dut_id,
-                                "WARNING",
-                                "AutoDetection",
-                                f"Error detecting compute baseboard: {e}",
-                            )
-                            # Even if dmidecode fails, we still have baseboard from mapping
-                            if info_dict.get("baseboard"):
+                        # Validate against mapping
+                        mapping = await self.validate_against_mapping(
+                            dut_id, platform=info_dict["platform"], node_type="Compute"
+                        )
+                        if mapping:
+                            # Set baseboard from mapping first (fallback)
+                            if mapping.get("baseboards"):
+                                info_dict["baseboard"] = mapping["baseboards"][0]
                                 await self.logger.write_to_dut_runtime_log(
                                     dut_id,
-                                    "INFO",
+                                    "DEBUG",
                                     "AutoDetection",
-                                    f"Using baseboard from platform mapping despite dmidecode error: '{info_dict['baseboard']}'",
+                                    f"Set baseboard from mapping: {info_dict['baseboard']}",
                                 )
-                                # Don't return here - let it flow to confirmation prompt
-            except Exception as e:
-                await self.logger.write_to_dut_runtime_log(
-                    dut_id,
-                    "WARNING",
-                    "AutoDetection",
-                    f"Error detecting CPU architecture: {e}",
-                )
 
-        # Detection Strategy 2: BMC/Redfish detection
-        # Try Redfish detection if BMC_IP is configured, regardless of preflight status
-        if dut_config.get("BMC_IP"):
+                            # Try to detect baseboard via host for more specific matching
+                            try:
+                                exit_code, output, stderr = (
+                                    await self.dut_manager.execute_host_command(
+                                        dut_id, "dmidecode -t 2", use_sudo=True
+                                    )
+                                )
+                                success = exit_code == 0
+                                if success and output:
+                                    # Parse dmidecode output for baseboard info
+                                    for line in output.split("\n"):
+                                        if "Product Name:" in line:
+                                            detected_baseboard = line.split(
+                                                "Product Name:"
+                                            )[1].strip()
+                                            if detected_baseboard:
+                                                await self.logger.write_to_dut_runtime_log(
+                                                    dut_id,
+                                                    "DEBUG",
+                                                    "AutoDetection",
+                                                    f"Detected model via dmidecode: {detected_baseboard}",
+                                                )
+
+                                                # Try model matching for more specific baseboard
+                                                if await self.try_model_matching(
+                                                    dut_id, detected_baseboard, info_dict
+                                                ):
+                                                    await self.logger.write_to_dut_runtime_log(
+                                                        dut_id,
+                                                        "INFO",
+                                                        "AutoDetection",
+                                                        f"Successfully matched model '{detected_baseboard}' to platform '{info_dict['platform']}' and baseboard '{info_dict['baseboard']}'",
+                                                    )
+                                                    # Don't return here - let it flow to confirmation prompt
+                                                else:
+                                                    # Model matching failed, but we still have a baseboard from mapping
+                                                    await self.logger.write_to_dut_runtime_log(
+                                                        dut_id,
+                                                        "INFO",
+                                                        "AutoDetection",
+                                                        f"Model '{detected_baseboard}' didn't match specific patterns, but using baseboard from platform mapping: '{info_dict['baseboard']}'",
+                                                    )
+                                                    # Don't return here - let it flow to confirmation prompt
+                            except Exception as e:
+                                await self.logger.write_to_dut_runtime_log(
+                                    dut_id,
+                                    "WARNING",
+                                    "AutoDetection",
+                                    f"Error detecting compute baseboard: {e}",
+                                )
+                                # Even if dmidecode fails, we still have a baseboard from mapping
+                                if info_dict.get("baseboard"):
+                                    await self.logger.write_to_dut_runtime_log(
+                                        dut_id,
+                                        "INFO",
+                                        "AutoDetection",
+                                        f"Using baseboard from platform mapping despite dmidecode error: '{info_dict['baseboard']}'",
+                                    )
+                                    # Don't return here - let it flow to confirmation prompt
+                except Exception as e:
+                    await self.logger.write_to_dut_runtime_log(
+                        dut_id,
+                        "WARNING",
+                        "AutoDetection",
+                        f"Error detecting CPU architecture: {e}",
+                    )
+
+        if _switch_detected and not info_dict.get("baseboard") and switch_baseboard_fallback:
+            info_dict["baseboard"] = switch_baseboard_fallback
             await self.logger.write_to_dut_runtime_log(
                 dut_id,
-                "DEBUG",
+                "INFO",
                 "AutoDetection",
-                "BMC IP is present - attempting Redfish detection",
+                f"Redfish did not disambiguate switch tray baseboard, falling back to '{switch_baseboard_fallback}'",
             )
-
-            if redfish_preflight_passed:
-                await self.logger.write_to_dut_runtime_log(
-                    dut_id,
-                    "DEBUG",
-                    "AutoDetection",
-                    "Redfish preflight passed - attempting Redfish detection",
-                )
-
-                # Try Redfish detection for both platform and baseboard
-                chassis_id_list = [
-                    "HGX_BMC_0",
-                    "Chassis_0",
-                    "HGX",
-                    "BMC_0",
-                    "HMC_0",
-                    "MGX_NVSwitch_0",
-                    "MGX_NVSwitch_1",
-                    "MGX_BMC_0",
-                    "DGX",
-                ]
-
-                success, chassis_collection, _, _ = (
-                    await self.dut_manager.execute_redfish_request(
-                        dut_id, "GET", "/redfish/v1/Chassis/"
-                    )
-                )
-                if success and chassis_collection:
-                    # First look for BMC_0 or HGX_BMC_0
-                    bmc_chassis = None
-                    for member in chassis_collection.get("Members", []):
-                        chassis_uri = member.get("@odata.id")
-                        if not chassis_uri:
-                            continue
-
-                        chassis_id = chassis_uri.split("/")[-1]
-                        if chassis_id in chassis_id_list:
-                            # Get details for this chassis
-                            success, chassis_info, _, _ = (
-                                await self.dut_manager.execute_redfish_request(
-                                    dut_id, "GET", chassis_uri
-                                )
-                            )
-                            if success and chassis_info:
-                                model = chassis_info.get("Model")
-                                await self.logger.write_to_dut_runtime_log(
-                                    dut_id,
-                                    "DEBUG",
-                                    "AutoDetection",
-                                    f"Redfish chassis {chassis_id} detected model: '{model}'",
-                                )
-                                if await self.try_model_matching(
-                                    dut_id, model, info_dict
-                                ):
-                                    bmc_chassis = chassis_info
-                                    break
-
-                    # If we didn't find BMC_0/HGX_BMC_0 or couldn't determine platform/baseboard,
-                    # check other chassis members for power shelf
-                    await self.logger.write_to_dut_runtime_log(
-                        dut_id,
-                        "DEBUG",
-                        "AutoDetection",
-                        "Checking other chassis members for power shelf",
-                    )
-
-                    if not info_dict["platform"]:
-                        for member in chassis_collection.get("Members", []):
-                            chassis_uri = member.get("@odata.id")
-                            if not chassis_uri:
-                                continue
-
-                            # Skip chassis we already tried in the primary detection
-                            chassis_id = chassis_uri.split("/")[-1]
-                            if chassis_id in chassis_id_list:
-                                continue
-
-                            # Get details for this chassis
-                            success, chassis_info, _, _ = (
-                                await self.dut_manager.execute_redfish_request(
-                                    dut_id, "GET", chassis_uri
-                                )
-                            )
-                            if not success or not chassis_info:
-                                continue
-
-                            # Check if this is a power shelf (DELTA manufacturer)
-                            manufacturer = chassis_info.get("Manufacturer")
-                            if manufacturer and manufacturer.upper() == "DELTA":
-                                # Look for PowerShelf mappings in platform mappings
-                                for mapping in self.platform_mappings:
-                                    if (
-                                        mapping["node_type"] == "PowerShelf"
-                                        and mapping["platform"] == "PowerShelf"
-                                        and manufacturer.upper()
-                                        in [
-                                            m.upper()
-                                            for m in mapping.get("manufacturer", [])
-                                        ]
-                                    ):
-                                        info_dict["node_type"] = mapping["node_type"]
-                                        info_dict["platform"] = mapping["platform"]
-                                        if mapping["baseboards"]:
-                                            info_dict["baseboard"] = mapping[
-                                                "baseboards"
-                                            ][0]
-                                        # Don't return here - let it flow to confirmation prompt
-                                        break
-
-                                # Fallback if no specific mapping found
-                                if not info_dict.get("baseboard"):
-                                    info_dict["node_type"] = "PowerShelf"
-                                    info_dict["platform"] = "PowerShelf"
-                                    # Don't return here - let it flow to confirmation prompt
-
-                            # Try model matching for non-power shelf chassis
-                            model = chassis_info.get("Model")
-                            if model:
-                                await self.logger.write_to_dut_runtime_log(
-                                    dut_id,
-                                    "DEBUG",
-                                    "AutoDetection",
-                                    f"Redfish chassis {chassis_id} detected model: '{model}'",
-                                )
-                                if await self.try_model_matching(
-                                    dut_id, model, info_dict
-                                ):
-                                    bmc_chassis = chassis_info
-                                    break
-            else:
-                await self.logger.write_to_dut_runtime_log(
-                    dut_id,
-                    "DEBUG",
-                    "AutoDetection",
-                    "Redfish preflight failed - skipping Redfish-based detection",
-                )
 
         # Check if detection was successful
         self.console.print("[green]Detection completed, processing results...[/green]")
-        detection_successful = bool(info_dict["platform"] and info_dict["baseboard"])
+        detection_successful = bool(
+            info_dict["platform"]
+            and (
+                info_dict["baseboard"]
+                or (_switch_detected and info_dict.get("node_type") == "SwitchTray")
+            )
+        )
 
         if not detection_successful:
             # Provide specific error information
@@ -1002,52 +1366,21 @@ class AutoDetectionService:
             f"Detection complete - Platform: {info_dict['platform']}, Baseboard: {info_dict['baseboard']}, NodeType: {info_dict['node_type']}",
         )
 
+        if (
+            _switch_detected
+            and info_dict.get("platform") == "NVSwitch"
+            and info_dict.get("node_type") == "SwitchTray"
+            and not info_dict.get("baseboard")
+        ):
+            self.console.print("[green]Auto-detection completed successfully![/green]")
+            return True, info_dict
+
         # If detection was successful or failed, prompt user for confirmation (unless non-interactive)
         # This allows user to confirm detected values or manually select if detection failed
         try:
-            confirmed_platform, confirmed_baseboard = (
-                self.prompt_for_detection_confirmation(
-                    info_dict["platform"],
-                    info_dict["baseboard"],
-                    info_dict["node_type"],
-                    non_interactive,
-                )
+            return await self._finalize_detection_with_confirmation(
+                dut_id, info_dict, non_interactive
             )
-
-            # Update info_dict with confirmed values
-            info_dict["platform"] = confirmed_platform
-            info_dict["baseboard"] = confirmed_baseboard
-
-            # For confirmed values, we need to look up the node_type from the mapping
-            for mapping in self.platform_mappings:
-                if (
-                    confirmed_platform == mapping["platform"]
-                    and confirmed_baseboard in mapping["baseboards"]
-                ):
-                    info_dict["node_type"] = mapping["node_type"]
-                    break
-
-            await self.logger.write_to_dut_runtime_log(
-                dut_id,
-                "INFO",
-                "AutoDetection",
-                f"User confirmed - Platform: {confirmed_platform}, Baseboard: {confirmed_baseboard}, NodeType: {info_dict['node_type']}",
-            )
-
-            self.console.print("[green]Auto-detection completed successfully![/green]")
-
-            return True, info_dict  # Always return success if user confirmed
-
-        except (KeyboardInterrupt, EOFError):
-            # User cancelled
-            await self.logger.write_to_dut_runtime_log(
-                dut_id,
-                "INFO",
-                "AutoDetection",
-                "User cancelled auto-detection process",
-            )
-            info_dict["error"] = "User cancelled auto-detection process"
-            return False, info_dict
         except ValueError as e:
             # Non-interactive mode failure
             await self.logger.write_to_dut_runtime_log(

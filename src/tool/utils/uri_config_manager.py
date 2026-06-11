@@ -139,14 +139,68 @@ class URIConfigManager:
                 # Use inline URI overrides from DUT config
                 uri_overrides = dut_config.get("uri_overrides", {})
                 if uri_overrides:
-                    self.dut_uri_configs[dut_id] = uri_overrides
+                    self.dut_uri_configs[dut_id] = uri_overrides.copy()
                     logger.info(f"Loaded inline URI overrides for DUT {dut_id}")
                 else:
                     self.dut_uri_configs[dut_id] = {}
 
+                # Also store RF_DEFAULT_PREFIX if present (for conflict detection)
+                rf_default_prefix = dut_config.get("RF_DEFAULT_PREFIX")
+                if rf_default_prefix:
+                    self.dut_uri_configs[dut_id][
+                        "RF_DEFAULT_PREFIX"
+                    ] = rf_default_prefix
+                    logger.debug(
+                        f"Stored RF_DEFAULT_PREFIX for DUT {dut_id}: {rf_default_prefix}"
+                    )
+
+                # Store RF_HMC_DEFAULT_PREFIX if present (HMC-specific prefix override)
+                rf_hmc_default_prefix = dut_config.get("RF_HMC_DEFAULT_PREFIX")
+                if rf_hmc_default_prefix:
+                    self.dut_uri_configs[dut_id][
+                        "RF_HMC_DEFAULT_PREFIX"
+                    ] = rf_hmc_default_prefix
+                    logger.debug(
+                        f"Stored RF_HMC_DEFAULT_PREFIX for DUT {dut_id}: {rf_hmc_default_prefix}"
+                    )
+
         except Exception as e:
             logger.error(f"Failed to load DUT URI configuration for {dut_id}: {e}")
             self.dut_uri_configs[dut_id] = {}
+
+    def update_dut_rf_prefix(self, dut_id: str, rf_prefix: str) -> None:
+        """
+        Update the RF_DEFAULT_PREFIX for a specific DUT.
+
+        This is called after DUT creation when RF_DEFAULT_PREFIX may have been
+        modified by applying tool-level prefix_override.
+
+        Args:
+            dut_id: The DUT identifier
+            rf_prefix: The new RF_DEFAULT_PREFIX value
+        """
+        if dut_id not in self.dut_uri_configs:
+            self.dut_uri_configs[dut_id] = {}
+
+        self.dut_uri_configs[dut_id]["RF_DEFAULT_PREFIX"] = rf_prefix
+        logger.debug(f"Updated RF_DEFAULT_PREFIX for DUT {dut_id}: {rf_prefix}")
+
+    def update_dut_hmc_prefix(self, dut_id: str, hmc_prefix: str) -> None:
+        """
+        Update the RF_HMC_DEFAULT_PREFIX for a specific DUT.
+
+        This is called after DUT creation when RF_HMC_DEFAULT_PREFIX has been
+        resolved (DUT-level or from tool-level hmc_prefix_override).
+
+        Args:
+            dut_id: The DUT identifier
+            hmc_prefix: The new RF_HMC_DEFAULT_PREFIX value
+        """
+        if dut_id not in self.dut_uri_configs:
+            self.dut_uri_configs[dut_id] = {}
+
+        self.dut_uri_configs[dut_id]["RF_HMC_DEFAULT_PREFIX"] = hmc_prefix
+        logger.debug(f"Updated RF_HMC_DEFAULT_PREFIX for DUT {dut_id}: {hmc_prefix}")
 
     def get_uri(
         self,
@@ -175,7 +229,7 @@ class URIConfigManager:
         if uri_key in dut_uris:
             uri = dut_uris[uri_key]
             logger.debug(f"Using DUT-specific URI for {dut_id}.{uri_key}: {uri}")
-            return self._apply_prefix_override(uri)
+            return self._apply_prefix_override(uri, dut_id)
 
         # Priority 2: Baseboard-specific URI overrides
         if baseboard and self.tool_uris:
@@ -186,7 +240,7 @@ class URIConfigManager:
                 logger.debug(
                     f"Using baseboard-specific URI for {baseboard}.{uri_key}: {uri}"
                 )
-                return self._apply_prefix_override(uri)
+                return self._apply_prefix_override(uri, dut_id)
 
         # Priority 3: Platform-specific URI overrides
         if platform and self.tool_uris:
@@ -197,7 +251,7 @@ class URIConfigManager:
                 logger.debug(
                     f"Using platform-specific URI for {platform}.{uri_key}: {uri}"
                 )
-                return self._apply_prefix_override(uri)
+                return self._apply_prefix_override(uri, dut_id)
 
         # Priority 4: Tool-level default URIs
         if self.tool_uris:
@@ -205,21 +259,22 @@ class URIConfigManager:
             if uri_key in default_uris:
                 uri = default_uris[uri_key]
                 logger.debug(f"Using tool-level default URI for {uri_key}: {uri}")
-                return self._apply_prefix_override(uri)
+                return self._apply_prefix_override(uri, dut_id)
 
         # Fallback: Return a standard URI pattern
-        fallback_uri = self._get_fallback_uri(uri_key)
+        fallback_uri = self._get_fallback_uri(uri_key, dut_id)
         logger.debug(
             f"No URI configuration found for {uri_key}, using fallback: {fallback_uri}"
         )
-        return self._apply_prefix_override(fallback_uri)
+        return fallback_uri
 
-    def _get_fallback_uri(self, uri_key: str) -> str:
+    def _get_fallback_uri(self, uri_key: str, dut_id: Optional[str] = None) -> str:
         """
         Get fallback URI for a key when no configuration is found.
 
         Args:
             uri_key: The URI key
+            dut_id: Optional DUT ID for prefix override logic
 
         Returns:
             str: Fallback URI
@@ -237,30 +292,98 @@ class URIConfigManager:
 
         # Ultimate fallback - construct URI from key and apply prefix override
         fallback_uri = f"/redfish/v1/{uri_key}"
-        return self._apply_prefix_override(fallback_uri)
+        return self._apply_prefix_override(fallback_uri, dut_id)
 
-    def _apply_prefix_override(self, uri: str) -> str:
+    def _is_hmc_uri(self, uri: str) -> bool:
+        """
+        Determine if a URI targets an HMC-owned resource on arm64 (Redfish aggregation).
+
+        HMC resources are identified by the presence of an HGX_ resource segment in
+        the URI path (e.g. /Systems/HGX_Baseboard_0/... or /Managers/HGX_BMC_0/...).
+        The prefix used to identify HMC resources is configurable via
+        ``uri_overrides.hmc_resource_prefix`` in tool_config.yaml (default: ``HGX_``).
+
+        Args:
+            uri: The Redfish URI to inspect
+
+        Returns:
+            bool: True if the URI targets an HMC resource, False otherwise
+        """
+        hmc_resource_prefix = (
+            self.tool_uris.get("hmc_resource_prefix", "HGX_")
+            if self.tool_uris
+            else "HGX_"
+        )
+        return f"/{hmc_resource_prefix}" in uri
+
+    def _apply_prefix_override(self, uri: str, dut_id: Optional[str] = None) -> str:
         """
         Apply prefix override if configured in the tool URIs.
 
+        For URIs targeting HMC resources (containing an HGX_ path segment), the
+        HMC-specific prefix is applied in this priority order:
+          1. DUT-level ``RF_HMC_DEFAULT_PREFIX`` (dut_config.yaml)
+          2. Tool-level ``uri_overrides.hmc_prefix_override`` (tool_config.yaml)
+
+        For all other (BMC) URIs, the standard prefix logic applies:
+          1. DUT-level ``RF_DEFAULT_PREFIX`` (if non-default, skips tool-level override)
+          2. Tool-level ``uri_overrides.prefix_override``
+
         Args:
             uri: The URI to potentially modify
+            dut_id: Optional DUT ID to check for DUT-specific prefix settings
 
         Returns:
-            str: The URI with prefix override applied if configured
+            str: The URI with the appropriate prefix override applied
         """
+        dut_uris = self.dut_uri_configs.get(dut_id, {}) if dut_id else {}
+
+        # --- HMC URI path ---
+        # HMC resources carry an HGX_ path segment and may live under a different
+        # Redfish prefix than the Customer BMC (e.g. /hgx/redfish/v1 vs /redfish/v1).
+        #
+        # Priority when RF_HMC_DEFAULT_PREFIX / hmc_prefix_override IS set:
+        #   Apply it and return immediately — it takes full precedence over any
+        #   global prefix_override.
+        #
+        # When neither HMC-specific prefix is set:
+        #   Fall through to the global prefix_override logic below so that a single
+        #   global prefix applies to ALL collectors (BMC and HMC alike).
+        if self._is_hmc_uri(uri):
+            # Priority 1: DUT-level HMC prefix (no tool_uris required)
+            hmc_prefix = dut_uris.get("RF_HMC_DEFAULT_PREFIX")
+            # Priority 2: Tool-level HMC prefix override (requires tool_uris)
+            if not hmc_prefix and self.tool_uris:
+                hmc_prefix = self.tool_uris.get("hmc_prefix_override")
+
+            if hmc_prefix:
+                # An HMC-specific prefix is configured — apply it and stop here.
+                if "/redfish/v1" in uri and not uri.startswith(hmc_prefix):
+                    uri = uri.replace("/redfish/v1", hmc_prefix, 1)
+                    logger.debug(f"Applied HMC prefix override '{hmc_prefix}' to URI: {uri}")
+                return uri
+            # No HMC-specific prefix configured — fall through to global prefix_override
+            # so that a single global prefix covers both BMC and HMC collectors.
+
+        # --- BMC URI path (also reached by HMC URIs when no HMC-specific prefix set) ---
         if not self.tool_uris:
             return uri
 
-        # Check for prefix override configuration
+        # If DUT has a custom RF_DEFAULT_PREFIX (not the default), skip tool-level
+        # prefix_override — the DUT's normalize_redfish_uri will handle it.
+        dut_rf_prefix = dut_uris.get("RF_DEFAULT_PREFIX")
+        if dut_rf_prefix and dut_rf_prefix != "/redfish/v1":
+            logger.debug(
+                f"Skipping tool-level prefix_override for DUT {dut_id} "
+                f"(has custom RF_DEFAULT_PREFIX: {dut_rf_prefix})"
+            )
+            return uri
+
         prefix_override = self.tool_uris.get("prefix_override")
         if not prefix_override:
             return uri
 
-        # Apply prefix override if URI contains the standard Redfish prefix
-        # but not if it already contains the custom prefix
         if "/redfish/v1" in uri and not uri.startswith(prefix_override):
-            # Replace the standard prefix with the configured override
             uri = uri.replace("/redfish/v1", prefix_override, 1)
             logger.debug(f"Applied prefix override '{prefix_override}' to URI: {uri}")
 

@@ -20,6 +20,8 @@ Provides utilities for auto-detecting and working with collector definition
 spreadsheets including the Telemetry Catalog.
 """
 
+import logging
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -28,6 +30,28 @@ from rich.table import Table
 from rich.text import Text
 
 from .console_output import create_sanitized_console
+from .frozen_path import get_base_path, is_frozen
+
+_logger = logging.getLogger(__name__)
+
+
+def _config_search_dirs() -> list[Path]:
+    """Return candidate config directories, ordered by priority.
+
+    Search order:
+      1. CWD/config (original behaviour)
+      2. Directory containing the binary + /config (frozen mode)
+      3. get_base_path()/config (frozen extraction dir)
+    """
+    dirs = [Path("config")]
+    if is_frozen():
+        binary_dir = Path(sys.argv[0]).resolve().parent / "config"
+        base_dir = get_base_path() / "config"
+        if binary_dir not in dirs:
+            dirs.append(binary_dir)
+        if base_dir not in dirs:
+            dirs.append(base_dir)
+    return dirs
 
 
 def auto_detect_spreadsheet(
@@ -36,7 +60,7 @@ def auto_detect_spreadsheet(
     """
     Auto-detect the latest Telemetry Catalog spreadsheet in config directory.
 
-    Uses version number parsing (e.g., v3.15.1 > v3.15) to find the highest version.
+    Uses version number parsing (e.g., v4.0 > v3.15) to find the highest version.
 
     Args:
         spreadsheet: Optional path to a spreadsheet
@@ -45,57 +69,60 @@ def auto_detect_spreadsheet(
     if spreadsheet:
         return spreadsheet
 
-    # Try to find the latest spreadsheet in config directory
-    config_dir = Path("config")
-    if config_dir.exists():
-        # Look for the latest Telemetry Catalog spreadsheet
-        spreadsheet_files = list(config_dir.glob("Telemetry_Catalog_*.xlsx"))
-        if spreadsheet_files:
-            import re
+    try:
+        import re
 
-            # Pattern to match: Telemetry_Catalog_v{major}.{minor}.{patch}.xlsx
-            pattern = re.compile(r"Telemetry_Catalog_v(\d+)\.(\d+)\.(\d+)\.xlsx")
+        pattern_3 = re.compile(r"Telemetry_Catalog_v(\d+)\.(\d+)\.(\d+)\.xlsx")
+        pattern_2 = re.compile(r"Telemetry_Catalog_v(\d+)\.(\d+)\.xlsx")
 
-            versioned_files = []
-            unversioned_files = []
+        versioned_files: list[tuple[int, int, int, Path]] = []
+        unversioned_files: list[Path] = []
 
-            for file in spreadsheet_files:
-                match = pattern.match(file.name)
+        for config_dir in _config_search_dirs():
+            if not config_dir.exists():
+                continue
+            for file in config_dir.glob("Telemetry_Catalog_*.xlsx"):
+                try:
+                    name = file.name
+                except Exception:
+                    continue
+
+                match = pattern_3.match(name)
                 if match:
                     major, minor, patch = map(int, match.groups())
                     versioned_files.append((major, minor, patch, file))
+                    continue
+                simple_match = pattern_2.match(name)
+                if simple_match:
+                    major, minor = map(int, simple_match.groups())
+                    versioned_files.append((major, minor, 0, file))
                 else:
-                    # Try simpler pattern: v{major}.{minor}
-                    simple_pattern = re.compile(
-                        r"Telemetry_Catalog_v(\d+)\.(\d+)\.xlsx"
-                    )
-                    simple_match = simple_pattern.match(file.name)
-                    if simple_match:
-                        major, minor = map(int, simple_match.groups())
-                        versioned_files.append((major, minor, 0, file))
-                    else:
-                        unversioned_files.append(file)
+                    unversioned_files.append(file)
 
-            # Use highest version if versioned files exist
-            if versioned_files:
-                versioned_files.sort(reverse=True)
-                latest_spreadsheet = versioned_files[0][3]
-                version = latest_spreadsheet.stem.replace("Telemetry_Catalog_", "")
-            else:
-                # Fallback to modification time for unversioned files
+        if versioned_files:
+            versioned_files.sort(reverse=True)
+            latest_spreadsheet = versioned_files[0][3]
+            version = latest_spreadsheet.stem.replace("Telemetry_Catalog_", "")
+        elif unversioned_files:
+            try:
                 latest_spreadsheet = max(
                     unversioned_files, key=lambda p: p.stat().st_mtime
                 )
-                version = latest_spreadsheet.stem.replace("Telemetry_Catalog_", "")
+            except Exception:
+                return None
+            version = latest_spreadsheet.stem.replace("Telemetry_Catalog_", "")
+        else:
+            return None
 
-            if not suppress_print:
-                sanitized_console = create_sanitized_console()
-                sanitized_console.print_info(
-                    f"Detected Telemetry Catalog {version} in config directory. Auto-loading..."
-                )
-            return latest_spreadsheet
-
-    return None
+        if not suppress_print:
+            sanitized_console = create_sanitized_console()
+            sanitized_console.print_info(
+                f"Detected Telemetry Catalog {version} in config directory. Auto-loading..."
+            )
+        return latest_spreadsheet
+    except Exception:
+        _logger.debug("Failed to auto-detect spreadsheet", exc_info=True)
+        return None
 
 
 def validate_spreadsheet_requirement(spreadsheet: Optional[Path]) -> None:

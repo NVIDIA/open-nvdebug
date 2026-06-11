@@ -22,13 +22,14 @@ progress tracking, and detailed debug information for concurrent operations.
 """
 
 import asyncio
+import atexit
 import contextvars
+import fcntl
 import json
 import logging
 import os
 import re
 import sys
-import fcntl
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -42,12 +43,20 @@ _collector_context: contextvars.ContextVar[Optional[str]] = contextvars.ContextV
 from ..utils.constants import ASCII_HEADER
 from ..utils.enums import (
     CollectorServiceMapping,
-    PreflightChecks,
     get_main_preflight_names,
 )
-from ..utils.json_utils import safe_json_dump, safe_json_dumps
+from ..utils.json_utils import safe_json_dump
+from ..utils.streaming import (
+    append_stream_window_to_filename,
+    format_stream_window_component,
+    normalize_stream_window,
+)
 
 logger = logging.getLogger(__name__)
+
+MAX_LOG_FILE_SIZE_MB = 100  # Warn when a single log file exceeds this
+_truncation_warned: set = set()
+_UNSAFE_PATH_CHARS = re.compile(r"[^A-Za-z0-9._ -]+")
 
 
 class StreamToLogger:
@@ -77,13 +86,13 @@ class StreamToLogger:
 
     def _is_progress_bar_line(self, line):
         """
-        Check if a line is a progress bar update.
+        Check if a line is a progress bar update (NOT a table).
 
         Args:
             line: Line to check
         """
-        # Progress bar indicators
-        progress_indicators = [
+        # Spinner characters used in progress bars
+        spinner_chars = [
             "⠋",
             "⠙",
             "⠹",
@@ -94,15 +103,51 @@ class StreamToLogger:
             "⠧",
             "⠇",
             "⠏",
-            "━",
-            "╺",
-            "╸",
         ]
 
-        # Check for progress bar patterns
-        has_spinner = any(indicator in line for indicator in progress_indicators)
+        # Progress bar specific characters
+        progress_bar_chars = ["━", "╺", "╸"]
+
+        # Table box drawing characters - these indicate a table, not a progress bar
+        table_box_chars = [
+            "┏",
+            "┓",
+            "┗",
+            "┛",
+            "┃",
+            "┣",
+            "┫",
+            "┳",
+            "┻",
+            "╋",
+            "┡",
+            "┩",
+            "╇",
+            "╈",
+            "│",
+            "─",
+            "├",
+            "┤",
+            "┬",
+            "┴",
+            "┼",
+            "╭",
+            "╮",
+            "╯",
+            "╰",
+        ]
+
+        # Check if this looks like a table line (has box drawing characters)
+        is_table_line = any(char in line for char in table_box_chars)
+
+        # Tables should be logged normally, not treated as progress bars
+        if is_table_line:
+            return False
+
+        # Check for actual progress bar patterns
+        has_spinner = any(char in line for char in spinner_chars)
         has_percentage = "%" in line
-        has_progress_chars = "━" in line or "╺" in line or "╸" in line
+        has_progress_chars = any(char in line for char in progress_bar_chars)
         has_time_remaining = "0:00:" in line
 
         # If it looks like a progress bar, filter it
@@ -133,6 +178,8 @@ class StreamToLogger:
                                 f"PROGRESS: {line.split(' - ')[0] if ' - ' in line else line}",
                             )
                         elif "Parallel Collectors" in line or "redfish:" in line:
+                            self.logger.log(self.level, f"PROGRESS: {line}")
+                        elif "Dependency" in line:
                             self.logger.log(self.level, f"PROGRESS: {line}")
                         self.last_progress_line = line
                 else:
@@ -232,12 +279,74 @@ class AsyncSafeLogger:
         self.original_stderr = None
         self.stdout_logger = None
         self.stderr_logger = None
+        self._stdout_capture_handler = None
+        self._stderr_capture_handler = None
 
         # Sanitizer for sensitive data
         self.sanitizer = sanitizer
 
         # Per-file asyncio locks for metadata writes
         self._metadata_file_locks: Dict[str, asyncio.Lock] = {}
+
+        # Register emergency cleanup for file handles
+        atexit.register(self._emergency_file_cleanup)
+
+    @staticmethod
+    def _safe_path_component(value: Any, fallback: str) -> str:
+        """Return a filesystem-safe single path component."""
+        text = str(value or "").strip()
+        text = text.replace("/", "_").replace("\\", "_")
+        text = _UNSAFE_PATH_CHARS.sub("_", text).strip(" .")
+        while ".." in text:
+            text = text.replace("..", "_")
+        return text or fallback
+
+    @classmethod
+    def _safe_output_filename(cls, filename: Any) -> str:
+        """Return a safe filename, never a relative or absolute path."""
+        return cls._safe_path_component(filename, "output.txt")
+
+    def _resolve_under_log_root(self, path: Path) -> Path:
+        """Resolve a path and ensure it remains under the logger root."""
+        base = self.base_log_dir.resolve()
+        resolved = path.resolve()
+        try:
+            resolved.relative_to(base)
+        except ValueError as exc:
+            raise ValueError(f"Refusing to write outside log directory: {path}") from exc
+        return resolved
+
+    def _emergency_file_cleanup(self) -> None:
+        """Called by atexit to ensure file handles are closed on unexpected exit."""
+        for dut_id, handle in getattr(self, "dut_runtime_files", {}).items():
+            try:
+                if handle and not handle.closed:
+                    handle.close()
+            except Exception:
+                pass
+        for attr in ("runtime_file_handle", "error_file_handle"):
+            handle = getattr(self, attr, None)
+            if handle and hasattr(handle, "closed") and not handle.closed:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+
+    def __del__(self) -> None:
+        """Emergency cleanup of file handles if stop() wasn't called."""
+        for dut_id, handle in getattr(self, "dut_runtime_files", {}).items():
+            try:
+                if handle and not handle.closed:
+                    handle.close()
+            except Exception:
+                pass
+        for attr in ("runtime_file_handle", "error_file_handle"):
+            handle = getattr(self, attr, None)
+            if handle and hasattr(handle, "closed") and not handle.closed:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
 
     async def start(self) -> None:
         """
@@ -282,9 +391,14 @@ class AsyncSafeLogger:
         stdout_logger = logging.getLogger("stdout")
         stderr_logger = logging.getLogger("stderr")
 
+        self._remove_stale_capture_handlers(stdout_logger)
+        self._remove_stale_capture_handlers(stderr_logger)
+
         # Create handlers that write to our runtime log
         stdout_handler = logging.StreamHandler(self.runtime_file_handle)
         stderr_handler = logging.StreamHandler(self.runtime_file_handle)
+        stdout_handler._nvdebug_capture_handler = True
+        stderr_handler._nvdebug_capture_handler = True
 
         # Set formatters
         formatter = logging.Formatter(
@@ -298,6 +412,8 @@ class AsyncSafeLogger:
         stderr_logger.addHandler(stderr_handler)
         stdout_logger.setLevel(logging.INFO)
         stderr_logger.setLevel(logging.ERROR)
+        self._stdout_capture_handler = stdout_handler
+        self._stderr_capture_handler = stderr_handler
 
         # Store original streams
         self.original_stdout = sys.stdout
@@ -315,6 +431,27 @@ class AsyncSafeLogger:
         sys.stdout = self.stdout_logger
         sys.stderr = self.stderr_logger
 
+    @staticmethod
+    def _remove_stale_capture_handlers(target_logger: logging.Logger) -> None:
+        """Remove old nvdebug stream-capture handlers backed by closed streams."""
+        for handler in list(target_logger.handlers):
+            if not getattr(handler, "_nvdebug_capture_handler", False):
+                continue
+            stream = getattr(handler, "stream", None)
+            if stream is not None and not getattr(stream, "closed", False):
+                continue
+            target_logger.removeHandler(handler)
+            handler.close()
+
+    def _remove_capture_handler(
+        self, target_logger: logging.Logger, handler: Optional[logging.Handler]
+    ) -> None:
+        if handler is None:
+            return
+        if handler in target_logger.handlers:
+            target_logger.removeHandler(handler)
+        handler.close()
+
     async def stop(self) -> None:
         """
         Stop the logging system and restore stdout/stderr.
@@ -327,7 +464,10 @@ class AsyncSafeLogger:
                 try:
                     # Check if "Completed at:" timestamp was already written
                     # (to avoid duplicates when cleanup writes timestamps early)
-                    log_path = self.log_dir / dut_id / "nvdebug_runtime_output.txt"
+                    dut_log_dir = self.dut_log_dirs.get(dut_id) or self.get_dut_log_dir(
+                        dut_id
+                    )
+                    log_path = dut_log_dir / "nvdebug_runtime_output.txt"
                     timestamp_already_written = False
                     if log_path.exists():
                         try:
@@ -354,7 +494,7 @@ class AsyncSafeLogger:
 
                     # Always close the file
                     dut_runtime_handle.close()
-                except Exception as e:
+                except Exception:
                     # Log error but continue with other cleanup
                     pass
 
@@ -384,6 +524,15 @@ class AsyncSafeLogger:
                 for line in footer_lines:
                     self.runtime_file_handle.write(line + "\n")
                 self.runtime_file_handle.flush()
+
+            self._remove_capture_handler(
+                logging.getLogger("stdout"), self._stdout_capture_handler
+            )
+            self._remove_capture_handler(
+                logging.getLogger("stderr"), self._stderr_capture_handler
+            )
+            self._stdout_capture_handler = None
+            self._stderr_capture_handler = None
 
             # Close file handles
             if (
@@ -445,42 +594,6 @@ class AsyncSafeLogger:
                     "WARN",
                     "AsyncSafeLogger",
                     f"Failed to write DUT metadata for {dut_id}: {e}",
-                )
-            except Exception:
-                pass
-
-    async def log_collector_output(
-        self, collector_id: str, dut_id: str, content: str
-    ) -> None:
-        """
-        Log collector output to a collector-specific file.
-
-        Args:
-            collector_id: Collector ID.
-            dut_id: DUT ID.
-            content: Content to log.
-        """
-        try:
-            # Create collector log file
-            file_path = await self.create_collector_log_file(
-                dut_id,
-                self._get_collector_group(collector_id),
-                collector_id,
-                "output.log",
-            )
-
-            # Write content
-            async with asyncio.Lock():
-                with open(file_path, "a") as f:
-                    f.write(f"{content}\n")
-        except Exception as e:
-            # Best-effort: log error to runtime
-            try:
-                await self.write_to_dut_runtime_log(
-                    dut_id,
-                    "WARN",
-                    "AsyncSafeLogger",
-                    f"Failed to log collector output for {collector_id} on {dut_id}: {e}",
                 )
             except Exception:
                 pass
@@ -583,6 +696,12 @@ class AsyncSafeLogger:
                 "error_messages", []
             )
             execution_time = collector_result.get("execution_time", None)
+            command_execution = collector_result.get("context", {}).get(
+                "command_execution"
+            )
+            request_response_capture = collector_result.get("context", {}).get(
+                "request_response_capture"
+            )
 
             # Debug logging to see what we extracted
             await self.write_to_dut_runtime_log(
@@ -632,6 +751,12 @@ class AsyncSafeLogger:
                     else "unknown"
                 ),
             }
+
+            if command_execution:
+                status_data["command_execution"] = command_execution
+
+            if request_response_capture:
+                status_data["request_response_capture"] = request_response_capture
 
             # Extract all stages and their commands from collector definition
             if collector_info and "stages" in collector_info:
@@ -772,7 +897,14 @@ class AsyncSafeLogger:
             timestamp = datetime.now().strftime("%H:%M:%S")
             print(f"[{timestamp}] [{level}] [{component}] {message}")
 
-    async def log_runtime(self, level: str, component: str, message: str) -> None:
+    async def log_runtime(
+        self,
+        level: str,
+        component: str,
+        message: str,
+        dut_id: Optional[str] = None,
+        collector_id: Optional[str] = None,
+    ) -> None:
         """
         Log runtime messages.
 
@@ -780,6 +912,8 @@ class AsyncSafeLogger:
             level: Logging level
             component: Component name
             message: Message to log
+            dut_id: Optional DUT identifier for per-DUT logging
+            collector_id: Optional collector identifier for context tracking
         """
         # Skip DEBUG level messages if debug mode is not enabled
         if level.upper() == "DEBUG" and not self.debug_mode:
@@ -799,6 +933,12 @@ class AsyncSafeLogger:
         # Sanitize message if sanitizer is available
         if self.sanitizer:
             message = self.sanitizer.sanitize(message)
+
+        if dut_id:
+            await self.write_to_dut_runtime_log(
+                dut_id, level, component, message, collector_id
+            )
+            return
 
         async with self.runtime_lock:
             # Always write to global runtime log
@@ -870,33 +1010,34 @@ class AsyncSafeLogger:
             dut_id: DUT ID
         """
         try:
-            dut_log_dir = self.base_log_dir / dut_id
+            safe_dut_id = self._safe_path_component(dut_id, "dut")
+            dut_log_dir = self._resolve_under_log_root(self.base_log_dir / safe_dut_id)
             dut_log_dir.mkdir(parents=True, exist_ok=True)
 
             # Create subdirectories
             for subdir in ["redfish", "ipmi", "host", "ssh", "error-logs"]:
                 (dut_log_dir / subdir).mkdir(exist_ok=True)
 
-            # Create per-DUT runtime log file
+            append_mode = self._get_tool_config_value("append", False)
+
+            # Create per-DUT runtime log file (like legacy nvdebug)
             dut_runtime_file = dut_log_dir / "nvdebug_runtime_output.txt"
 
-            # Write header first (create/truncate file)
-            with open(dut_runtime_file, "w") as header_handle:
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                header_lines = [
-                    ASCII_HEADER,
-                    f"[{timestamp}] [INFO] [DUT:{dut_id}] {'=' * 80}",
-                    f"[{timestamp}] [INFO] [DUT:{dut_id}] DUT Runtime Log - {dut_id}",
-                    f"[{timestamp}] [INFO] [DUT:{dut_id}] Started at: {datetime.now().isoformat()}",
-                    f"[{timestamp}] [INFO] [DUT:{dut_id}] {'=' * 80}",
-                ]
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            header_lines = [
+                ASCII_HEADER,
+                f"[{timestamp}] [INFO] [DUT:{dut_id}] {'=' * 80}",
+                f"[{timestamp}] [INFO] [DUT:{dut_id}] DUT Runtime Log - {dut_id}",
+                f"[{timestamp}] [INFO] [DUT:{dut_id}] Started at: {datetime.now().isoformat()}",
+                f"[{timestamp}] [INFO] [DUT:{dut_id}] {'=' * 80}",
+            ]
 
+            open_mode = "a" if append_mode and dut_runtime_file.exists() else "w"
+            dut_runtime_handle = open(dut_runtime_file, open_mode)
+            if open_mode == "w":
                 for line in header_lines:
-                    header_handle.write(line + "\n")
-                header_handle.flush()
-
-            # Now open in append mode for subsequent writes
-            dut_runtime_handle = open(dut_runtime_file, "a")
+                    dut_runtime_handle.write(line + "\n")
+                dut_runtime_handle.flush()
 
             self.dut_log_dirs[dut_id] = dut_log_dir
             self.dut_runtime_files[dut_id] = dut_runtime_handle
@@ -925,7 +1066,8 @@ class AsyncSafeLogger:
         Args:
             dut_id: DUT ID
         """
-        return self.base_log_dir / dut_id
+        safe_dut_id = self._safe_path_component(dut_id, "dut")
+        return self._resolve_under_log_root(self.base_log_dir / safe_dut_id)
 
     def get_dut_metadata_dir(self, dut_id: str) -> Path:
         """
@@ -936,7 +1078,8 @@ class AsyncSafeLogger:
         """
         if dut_id not in self.dut_log_dirs:
             # Create DUT log directory if it doesn't exist
-            dut_log_dir = self.base_log_dir / dut_id
+            safe_dut_id = self._safe_path_component(dut_id, "dut")
+            dut_log_dir = self._resolve_under_log_root(self.base_log_dir / safe_dut_id)
             dut_log_dir.mkdir(parents=True, exist_ok=True)
             self.dut_log_dirs[dut_id] = dut_log_dir
 
@@ -944,6 +1087,52 @@ class AsyncSafeLogger:
         metadata_dir = dut_log_dir / ".metadata"
         metadata_dir.mkdir(parents=True, exist_ok=True)
         return metadata_dir
+
+    def _get_tool_config_value(self, key: str, default: Any = None) -> Any:
+        """Read a tool config value from the attached orchestrator if available."""
+        if not self.orchestrator or not getattr(self.orchestrator, "config_manager", None):
+            return default
+        try:
+            tool_config = self.orchestrator.config_manager.get_tool_config()
+        except Exception:
+            return default
+
+        if isinstance(tool_config, dict):
+            return tool_config.get(key, default)
+        return getattr(tool_config, key, default)
+
+    def _apply_stream_window_to_filename(
+        self, collector_id: str, filename: str
+    ) -> str:
+        """Add the streaming window suffix to collector outputs when enabled."""
+        if not filename or filename.startswith(".") or not collector_id:
+            return filename
+        if not self._get_tool_config_value("streaming_only", False):
+            return filename
+
+        collector_info = None
+        try:
+            if self.orchestrator:
+                collector_info = self.orchestrator.get_collector_info(collector_id)
+        except Exception:
+            collector_info = None
+
+        if not collector_info or not collector_info.get("streaming_candidate", False):
+            return filename
+
+        try:
+            stream_begin, stream_end = normalize_stream_window(
+                self._get_tool_config_value("stream_begin"),
+                self._get_tool_config_value("stream_end"),
+            )
+        except Exception:
+            return filename
+
+        return append_stream_window_to_filename(
+            filename,
+            format_stream_window_component(stream_begin),
+            format_stream_window_component(stream_end),
+        )
 
     def _get_lock_for_path(self, path: Path) -> asyncio.Lock:
         """
@@ -962,7 +1151,9 @@ class AsyncSafeLogger:
             self._metadata_file_locks[key] = lock
         return lock
 
-    async def _log_simple(self, level: str, message: str, dut_id: Optional[str] = None) -> None:
+    async def _log_simple(
+        self, level: str, message: str, dut_id: Optional[str] = None
+    ) -> None:
         """
         Log a message to DUT runtime log if dut_id is provided, otherwise to global runtime.
 
@@ -973,7 +1164,9 @@ class AsyncSafeLogger:
         """
         try:
             if dut_id:
-                await self.write_to_dut_runtime_log(dut_id, level, "AsyncLogger", message)
+                await self.write_to_dut_runtime_log(
+                    dut_id, level, "AsyncLogger", message
+                )
             else:
                 await self.log_runtime(level, "AsyncLogger", message)
         except Exception:
@@ -1223,6 +1416,22 @@ class AsyncSafeLogger:
                 log_entry = f"[{timestamp}] [{level}] [{component}] {message}\n"
 
             try:
+                # Check file size to prevent disk fill
+                try:
+                    current_size = dut_runtime_handle.tell()
+                    if current_size > MAX_LOG_FILE_SIZE_MB * 1024 * 1024:
+                        handle_key = id(dut_runtime_handle)
+                        if handle_key not in _truncation_warned:
+                            dut_runtime_handle.write(
+                                f"\n[WARNING] Log file exceeded {MAX_LOG_FILE_SIZE_MB}MB. "
+                                f"Further entries truncated.\n"
+                            )
+                            dut_runtime_handle.flush()
+                            _truncation_warned.add(handle_key)
+                        return
+                except Exception:
+                    pass  # Don't let size check break logging
+
                 # Write log entry directly (no need to seek to end of file)
                 dut_runtime_handle.write(log_entry)
                 dut_runtime_handle.flush()
@@ -1231,63 +1440,6 @@ class AsyncSafeLogger:
                     "LOGGING_ERROR",
                     f"Failed to write to DUT runtime log for {dut_id}: {e}",
                 )
-
-    async def write_to_dut_log(
-        self, dut_id: str, level: str, component: str, message: str
-    ) -> None:
-        """
-        Write to DUT-specific log file.
-
-        Args:
-            dut_id: DUT ID
-            level: Logging level
-            component: Component name
-            message: Message to write
-        """
-        if dut_id not in self.dut_runtime_files:
-            await self.setup_dut_logging(dut_id)
-
-        # Also write to DUT runtime log
-        await self.write_to_dut_runtime_log(dut_id, level, component, message)
-
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-        log_entry = f"[{timestamp}] [{level}] [{component}] {message}\n"
-
-        # Determine if this is a collector log (R1, R2, etc.) or a service log
-        if component.startswith(("R", "I", "S", "H", "C")) and len(component) <= 3:
-            # This is a collector - use proper structure
-            group = self._get_collector_group(component)
-
-            # Get collector name from orchestrator if available
-            collector_name = component
-            try:
-                if hasattr(self, "orchestrator") and self.orchestrator:
-                    collector_info = self.orchestrator.get_collector_info(component)
-                    if collector_info and "name" in collector_info:
-                        collector_name = collector_info["name"]
-                    else:
-                        # Fallback: use group name if no collector name found
-                        collector_name = group
-            except Exception:
-                # Fallback: use group name if any error occurs
-                collector_name = group
-
-            collector_dir = (
-                self.dut_log_dirs[dut_id] / group / f"{component}_{collector_name}"
-            )
-            collector_dir.mkdir(parents=True, exist_ok=True)
-            log_file = collector_dir / "collector.log"
-        else:
-            # This is a service log - use direct DUT directory
-            log_file = self.dut_log_dirs[dut_id] / f"{component}.log"
-
-        try:
-            with open(log_file, "a") as f:
-                f.write(log_entry)
-        except Exception as e:
-            await self.log_error(
-                "LOGGING_ERROR", f"Failed to write to DUT log {log_file}: {e}"
-            )
 
     def _get_collector_group(self, collector_id: str) -> str:
         """
@@ -1340,22 +1492,34 @@ class AsyncSafeLogger:
                 else:
                     # Fallback: use group name if no collector name found
                     collector_name = group
-        except Exception as e:
+        except Exception:
             # Fallback: use group name if any error occurs
             collector_name = group
 
+        output_filename = self._apply_stream_window_to_filename(
+            collector_id, output_filename
+        )
+        output_filename = self._safe_output_filename(output_filename)
+
         # Create directory structure: logs/dut_id/group/Service_collector_id_name/ (standard format)
         # Standard format: Redfish_R8_firmware_inventory, Host_H1_node_dmesg, etc.
-        service_prefix = group.capitalize()
+        safe_dut_id = self._safe_path_component(dut_id, "dut")
+        safe_group = self._safe_path_component(group, "collector")
+        safe_collector_id = self._safe_path_component(collector_id, "collector")
+        safe_collector_name = self._safe_path_component(collector_name, safe_collector_id)
+        service_prefix = safe_group.capitalize()
         collector_dir = (
             self.base_log_dir
-            / dut_id
-            / group
-            / f"{service_prefix}_{collector_id}_{collector_name}"
+            / safe_dut_id
+            / safe_group
+            / f"{service_prefix}_{safe_collector_id}_{safe_collector_name}"
         )
+        collector_dir = self._resolve_under_log_root(collector_dir)
         collector_dir.mkdir(parents=True, exist_ok=True)
 
-        return collector_dir / output_filename
+        file_path = self._resolve_under_log_root(collector_dir / output_filename)
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        return file_path
 
     async def create_config_files(
         self,
@@ -1452,7 +1616,7 @@ class AsyncSafeLogger:
             baseboard: Baseboard
         """
         try:
-            from ..version import __build_hash__, __version__
+            from ..version import __version__
 
             dut_dir = self.get_dut_log_dir(dut_id)
             signature_file = dut_dir / ".log_signature.txt"
@@ -1473,7 +1637,7 @@ Baseboard: {baseboard or 'unknown'}
             with open(signature_file, "w") as f:
                 f.write(signature_content)
 
-            # Also create root-level signature file
+            # Also create root-level signature file for legacy parser compatibility
             root_signature_file = self.base_log_dir / ".log_signature.txt"
             with open(root_signature_file, "w") as f:
                 f.write(signature_content)
@@ -1501,7 +1665,7 @@ Baseboard: {baseboard or 'unknown'}
                 logger.warning(f"Runtime log file not found for DUT {dut_id}")
                 return
 
-            with open(runtime_log_file, "r") as f:
+            with open(runtime_log_file, "r", encoding="utf-8", errors="replace") as f:
                 runtime_content = f.read()
 
             # Create structured content with headers
@@ -1517,9 +1681,38 @@ NVDEBUGTOOL ORGANIZED LOG - {timestamp}
 
 {runtime_content}
 
-======================================== COLLECTOR RESULTS SUMMARY ========================================
+======================================== EXECUTION ORDER ========================================
 
-Group      ID       Collector Name                                Status     Execution Time 
+"""
+
+            execution_order_file = dut_dir / ".metadata" / "execution_order.json"
+            if execution_order_file.exists():
+                try:
+                    with open(execution_order_file, "r") as f:
+                        execution_order = json.load(f)
+                    entries = execution_order.get("payload", {}).get(
+                        "execution_order", []
+                    )
+                    if entries:
+                        structured_content += "Order  | Timestamp           | ID    | Name                          | Group\n"
+                        structured_content += "------ | ------------------- | ----- | ----------------------------- | -----\n"
+                        for entry in entries:
+                            structured_content += (
+                                f"{str(entry.get('order', '')).ljust(5)} | "
+                                f"{str(entry.get('timestamp', '')).ljust(19)} | "
+                                f"{str(entry.get('id', '')).ljust(5)} | "
+                                f"{str(entry.get('name', '')).ljust(29)} | "
+                                f"{str(entry.get('group', ''))}\n"
+                            )
+                except Exception as e:
+                    await self.log_error(
+                        "LOGGING_ERROR",
+                        f"Error reading execution order metadata for structured log: {e}",
+                    )
+
+            structured_content += """======================================== COLLECTOR RESULTS SUMMARY ========================================
+
+Group      ID       Collector Name                                Status     Execution Time
 ------------------------------------------------------------------------------------------------------------------
 
 --- REDFISH COLLECTORS ---
@@ -1570,7 +1763,7 @@ Group      ID       Collector Name                                Status     Exe
             structured_content += "END OF ORGANIZED LOG\n"
             structured_content += "================================================================================\n"
 
-            with open(structured_log_file, "w") as f:
+            with open(structured_log_file, "w", encoding="utf-8") as f:
                 f.write(structured_content)
 
         except Exception as e:
@@ -1728,7 +1921,7 @@ Group      ID       Collector Name                                Status     Exe
 
         # Header section
         lines.append("=" * 80)
-        lines.append(f"COLLECTOR ERROR REPORT")
+        lines.append("COLLECTOR ERROR REPORT")
         lines.append("=" * 80)
         lines.append("")
 
@@ -2259,7 +2452,7 @@ Group      ID       Collector Name                                Status     Exe
 
     async def initialize_all_collector_metadata(self, dut_id: str) -> None:
         """
-        Initialize all collector metadata files upfront with all collectors.
+        Initialize all collector metadata files upfront with all collectors (like legacy code).
 
         Args:
             dut_id: DUT ID.
@@ -2302,7 +2495,7 @@ Group      ID       Collector Name                                Status     Exe
         if self.orchestrator:
             all_collectors = self.orchestrator.get_collectors_for_group(group)
 
-        # Create group metadata structure
+        # Create group metadata structure like legacy code
         group_metadata = {
             "metadata": {
                 "created_at": datetime.now().isoformat() + "Z",
@@ -2331,14 +2524,14 @@ Group      ID       Collector Name                                Status     Exe
             "collectors": {},
         }
 
-        # Initialize ALL collectors with empty status
+        # Initialize ALL collectors with empty status (like legacy code)
         for collector_id, collector_info in all_collectors.items():
-            # Use lowercase collector ID
+            # Use lowercase collector ID like legacy format
             legacy_collector_id = collector_id.lower()
             group_metadata["collectors"][legacy_collector_id] = {
                 "id": legacy_collector_id,
                 "name": collector_info.get("name", collector_id),
-                "status": "",  # Empty status
+                "status": "",  # Empty status like legacy code
                 "reason": "",
                 "execution_time": "",
                 "created_at": datetime.now().isoformat() + "Z",
@@ -2356,7 +2549,7 @@ Group      ID       Collector Name                                Status     Exe
             for collector_id, collector_result in dut_status.get(
                 "collectors", {}
             ).items():
-                # Use lowercase collector ID
+                # Use lowercase collector ID like legacy format
                 legacy_collector_id = collector_id.lower()
                 if legacy_collector_id in group_metadata["collectors"]:
                     status = collector_result.get("status", "NotRan")
@@ -2389,7 +2582,7 @@ Group      ID       Collector Name                                Status     Exe
                         }
                     )
 
-        # Add summary section
+        # Add summary section like legacy format
         total_collectors = len(group_metadata["collectors"])
         passed = sum(
             1 for c in group_metadata["collectors"].values() if c["status"] == "Passed"
@@ -2514,7 +2707,7 @@ Group      ID       Collector Name                                Status     Exe
 
             dut_summaries[dut_id] = dut_summary
 
-        # Create root metadata structure
+        # Create root metadata structure (legacy format)
         root_metadata = {
             "metadata": {
                 "created_at": datetime.now().isoformat() + "Z",
@@ -2554,7 +2747,7 @@ Group      ID       Collector Name                                Status     Exe
         self, dependency_data: Dict[str, Any], dut_id: str = None
     ) -> None:
         """
-        Write dependency check metadata.
+        Write dependency check metadata in legacy format.
 
         Args:
             dependency_data: Dependency data.
@@ -2569,7 +2762,7 @@ Group      ID       Collector Name                                Status     Exe
             # Write to root metadata directory (for backward compatibility)
             dep_file = self.metadata_dir / "dependency_check.json"
 
-        # Convert to standard format for dependency results
+        # Convert to legacy format - exact structure from legacy dependency_checker.py
         legacy_dependency_data = {
             "metadata": {
                 "created_at": datetime.now().isoformat() + "Z",
@@ -2618,7 +2811,7 @@ Group      ID       Collector Name                                Status     Exe
             # Convert to lowercase for legacy format
             legacy_collector_id = collector_id.lower()
 
-            # Convert dependencies to standard format
+            # Convert dependencies to legacy format (exact structure from legacy DependencyResult)
             dependencies = []
 
             # Add required dependencies
@@ -2685,7 +2878,9 @@ Group      ID       Collector Name                                Status     Exe
                         existing_data, legacy_dependency_data
                     )
                     merged_count = len(existing_data.get("collectors", {}))
-                    total_checks = existing_data.get("summary", {}).get("total_checks", 0)
+                    total_checks = existing_data.get("summary", {}).get(
+                        "total_checks", 0
+                    )
 
                     # Write back atomically in-place
                     f.seek(0)

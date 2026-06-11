@@ -107,12 +107,12 @@ def get_skip_reason(
     return None
 
 
-def log_filtered_ids(
+async def log_filtered_ids(
     original_ids: List[str],
     filtered_ids: List[str],
     id_type: str,
-    logger=None,
-    dut_id: str = None,
+    logger,
+    dut_id: Optional[str] = None,
 ) -> None:
     """
     Log information about filtered IDs.
@@ -121,7 +121,7 @@ def log_filtered_ids(
         original_ids: Original list of IDs
         filtered_ids: Filtered list of IDs
         id_type: Type of IDs being filtered
-        logger: Logger instance (optional)
+        logger: Logger instance
         dut_id: DUT ID for logging context (optional)
     """
     if not logger:
@@ -132,6 +132,6 @@ def log_filtered_ids(
         skipped_ids = [id_val for id_val in original_ids if id_val not in filtered_ids]
         message = f"Filtered {skipped_count} {id_type} IDs: {skipped_ids}"
         if dut_id:
-            logger.log_runtime("INFO", "IDFiltering", message, dut_id)
+            await logger.log_runtime("INFO", "IDFiltering", message, dut_id)
         else:
-            logger.log_runtime("INFO", "IDFiltering", message)
+            await logger.log_runtime("INFO", "IDFiltering", message)

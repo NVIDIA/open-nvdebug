@@ -21,14 +21,12 @@ This module provides functionality to check dependencies for collectors,
 including commands, files, services, and platform-specific requirements.
 """
 
-import json
+import inspect
 import os
-import shutil
 import subprocess
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 
 class DependencyType(Enum):
@@ -385,15 +383,20 @@ class DependencyChecker:
             self._cache[cache_key] = dependency_result
             return dependency_result
 
-    async def _check_file_on_dut(self, dut_id: str, file_path: str) -> DependencyResult:
+    async def _check_file_on_dut(
+        self, dut_id: str, file_path: str, use_bmc: bool = False
+    ) -> DependencyResult:
         """
         Check if a file exists on a specific DUT.
 
         Args:
             dut_id: ID of the DUT to check
             file_path: Path to the file to check
+            use_bmc: Whether to use BMC connection
         """
         cache_key = f"dut_file:{dut_id}:{file_path}"
+        if use_bmc:
+            cache_key = f"dut_bmc_file:{dut_id}:{file_path}"
 
         if cache_key in self._cache:
             return self._cache[cache_key]
@@ -404,9 +407,14 @@ class DependencyChecker:
 
         try:
             # Use test -f command to check if file exists
-            exit_code, stdout, stderr = await self.dut_manager.execute_bmc_command(
-                dut_id, f"test -f {file_path}", timeout=30
-            )
+            if use_bmc:
+                exit_code, stdout, stderr = await self.dut_manager.execute_bmc_command(
+                    dut_id, f"test -f {file_path}", timeout=30
+                )
+            else:
+                exit_code, stdout, stderr = await self.dut_manager.execute_host_command(
+                    dut_id, f"test -f {file_path}", timeout=30
+                )
 
             if exit_code == 0:
                 dependency_result = DependencyResult(
@@ -441,6 +449,64 @@ class DependencyChecker:
             )
             self._cache[cache_key] = dependency_result
             return dependency_result
+
+    async def _check_service_on_dut(
+        self, dut_id: str, service_name: str, use_bmc: bool = False
+    ) -> DependencyResult:
+        """
+        Check if a systemd service is active on a specific DUT via SSH.
+
+        Args:
+            dut_id: ID of the DUT to check
+            service_name: Name of the systemd service
+            use_bmc: Whether to use BMC connection (for SSH/BMC collectors)
+        """
+        cache_key = f"dut_service:{dut_id}:{service_name}"
+        if use_bmc:
+            cache_key = f"dut_bmc_service:{dut_id}:{service_name}"
+
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
+        if not self.dut_manager:
+            return self.check_service(service_name)
+
+        try:
+            if use_bmc:
+                exit_code, stdout, stderr = await self.dut_manager.execute_bmc_command(
+                    dut_id, f"systemctl is-active {service_name}", timeout=30
+                )
+            else:
+                exit_code, stdout, stderr = await self.dut_manager.execute_host_command(
+                    dut_id, f"systemctl is-active {service_name}", timeout=30
+                )
+
+            is_active = exit_code == 0 and stdout.strip() == "active"
+            dependency_result = DependencyResult(
+                type=DependencyType.SERVICE,
+                name=service_name,
+                available=is_active,
+                version=None,
+                error_message=(
+                    None
+                    if is_active
+                    else f"Service '{service_name}' is not active on DUT {dut_id}"
+                ),
+                platform=dut_id,
+            )
+
+        except Exception as e:
+            dependency_result = DependencyResult(
+                type=DependencyType.SERVICE,
+                name=service_name,
+                available=False,
+                version=None,
+                error_message=f"Error checking service '{service_name}' on DUT {dut_id}: {str(e)}",
+                platform=dut_id,
+            )
+
+        self._cache[cache_key] = dependency_result
+        return dependency_result
 
     def check_service(self, service_name: str) -> DependencyResult:
         """
@@ -589,21 +655,16 @@ class DependencyChecker:
             return cmd_result
 
         try:
-            # Execute version command - use shell=True for complex commands
-            # Check if command contains shell operators or Python code
-            needs_shell = any(
-                op in version_cmd
-                for op in [";", "|", "&&", "||", "(", ")", "'", '"', "import", "print"]
-            )
+            # Execute version command - parse string commands safely with shlex
+            import shlex
 
-            if needs_shell:
-                result = subprocess.run(
-                    version_cmd, shell=True, capture_output=True, text=True, timeout=30
-                )
+            if isinstance(version_cmd, str):
+                cmd_list = shlex.split(version_cmd)
             else:
-                result = subprocess.run(
-                    version_cmd.split(), capture_output=True, text=True, timeout=30
-                )
+                cmd_list = version_cmd
+            result = subprocess.run(
+                cmd_list, capture_output=True, text=True, timeout=30
+            )
 
             if result.returncode == 0:
                 version_output = result.stdout.strip()
@@ -663,8 +724,11 @@ class DependencyChecker:
         )
         fallback_checks = platform_specific.get("fallback_checks", [])
 
-        # First try the main service check
-        main_result = self.check_service(service_name)
+        # First try the main service check — use remote check when dut_id is provided
+        if dut_id and self.dut_manager:
+            main_result = await self._check_service_on_dut(dut_id, service_name)
+        else:
+            main_result = self.check_service(service_name)
         if main_result.available:
             return main_result
 
@@ -689,7 +753,7 @@ class DependencyChecker:
                                 available=True,
                                 error_message="",
                             )
-                    except Exception as e:
+                    except Exception:
                         # If we can't check on DUT, assume file exists for now
                         return DependencyResult(
                             name=file_path,
@@ -747,7 +811,7 @@ class DependencyChecker:
                                 available=True,
                                 error_message="",
                             )
-                    except Exception as e:
+                    except Exception:
                         if optional:
                             # Optional commands are considered available even if they fail
                             return DependencyResult(
@@ -916,15 +980,19 @@ class DependencyChecker:
                 elif dep_type == "command_version":
                     min_version = dep.get("min_version")
                     version_cmd = dep.get("version_cmd", f"{dep_name} --version")
-                    result = await self.check_command_version(
+                    result = self.check_command_version(
                         dep_name, min_version, version_cmd
                     )
+                    if inspect.isawaitable(result):
+                        result = await result
                 elif dep_type == "service":
                     result = self.check_service(dep_name)
                 elif dep_type == "file":
                     result = self.check_file(dep_name)
                 elif dep_type == "platform_service":
-                    result = await self.check_platform_service(dep, platform)
+                    result = self.check_platform_service(dep, platform)
+                    if inspect.isawaitable(result):
+                        result = await result
                 elif dep_type == "fallback_group":
                     result = self.check_fallback_group(dep)
                 else:
@@ -956,15 +1024,19 @@ class DependencyChecker:
                 elif dep_type == "command_version":
                     min_version = dep.get("min_version")
                     version_cmd = dep.get("version_cmd", f"{dep_name} --version")
-                    result = await self.check_command_version(
+                    result = self.check_command_version(
                         dep_name, min_version, version_cmd
                     )
+                    if inspect.isawaitable(result):
+                        result = await result
                 elif dep_type == "service":
                     result = self.check_service(dep_name)
                 elif dep_type == "file":
                     result = self.check_file(dep_name)
                 elif dep_type == "platform_service":
-                    result = await self.check_platform_service(dep, platform)
+                    result = self.check_platform_service(dep, platform)
+                    if inspect.isawaitable(result):
+                        result = await result
                 elif dep_type == "fallback_group":
                     result = self.check_fallback_group(dep)
                 else:
@@ -1110,11 +1182,14 @@ class DependencyChecker:
                         result = self.check_command(dep_name)
                 elif dep_type == "file":
                     # Use appropriate connection based on collector type
-                    if self.dut_manager and collector_id.startswith(
-                        "S"
-                    ):  # SSH collectors use BMC connection
-                        result = await self._check_file_on_dut(dut_id, dep_name)
-                    else:  # Host collectors or no DUT manager - fall back to local check
+                    if self.dut_manager:
+                        use_bmc = collector_id.startswith(
+                            "S"
+                        )  # SSH collectors use BMC connection
+                        result = await self._check_file_on_dut(
+                            dut_id, dep_name, use_bmc=use_bmc
+                        )
+                    else:  # No DUT manager - fall back to local check
                         result = self.check_file(dep_name)
                 elif dep_type == "command_version":
                     # Check command version on appropriate target
@@ -1194,11 +1269,14 @@ class DependencyChecker:
                         result = self.check_command(dep_name)
                 elif dep_type == "file":
                     # Use appropriate connection based on collector type
-                    if self.dut_manager and collector_id.startswith(
-                        "S"
-                    ):  # SSH collectors use BMC connection
-                        result = await self._check_file_on_dut(dut_id, dep_name)
-                    else:  # Host collectors or no DUT manager - fall back to local check
+                    if self.dut_manager:
+                        use_bmc = collector_id.startswith(
+                            "S"
+                        )  # SSH collectors use BMC connection
+                        result = await self._check_file_on_dut(
+                            dut_id, dep_name, use_bmc=use_bmc
+                        )
+                    else:  # No DUT manager - fall back to local check
                         result = self.check_file(dep_name)
                 elif dep_type == "command_version":
                     # Check command version on appropriate target
@@ -1320,7 +1398,7 @@ class DependencyChecker:
             v2_parts.extend([0] * (max_len - len(v2_parts)))
 
             return v1_parts >= v2_parts
-        except Exception as e:
+        except Exception:
             # If version comparison fails, log the issue but assume it's OK
             # This prevents dependency failures due to version parsing issues
             return True

@@ -23,7 +23,6 @@ This package exports:
     - load_dut_config: Load DUT configuration
     - get_available_baseboards: Get available baseboard platforms
     - validate_baseboard: Validate baseboard name
-    - NVDebugError: Base exception class
     - __version__: Version string
     - __build_hash__: Build hash
 """
@@ -35,7 +34,6 @@ from .config import (
     load_dut_config,
     validate_baseboard,
 )
-from .utils.exceptions import NVDebugError
 from .version import __build_hash__, __version__
 
 __all__ = [
@@ -46,5 +44,4 @@ __all__ = [
     "load_dut_config",
     "get_available_baseboards",
     "validate_baseboard",
-    "NVDebugError",
 ]

@@ -20,18 +20,87 @@ This module handles parsing of Ansible inventory files and converting them
 to DUT configurations with support for INI and YAML formats.
 """
 
+import json
 import os
 import tempfile
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 from rich.console import Console
+
+from . import excel_reader
 from rich.panel import Panel
 from rich.table import Table
-from rich.text import Text
 
 from ..config import DUTConfig
+from .spreadsheet_utils import auto_detect_spreadsheet
+
+
+@lru_cache(maxsize=1)
+def _load_ansible_baseboard_mappings() -> List[Dict[str, Any]]:
+    """
+    Load ansible baseboard mappings from the Telemetry Catalog spreadsheet.
+
+    Returns:
+        List of mapping dictionaries containing product_family, node_type, baseboard.
+    """
+
+    spreadsheet = auto_detect_spreadsheet(None, suppress_print=True)
+    if not spreadsheet:
+        return []
+
+    spreadsheet_path = Path(spreadsheet)
+    if not spreadsheet_path.exists():
+        return []
+
+    try:
+        df = excel_reader.read_excel(spreadsheet_path, sheet_name="Log Collection Configuration")
+    except Exception:
+        return []
+
+    mappings: List[Dict[str, Any]] = []
+
+    filtered_rows = df[df["Section"] == "Ansible Mappings"]
+    for _, row in filtered_rows.iterrows():
+        field_name = str(row.get("Configuration Item", "")).strip().lower()
+        if field_name != "ansible_mappings":
+            continue
+
+        value = row.get("Value", "")
+        if not isinstance(value, str) or not value.strip():
+            continue
+
+        try:
+            raw_entries = json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            continue
+
+        if not isinstance(raw_entries, list):
+            continue
+
+        for entry in raw_entries:
+            if not isinstance(entry, dict):
+                continue
+            baseboard = entry.get("baseboard")
+            product_family = entry.get("product_family")
+            if not baseboard or not product_family:
+                continue
+            node_type = entry.get("node_type")
+            mappings.append(
+                {
+                    "baseboard": str(baseboard),
+                    "product_family": str(product_family).lower(),
+                    "node_type": (
+                        str(node_type).lower()
+                        if node_type is not None and str(node_type).strip()
+                        else None
+                    ),
+                }
+            )
+
+    return mappings
 
 
 def _display_yaml_error(file_path: Path, error_message: str, error_type: str) -> None:
@@ -185,6 +254,8 @@ def parse_ansible_inventory_to_dut_configs(
     try:
         with open(ansible_inventory_path, "r") as f:
             ansible_data = yaml.safe_load(f)
+    except FileNotFoundError as e:
+        _display_yaml_error(ansible_inventory_path, str(e), "YAML parsing failed")
     except yaml.YAMLError as e:
         # Try to automatically fix common YAML issues
         if _fix_common_yaml_issues(ansible_inventory_path):
@@ -225,39 +296,96 @@ def parse_ansible_inventory_to_dut_configs(
     cluster_info = ansible_data.get("all", {}).get("vars", {})
     product_family = cluster_info.get("product_family", "")
 
-    # Parse different node types
-    node_mappings = [
-        ("switch", "SwitchTray"),
-        ("compute", "Compute"),
-        ("powershelf", "PowerShelf"),
-    ]
+    # Parse inventory groups into canonical node types while supporting
+    # ansible aliases such as "singlenode" for compute inventories.
+    group_order = {"SwitchTray": 0, "Compute": 1, "PowerShelf": 2}
+    parsed_groups = []
 
-    for node_key, node_type in node_mappings:
-        if node_key in ansible_data and "hosts" in ansible_data[node_key]:
-            hosts = ansible_data[node_key]["hosts"]
-            vars_section = ansible_data[node_key].get("vars", {})
+    for group_name, group_data in ansible_data.items():
+        if group_name == "all" or not isinstance(group_data, dict):
+            continue
 
-            # Detect baseboard from ansible data if not provided
-            detected_baseboard = _detect_baseboard_from_ansible_data(
-                product_family, node_type, baseboard
+        hosts = group_data.get("hosts")
+        if not isinstance(hosts, dict):
+            continue
+
+        vars_section = group_data.get("vars", {})
+        if not isinstance(vars_section, dict):
+            vars_section = {}
+
+        node_type = _resolve_ansible_node_type(group_name, vars_section)
+        if not node_type:
+            continue
+
+        parsed_groups.append(
+            (
+                group_order.get(node_type, len(group_order)),
+                len(parsed_groups),
+                group_name,
+                hosts,
+                vars_section,
+                node_type,
             )
+        )
 
-            # Create node type config
-            node_type_config = {
-                "platform": "unknown",  # Platform is no longer configurable
-                "baseboard": detected_baseboard,
-                "vars": vars_section,
-            }
-            node_type_configs[node_type] = node_type_config
+    for _, _, _group_name, hosts, vars_section, node_type in sorted(parsed_groups):
+        # Detect baseboard from ansible data if not provided
+        detected_baseboard = _detect_baseboard_from_ansible_data(
+            product_family, node_type, baseboard
+        )
 
-            # Create DUT configs for each host
-            for host_name, host_data in hosts.items():
-                dut_config = _create_dut_config_from_ansible_host(
-                    host_name, host_data, vars_section, node_type, detected_baseboard
-                )
-                dut_configs.append(dut_config)
+        existing_node_config = node_type_configs.get(node_type, {})
+        merged_vars = {
+            **existing_node_config.get("vars", {}),
+            **vars_section,
+        }
+        node_type_configs[node_type] = {
+            "platform": "unknown",  # Platform is no longer configurable
+            "baseboard": detected_baseboard,
+            "vars": merged_vars,
+        }
+
+        # Create DUT configs for each host
+        for host_name, host_data in hosts.items():
+            dut_config = _create_dut_config_from_ansible_host(
+                host_name, host_data, vars_section, node_type, detected_baseboard
+            )
+            dut_configs.append(dut_config)
 
     return dut_configs, node_type_configs
+
+
+def _resolve_ansible_node_type(
+    group_name: str, vars_section: Dict[str, Any]
+) -> Optional[str]:
+    """
+    Resolve ansible inventory groups to the tool's canonical node types.
+
+    Group aliases such as "singlenode" are treated as Compute so they flow
+    through the same parsing path as standard compute groups.
+    """
+
+    normalized_mapping = {
+        "switch": "SwitchTray",
+        "switchtray": "SwitchTray",
+        "compute": "Compute",
+        "singlenode": "Compute",
+        "powershelf": "PowerShelf",
+    }
+
+    candidates = [
+        vars_section.get("host_type"),
+        group_name,
+    ]
+
+    for candidate in candidates:
+        normalized_candidate = "".join(
+            char for char in str(candidate).strip().lower() if char.isalnum()
+        )
+        if normalized_candidate in normalized_mapping:
+            return normalized_mapping[normalized_candidate]
+
+    return None
 
 
 def _detect_baseboard_from_ansible_data(
@@ -278,72 +406,72 @@ def _detect_baseboard_from_ansible_data(
     if provided_baseboard:
         return provided_baseboard
 
-    # Common baseboard mappings based on product family and node type
-    baseboard_mappings = {
-        # GB300 mappings
-        ("gb300", "Compute"): "GB300 NVL",
-        ("gb300", "SwitchTray"): "GB300 NVL",
-        ("gb300", "PowerShelf"): "GB300 NVL",
-        # GB200 mappings
-        ("gb200", "Compute"): "GB200 NVL",
-        ("gb200", "SwitchTray"): "GB200 NVL",
-        ("gb200", "PowerShelf"): "GB200 NVL",
-        # H100 mappings
-        ("h100", "Compute"): "H100 HGX",
-        ("h100", "SwitchTray"): "H100 HGX",
-        ("h100", "PowerShelf"): "H100 HGX",
-        # H200 mappings
-        ("h200", "Compute"): "H200 HGX",
-        ("h200", "SwitchTray"): "H200 HGX",
-        ("h200", "PowerShelf"): "H200 HGX",
-        # B200 mappings
-        ("b200", "Compute"): "B200 HGX",
-        ("b200", "SwitchTray"): "B200 HGX",
-        ("b200", "PowerShelf"): "B200 HGX",
-        # Generic mappings for common patterns
-        ("nvl", "Compute"): "NVL",
-        ("nvl", "SwitchTray"): "NVL",
-        ("nvl", "PowerShelf"): "NVL",
-        ("hgx", "Compute"): "HGX",
-        ("hgx", "SwitchTray"): "HGX",
-        ("hgx", "PowerShelf"): "HGX",
-    }
-
-    # Try to find a mapping based on product family and node type
-    product_family_lower = product_family.lower()
+    product_family_lower = product_family.lower() if product_family else ""
     node_type_lower = node_type.lower()
 
-    # Direct mapping
-    if (product_family_lower, node_type_lower) in baseboard_mappings:
-        return baseboard_mappings[(product_family_lower, node_type_lower)]
+    mappings = _load_ansible_baseboard_mappings()
+    best_match: Optional[str] = None
+    best_score: Tuple[int, int] = (-1, -1)
 
-    # Try partial matches
-    for (pf, nt), baseboard in baseboard_mappings.items():
-        if pf in product_family_lower and nt in node_type_lower:
-            return baseboard
+    for mapping in mappings:
+        mapped_pf = mapping.get("product_family")
+        mapped_node = mapping.get("node_type")
+        baseboard_name = mapping.get("baseboard")
 
-    # Try to extract baseboard from product family
-    if "gb300" in product_family_lower:
-        return "GB300 NVL"
-    elif "gb200" in product_family_lower:
-        return "GB200 NVL"
-    elif "h200" in product_family_lower:
-        return "H200 HGX"
-    elif "h100" in product_family_lower:
-        return "H100 HGX"
-    elif "b200" in product_family_lower:
-        return "B200 HGX"
-    elif "nvl" in product_family_lower:
-        return "NVL"
-    elif "hgx" in product_family_lower:
-        return "HGX"
+        if not mapped_pf or not baseboard_name:
+            continue
 
-    # Default fallback - try to use product family as baseboard
-    if product_family:
-        return product_family.upper()
+        if not product_family_lower:
+            continue
 
-    # Final fallback
-    return "Unknown"
+        # Normalize mapped values to lowercase for case-insensitive comparison
+        # (defensive - mappings should already be normalized when loaded, but this ensures robustness)
+        mapped_pf_lower = str(mapped_pf).lower() if mapped_pf else ""
+        mapped_node_lower = (
+            str(mapped_node).lower()
+            if mapped_node is not None and str(mapped_node).strip()
+            else None
+        )
+
+        # Check for exact match first (preferred)
+        pf_exact = product_family_lower == mapped_pf_lower
+        # Check for substring match (less preferred, but only if no exact match found)
+        # Note: We check if mapped_pf is contained in product_family to handle cases like
+        # "gb200 cluster" matching "gb200"
+        pf_contains = mapped_pf_lower in product_family_lower if not pf_exact else False
+
+        if not pf_exact and not pf_contains:
+            continue
+
+        node_score = -1
+        if mapped_node_lower:
+            if mapped_node_lower == node_type_lower:
+                node_score = 1
+            elif mapped_node_lower in node_type_lower:
+                node_score = 0
+            else:
+                continue
+
+        # Prioritize exact matches over substring matches
+        # Score: (pf_score, node_score) where pf_score: 2=exact, 1=contains
+        pf_score = 2 if pf_exact else 1
+        score = (pf_score, node_score)
+        if score > best_score:
+            best_score = score
+            best_match = baseboard_name
+
+    if best_match:
+        return best_match
+
+    # No mapping found in spreadsheet - this is a configuration error
+    # The spreadsheet must be updated to include the mapping for this product_family/node_type combination
+    error_msg = (
+        f"No baseboard mapping found in spreadsheet for product_family='{product_family}' "
+        f"and node_type='{node_type}'. "
+        f"Please ensure the spreadsheet includes an Ansible Mapping entry for this combination. "
+        f"Found {len(mappings)} mapping(s) in spreadsheet."
+    )
+    raise ValueError(error_msg)
 
 
 def _create_dut_config_from_ansible_host(
@@ -369,23 +497,103 @@ def _create_dut_config_from_ansible_host(
     # Extract hostname from host data or use the key
     hostname = host_data.get("hostname", host_name)
 
+    # Prefer common bmc ip keys in order of specificity
+    bmc_ip = (
+        host_data.get("ansible_bmc_host")
+        or host_data.get("bmc_host")
+        or vars_section.get("ansible_bmc_host")
+        or vars_section.get("bmc_host")
+        or ""
+    )
+
+    # BMC credentials: prefer explicit BMC creds, fall back to generic ansible creds
+    bmc_user = (
+        host_data.get("bmc_user")
+        or vars_section.get("ansible_bmc_user")
+        or vars_section.get("bmc_user")
+        or vars_section.get("bmc_username")
+        or vars_section.get("ansible_user")
+        or ""
+    )
+    bmc_pass = (
+        host_data.get("bmc_pass")
+        or vars_section.get("ansible_bmc_pass")
+        or vars_section.get("bmc_pass")
+        or vars_section.get("bmc_password")
+        or vars_section.get("ansible_bmc_password")
+        or vars_section.get("ansible_ssh_pass")
+        or ""
+    )
+
+    # BMC SSH creds: prefer BMC creds, fall back to host creds
+    bmc_ssh_user = (
+        vars_section.get("ansible_bmc_user")
+        or vars_section.get("bmc_user")
+        or vars_section.get("bmc_username")
+        or vars_section.get("ansible_user")
+        or bmc_user
+        or ""
+    )
+    bmc_ssh_pass = (
+        vars_section.get("ansible_bmc_pass")
+        or vars_section.get("bmc_pass")
+        or vars_section.get("bmc_password")
+        or vars_section.get("ansible_bmc_password")
+        or vars_section.get("ansible_ssh_pass")
+        or bmc_pass
+        or ""
+    )
+    bmc_ssh_key_path = (
+        vars_section.get("ansible_bmc_ssh_private_key_file")
+        or vars_section.get("ansible_bmc_ssh_key_path")
+        or vars_section.get("bmc_ssh_key_path")
+        or vars_section.get("BMC_SSH_KEY_PATH")
+        or ""
+    )
+    host_ssh_key_path = (
+        vars_section.get("ansible_ssh_private_key_file")
+        or vars_section.get("host_ssh_key_path")
+        or vars_section.get("HOST_SSH_KEY_PATH")
+        or ""
+    )
+
+    # Redfish creds: default to BMC creds if not explicitly provided
+    rf_user = (
+        vars_section.get("ansible_bmc_user")
+        or vars_section.get("bmc_user")
+        or vars_section.get("bmc_username")
+        or vars_section.get("RF_User")
+        or bmc_user
+        or ""
+    )
+    rf_pass = (
+        vars_section.get("ansible_bmc_pass")
+        or vars_section.get("bmc_pass")
+        or vars_section.get("bmc_password")
+        or vars_section.get("RF_Pass")
+        or bmc_pass
+        or ""
+    )
+
     # Create DUTConfig with Ansible data
     dut_config = DUTConfig(
         name=hostname,
         baseboard=baseboard,
         # BMC Configuration
-        bmc_ip=host_data.get("ansible_bmc_host", ""),
-        bmc_user=vars_section.get("ansible_bmc_user", ""),
-        bmc_pass=vars_section.get("ansible_bmc_pass", ""),
-        bmc_ssh_user=vars_section.get("ansible_user", ""),
-        bmc_ssh_pass=vars_section.get("ansible_ssh_pass", ""),
+        bmc_ip=bmc_ip,
+        bmc_user=bmc_user,
+        bmc_pass=bmc_pass,
+        bmc_ssh_user=bmc_ssh_user,
+        bmc_ssh_pass=bmc_ssh_pass,
+        bmc_ssh_key_path=bmc_ssh_key_path,
         # Host Configuration
         host_ip=host_data.get("ansible_host", ""),
         host_user=vars_section.get("ansible_user", ""),
         host_pass=vars_section.get("ansible_ssh_pass", ""),
+        host_ssh_key_path=host_ssh_key_path,
         # Redfish Configuration (use BMC credentials as fallback)
-        bmc_rf_user=vars_section.get("ansible_bmc_user", ""),
-        bmc_rf_pass=vars_section.get("ansible_bmc_pass", ""),
+        bmc_rf_user=rf_user,
+        bmc_rf_pass=rf_pass,
         # Additional configuration
         local=False,  # Default to remote mode
         non_interactive=False,
@@ -428,10 +636,13 @@ def generate_config_files_from_ansible(
         "LogSanitization": True,
         "AUTO_PARSE": True,
         "GENERATE_HTML_REPORTS": True,
+        # Ensure SSH collectors are not skipped by default for ansible-generated configs
+        "SKIP_BMC_SSH_LOGS": False,
     }
 
     config_file_path = Path(temp_dir) / "config.yaml"
-    with open(config_file_path, "w") as f:
+    fd = os.open(str(config_file_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
         yaml.dump(config_data, f, default_flow_style=False, sort_keys=False)
 
     # Generate dut_config.yaml
@@ -466,7 +677,10 @@ def generate_config_files_from_ansible(
         dut_config_data[dut_config.name] = dut_dict
 
     dut_config_file_path = Path(temp_dir) / "dut_config.yaml"
-    with open(dut_config_file_path, "w") as f:
+    fd = os.open(
+        str(dut_config_file_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+    )
+    with os.fdopen(fd, "w") as f:
         yaml.dump(dut_config_data, f, default_flow_style=False, sort_keys=False)
 
     return config_file_path, dut_config_file_path

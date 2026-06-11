@@ -1,0 +1,360 @@
+{
+  "version": "1.0",
+  "generated_at": "2026-03-18T14:32:05Z",
+  "tool_version": "2.1.0",
+  "tool_config": {
+    "collection_level": "L2",
+    "execution_mode": "RemoteClient",
+    "baseboard": "HGX_H100"
+  },
+  "duts": [
+    {
+      "id": "DUT_1",
+      "baseboard": "HGX_H100",
+      "node_type": "GPU_Node",
+      "bmc_ip": "10.110.42.11",
+      "system_info": {
+        "model": "DGXH100-880G",
+        "part_number": "920-23687-2532-000",
+        "serial_number": "1652425000123",
+        "firmware": [
+          { "component": "BMC", "version": "24.02.05", "date": "2025-10-15" },
+          { "component": "BIOS", "version": "1.6.0", "date": "2025-09-20" },
+          { "component": "CPLD", "version": "3.1.2", "date": null }
+        ]
+      },
+      "collector_groups": [
+        {
+          "name": "redfish",
+          "service_type": "redfish",
+          "total_execution_time": 18.4,
+          "collectors": [
+            {
+              "id": "DUT_1__redfish__Systems",
+              "name": "Systems",
+              "status": "success",
+              "execution_time": 5.2,
+              "start_time": "2026-03-18T14:30:10Z",
+              "end_time": "2026-03-18T14:30:15Z",
+              "reason": "",
+              "dependencies": [],
+              "collection_level": "L1",
+              "files": [
+                { "path": "DUT_1/redfish/Systems.json", "size": 24500, "type": "json", "collector_id": "DUT_1__redfish__Systems", "viewer_hint": "json-tree" }
+              ],
+              "stage_timing": { "validation": 0.1, "discovery": 0.8, "execution": 3.9, "post_processing": 0.4 }
+            },
+            {
+              "id": "DUT_1__redfish__Managers",
+              "name": "Managers",
+              "status": "success",
+              "execution_time": 6.8,
+              "start_time": "2026-03-18T14:30:15Z",
+              "end_time": "2026-03-18T14:30:22Z",
+              "reason": "",
+              "dependencies": [],
+              "collection_level": "L1",
+              "files": [
+                { "path": "DUT_1/redfish/Managers.json", "size": 18200, "type": "json", "collector_id": "DUT_1__redfish__Managers", "viewer_hint": "json-tree" }
+              ],
+              "stage_timing": { "validation": 0.1, "discovery": 1.2, "execution": 5.0, "post_processing": 0.5 }
+            },
+            {
+              "id": "DUT_1__redfish__Thermal",
+              "name": "Thermal",
+              "status": "error",
+              "execution_time": 6.4,
+              "start_time": "2026-03-18T14:30:22Z",
+              "end_time": "2026-03-18T14:30:28Z",
+              "reason": "Redfish resource /redfish/v1/Chassis/1/Thermal returned HTTP 500",
+              "dependencies": ["DUT_1__redfish__Systems"],
+              "collection_level": "L2",
+              "files": [
+                { "path": "DUT_1/redfish/Thermal_error.log", "size": 1024, "type": "log", "collector_id": "DUT_1__redfish__Thermal", "viewer_hint": "log-viewer" }
+              ],
+              "stage_timing": { "validation": 0.1, "discovery": 0.5, "execution": 5.5, "post_processing": 0.3 }
+            }
+          ]
+        },
+        {
+          "name": "host",
+          "service_type": "ssh",
+          "total_execution_time": 14.1,
+          "collectors": [
+            {
+              "id": "DUT_1__host__DmesgLogs",
+              "name": "DmesgLogs",
+              "status": "success",
+              "execution_time": 8.3,
+              "start_time": "2026-03-18T14:30:28Z",
+              "end_time": "2026-03-18T14:30:36Z",
+              "reason": "",
+              "dependencies": [],
+              "collection_level": "L1",
+              "files": [
+                { "path": "DUT_1/host/dmesg.log", "size": 512000, "type": "log", "collector_id": "DUT_1__host__DmesgLogs", "viewer_hint": "log-viewer" }
+              ],
+              "stage_timing": { "validation": 0.2, "discovery": 0.3, "execution": 7.2, "post_processing": 0.6 }
+            },
+            {
+              "id": "DUT_1__host__NvidiaSmi",
+              "name": "NvidiaSmi",
+              "status": "success",
+              "execution_time": 5.8,
+              "start_time": "2026-03-18T14:30:36Z",
+              "end_time": "2026-03-18T14:30:42Z",
+              "reason": "",
+              "dependencies": [],
+              "collection_level": "L1",
+              "files": [
+                { "path": "DUT_1/host/nvidia-smi.xml", "size": 45300, "type": "xml", "collector_id": "DUT_1__host__NvidiaSmi" }
+              ],
+              "stage_timing": { "validation": 0.1, "discovery": 0.2, "execution": 5.1, "post_processing": 0.4 }
+            }
+          ]
+        }
+      ],
+      "status_summary": {
+        "success": 4,
+        "error": 1,
+        "partial": 0,
+        "skipped": 0,
+        "not_ran": 0
+      },
+      "overall_status": "error",
+      "execution_time": 32.5,
+      "log_size": 601024
+    },
+    {
+      "id": "DUT_2",
+      "baseboard": "HGX_H100",
+      "node_type": "GPU_Node",
+      "bmc_ip": "10.110.42.12",
+      "system_info": {
+        "model": "DGXH100-880G",
+        "part_number": "920-23687-2532-000",
+        "serial_number": "1652425000456",
+        "firmware": [
+          { "component": "BMC", "version": "24.02.05", "date": "2025-10-15" },
+          { "component": "BIOS", "version": "1.6.0", "date": "2025-09-20" },
+          { "component": "CPLD", "version": "3.1.2", "date": null }
+        ]
+      },
+      "collector_groups": [
+        {
+          "name": "redfish",
+          "service_type": "redfish",
+          "total_execution_time": 15.7,
+          "collectors": [
+            {
+              "id": "DUT_2__redfish__Systems",
+              "name": "Systems",
+              "status": "success",
+              "execution_time": 4.9,
+              "start_time": "2026-03-18T14:30:10Z",
+              "end_time": "2026-03-18T14:30:15Z",
+              "reason": "",
+              "dependencies": [],
+              "collection_level": "L1",
+              "files": [
+                { "path": "DUT_2/redfish/Systems.json", "size": 23800, "type": "json", "collector_id": "DUT_2__redfish__Systems", "viewer_hint": "json-tree" }
+              ],
+              "stage_timing": { "validation": 0.1, "discovery": 0.7, "execution": 3.7, "post_processing": 0.4 }
+            },
+            {
+              "id": "DUT_2__redfish__Managers",
+              "name": "Managers",
+              "status": "success",
+              "execution_time": 5.4,
+              "start_time": "2026-03-18T14:30:15Z",
+              "end_time": "2026-03-18T14:30:20Z",
+              "reason": "",
+              "dependencies": [],
+              "collection_level": "L1",
+              "files": [
+                { "path": "DUT_2/redfish/Managers.json", "size": 17500, "type": "json", "collector_id": "DUT_2__redfish__Managers", "viewer_hint": "json-tree" }
+              ],
+              "stage_timing": { "validation": 0.1, "discovery": 1.0, "execution": 3.8, "post_processing": 0.5 }
+            },
+            {
+              "id": "DUT_2__redfish__Thermal",
+              "name": "Thermal",
+              "status": "success",
+              "execution_time": 5.4,
+              "start_time": "2026-03-18T14:30:20Z",
+              "end_time": "2026-03-18T14:30:25Z",
+              "reason": "",
+              "dependencies": ["DUT_2__redfish__Systems"],
+              "collection_level": "L2",
+              "files": [
+                { "path": "DUT_2/redfish/Thermal.json", "size": 31200, "type": "json", "collector_id": "DUT_2__redfish__Thermal", "viewer_hint": "json-tree" }
+              ],
+              "stage_timing": { "validation": 0.1, "discovery": 0.6, "execution": 4.2, "post_processing": 0.5 }
+            }
+          ]
+        },
+        {
+          "name": "host",
+          "service_type": "ssh",
+          "total_execution_time": 16.2,
+          "collectors": [
+            {
+              "id": "DUT_2__host__DmesgLogs",
+              "name": "DmesgLogs",
+              "status": "success",
+              "execution_time": 9.1,
+              "start_time": "2026-03-18T14:30:25Z",
+              "end_time": "2026-03-18T14:30:34Z",
+              "reason": "",
+              "dependencies": [],
+              "collection_level": "L1",
+              "files": [
+                { "path": "DUT_2/host/dmesg.log", "size": 487000, "type": "log", "collector_id": "DUT_2__host__DmesgLogs", "viewer_hint": "log-viewer" }
+              ],
+              "stage_timing": { "validation": 0.2, "discovery": 0.3, "execution": 8.0, "post_processing": 0.6 }
+            },
+            {
+              "id": "DUT_2__host__NvidiaSmi",
+              "name": "NvidiaSmi",
+              "status": "skipped",
+              "execution_time": 0.0,
+              "start_time": null,
+              "end_time": null,
+              "reason": "Host SSH unreachable after collection start",
+              "dependencies": [],
+              "collection_level": "L1",
+              "files": [],
+              "stage_timing": { "validation": null, "discovery": null, "execution": null, "post_processing": null }
+            }
+          ]
+        }
+      ],
+      "status_summary": {
+        "success": 4,
+        "error": 0,
+        "partial": 0,
+        "skipped": 1,
+        "not_ran": 0
+      },
+      "overall_status": "partial",
+      "execution_time": 31.9,
+      "log_size": 559500
+    }
+  ],
+  "collector_catalog": [
+    { "id": "redfish__Systems", "name": "Systems", "group": "redfish", "description": "Collects Redfish Systems resource tree", "collection_level": "L1", "dependencies": [], "applicable_baseboards": ["HGX_H100", "HGX_H200", "DGX_B200"] },
+    { "id": "redfish__Managers", "name": "Managers", "group": "redfish", "description": "Collects Redfish Managers resource tree", "collection_level": "L1", "dependencies": [], "applicable_baseboards": ["HGX_H100", "HGX_H200", "DGX_B200"] },
+    { "id": "redfish__Thermal", "name": "Thermal", "group": "redfish", "description": "Collects chassis thermal sensor data", "collection_level": "L2", "dependencies": ["redfish__Systems"], "applicable_baseboards": ["HGX_H100", "HGX_H200"] },
+    { "id": "host__DmesgLogs", "name": "DmesgLogs", "group": "host", "description": "Collects kernel dmesg ring buffer logs", "collection_level": "L1", "dependencies": [], "applicable_baseboards": ["HGX_H100", "HGX_H200", "DGX_B200"] },
+    { "id": "host__NvidiaSmi", "name": "NvidiaSmi", "group": "host", "description": "Collects nvidia-smi GPU query output", "collection_level": "L1", "dependencies": [], "applicable_baseboards": ["HGX_H100", "HGX_H200", "DGX_B200"] }
+  ],
+  "file_index": [
+    { "path": "DUT_1/redfish/Systems.json", "size": 24500, "type": "json", "collector_id": "DUT_1__redfish__Systems", "dut_id": "DUT_1", "collector_group": "redfish", "collector_name": "Systems", "viewer_hint": "json-tree" },
+    { "path": "DUT_1/redfish/Managers.json", "size": 18200, "type": "json", "collector_id": "DUT_1__redfish__Managers", "dut_id": "DUT_1", "collector_group": "redfish", "collector_name": "Managers", "viewer_hint": "json-tree" },
+    { "path": "DUT_1/redfish/Thermal_error.log", "size": 1024, "type": "log", "collector_id": "DUT_1__redfish__Thermal", "dut_id": "DUT_1", "collector_group": "redfish", "collector_name": "Thermal", "viewer_hint": "log-viewer" },
+    { "path": "DUT_1/host/dmesg.log", "size": 512000, "type": "log", "collector_id": "DUT_1__host__DmesgLogs", "dut_id": "DUT_1", "collector_group": "host", "collector_name": "DmesgLogs", "viewer_hint": "log-viewer" },
+    { "path": "DUT_1/host/nvidia-smi.xml", "size": 45300, "type": "xml", "collector_id": "DUT_1__host__NvidiaSmi", "dut_id": "DUT_1", "collector_group": "host", "collector_name": "NvidiaSmi" },
+    { "path": "DUT_2/redfish/Systems.json", "size": 23800, "type": "json", "collector_id": "DUT_2__redfish__Systems", "dut_id": "DUT_2", "collector_group": "redfish", "collector_name": "Systems", "viewer_hint": "json-tree" },
+    { "path": "DUT_2/redfish/Managers.json", "size": 17500, "type": "json", "collector_id": "DUT_2__redfish__Managers", "dut_id": "DUT_2", "collector_group": "redfish", "collector_name": "Managers", "viewer_hint": "json-tree" },
+    { "path": "DUT_2/redfish/Thermal.json", "size": 31200, "type": "json", "collector_id": "DUT_2__redfish__Thermal", "dut_id": "DUT_2", "collector_group": "redfish", "collector_name": "Thermal", "viewer_hint": "json-tree" },
+    { "path": "DUT_2/host/dmesg.log", "size": 487000, "type": "log", "collector_id": "DUT_2__host__DmesgLogs", "dut_id": "DUT_2", "collector_group": "host", "collector_name": "DmesgLogs", "viewer_hint": "log-viewer" },
+    { "path": "manifest.json", "size": 8500, "type": "json", "collector_id": "", "dut_id": "", "collector_group": "", "collector_name": "" }
+  ],
+  "errors": [
+    {
+      "dut_id": "DUT_1",
+      "collector_id": "DUT_1__redfish__Thermal",
+      "collector_name": "Thermal",
+      "collector_group": "redfish",
+      "message": "Redfish resource /redfish/v1/Chassis/1/Thermal returned HTTP 500",
+      "timestamp": "2026-03-18T14:30:27Z"
+    },
+    {
+      "dut_id": "DUT_2",
+      "collector_id": "DUT_2__host__NvidiaSmi",
+      "collector_name": "NvidiaSmi",
+      "collector_group": "host",
+      "message": "Host SSH unreachable after collection start",
+      "timestamp": "2026-03-18T14:30:34Z"
+    }
+  ],
+  "preflight": {
+    "per_dut": [
+      {
+        "dut_id": "DUT_1",
+        "checks": [
+          { "name": "BMC Reachability", "group": "network", "status": "pass", "details": "BMC at 10.110.42.11 responded in 12ms" },
+          { "name": "Redfish Service", "group": "service", "status": "pass", "details": "Redfish root /redfish/v1 accessible" },
+          { "name": "SSH Connectivity", "group": "network", "status": "pass", "details": "SSH connection established to host" },
+          { "name": "Disk Space", "group": "resource", "status": "warning", "details": "Available disk space 2.1GB (threshold 5GB)" }
+        ]
+      },
+      {
+        "dut_id": "DUT_2",
+        "checks": [
+          { "name": "BMC Reachability", "group": "network", "status": "pass", "details": "BMC at 10.110.42.12 responded in 8ms" },
+          { "name": "Redfish Service", "group": "service", "status": "pass", "details": "Redfish root /redfish/v1 accessible" },
+          { "name": "SSH Connectivity", "group": "network", "status": "warning", "details": "SSH connection intermittent, latency 850ms" },
+          { "name": "Disk Space", "group": "resource", "status": "pass", "details": "Available disk space 28.4GB" }
+        ]
+      }
+    ]
+  },
+  "timing": {
+    "total_duration": 72.8,
+    "component_timing": {
+      "tool_init": 1.2,
+      "config_load": 0.4,
+      "dut_init": 2.8,
+      "preflight": 4.5,
+      "collection": 58.3,
+      "report_generation": 3.1,
+      "metadata_write": 1.8,
+      "cleanup": 0.7
+    },
+    "per_dut": [
+      {
+        "dut_id": "DUT_1",
+        "duration": 32.5,
+        "collectors": [
+          { "id": "DUT_1__redfish__Systems", "name": "Systems", "group": "redfish", "duration": 5.2, "start_time": "2026-03-18T14:30:10Z", "end_time": "2026-03-18T14:30:15Z", "status": "success", "stage_timing": { "validation": 0.1, "discovery": 0.8, "execution": 3.9, "post_processing": 0.4 } },
+          { "id": "DUT_1__redfish__Managers", "name": "Managers", "group": "redfish", "duration": 6.8, "start_time": "2026-03-18T14:30:15Z", "end_time": "2026-03-18T14:30:22Z", "status": "success", "stage_timing": { "validation": 0.1, "discovery": 1.2, "execution": 5.0, "post_processing": 0.5 } },
+          { "id": "DUT_1__redfish__Thermal", "name": "Thermal", "group": "redfish", "duration": 6.4, "start_time": "2026-03-18T14:30:22Z", "end_time": "2026-03-18T14:30:28Z", "status": "error", "stage_timing": { "validation": 0.1, "discovery": 0.5, "execution": 5.5, "post_processing": 0.3 } },
+          { "id": "DUT_1__host__DmesgLogs", "name": "DmesgLogs", "group": "host", "duration": 8.3, "start_time": "2026-03-18T14:30:28Z", "end_time": "2026-03-18T14:30:36Z", "status": "success", "stage_timing": { "validation": 0.2, "discovery": 0.3, "execution": 7.2, "post_processing": 0.6 } },
+          { "id": "DUT_1__host__NvidiaSmi", "name": "NvidiaSmi", "group": "host", "duration": 5.8, "start_time": "2026-03-18T14:30:36Z", "end_time": "2026-03-18T14:30:42Z", "status": "success", "stage_timing": { "validation": 0.1, "discovery": 0.2, "execution": 5.1, "post_processing": 0.4 } }
+        ]
+      },
+      {
+        "dut_id": "DUT_2",
+        "duration": 31.9,
+        "collectors": [
+          { "id": "DUT_2__redfish__Systems", "name": "Systems", "group": "redfish", "duration": 4.9, "start_time": "2026-03-18T14:30:10Z", "end_time": "2026-03-18T14:30:15Z", "status": "success", "stage_timing": { "validation": 0.1, "discovery": 0.7, "execution": 3.7, "post_processing": 0.4 } },
+          { "id": "DUT_2__redfish__Managers", "name": "Managers", "group": "redfish", "duration": 5.4, "start_time": "2026-03-18T14:30:15Z", "end_time": "2026-03-18T14:30:20Z", "status": "success", "stage_timing": { "validation": 0.1, "discovery": 1.0, "execution": 3.8, "post_processing": 0.5 } },
+          { "id": "DUT_2__redfish__Thermal", "name": "Thermal", "group": "redfish", "duration": 5.4, "start_time": "2026-03-18T14:30:20Z", "end_time": "2026-03-18T14:30:25Z", "status": "success", "stage_timing": { "validation": 0.1, "discovery": 0.6, "execution": 4.2, "post_processing": 0.5 } },
+          { "id": "DUT_2__host__DmesgLogs", "name": "DmesgLogs", "group": "host", "duration": 9.1, "start_time": "2026-03-18T14:30:25Z", "end_time": "2026-03-18T14:30:34Z", "status": "success", "stage_timing": { "validation": 0.2, "discovery": 0.3, "execution": 8.0, "post_processing": 0.6 } },
+          { "id": "DUT_2__host__NvidiaSmi", "name": "NvidiaSmi", "group": "host", "duration": 0.0, "start_time": null, "end_time": null, "status": "skipped", "stage_timing": { "validation": null, "discovery": null, "execution": null, "post_processing": null } }
+        ]
+      }
+    ],
+    "per_service": [
+      { "service": "redfish", "total_collectors": 6, "total_duration": 34.1 },
+      { "service": "ssh", "total_collectors": 4, "total_duration": 23.2 }
+    ]
+  },
+  "collection_summary": {
+    "total_duts": 2,
+    "total_collectors_executed": 10,
+    "total_collectors_in_catalog": 5,
+    "total_collectors_filtered_out": 0,
+    "total_log_size": 1160524,
+    "total_runtime": 64.4,
+    "overall_collection_pct": 90,
+    "status_counts": {
+      "success": 8,
+      "error": 1,
+      "partial": 0,
+      "skipped": 1,
+      "not_ran": 0
+    }
+  }
+}

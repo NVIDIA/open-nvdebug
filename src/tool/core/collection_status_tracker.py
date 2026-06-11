@@ -24,15 +24,12 @@ status information.
 
 import asyncio
 import json
-import os
-import sys
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
-import aiofiles
 from rich.console import Console
 from rich.live import Live
 from rich.panel import Panel
@@ -131,25 +128,6 @@ class CollectorStatusEntry:
         }
         return data
 
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "CollectorStatusEntry":
-        """
-        Create collector status entry from dictionary.
-
-        Args:
-            data: Dictionary representation of status entry.
-
-        Returns:
-            CollectorStatusEntry instance.
-        """
-        data["status"] = CollectorStatus(data["status"])
-        if data.get("start_time"):
-            data["start_time"] = datetime.fromisoformat(data["start_time"])
-        if data.get("end_time"):
-            data["end_time"] = datetime.fromisoformat(data["end_time"])
-        return cls(**data)
-
-
 class CollectionStatusTracker:
     """
     Tracks collection status across multiple DUTs with async-safe operations.
@@ -201,6 +179,8 @@ class CollectionStatusTracker:
             "partial_collectors": 0,
             "failed_collectors": 0,
             "skipped_collectors": 0,
+            "baseboard_excluded": 0,
+            "config_excluded": 0,
         }
 
         # File lock for async-safe operations
@@ -238,9 +218,28 @@ class CollectionStatusTracker:
             # Summary file goes directly in DUT folder (human-readable, easily accessible)
             self.dut_summary_files[dut_id] = dut_dir / "collection_status_summary.txt"
 
+        # Resolve tool-level config once; per-DUT config is looked up in the
+        # inner loop so that ``timeout_config`` overrides (e.g.
+        # ``NVOS_TECH_DUMP_TIMEOUT`` for H14) are reflected in the status
+        # summary as the *effective* runtime timeout rather than the raw
+        # top-level YAML value.
+        tool_config: Dict[str, Any] = {}
+        all_dut_configs: Dict[str, Any] = {}
+        try:
+            tool_config = config_manager.get_tool_config() or {}
+        except Exception:
+            tool_config = {}
+        try:
+            all_dut_configs = config_manager.get_dut_config() or {}
+        except Exception:
+            all_dut_configs = {}
+
+        from ..utils.timeout_config import get_collector_timeout
+
         # Initialize status entries for all DUT-collector combinations
         for dut_id in dut_ids:
             self.dut_collectors[dut_id] = set()
+            per_dut_config = all_dut_configs.get(dut_id, {}) or {}
 
             for collector_id in collector_ids:
                 collector_info = config_manager.get_collector_info(collector_id)
@@ -248,8 +247,35 @@ class CollectionStatusTracker:
                 group = collector_info.get("group", "Unknown")
                 level = collector_info.get("collection_level", "L1")
 
-                # Get timeout from collector definition
-                timeout = collector_info.get("timeout", None)
+                # Report the effective timeout (including ``timeout_config``
+                # overrides from tool/DUT config) so the status summary
+                # matches what the execution path will actually enforce.
+                raw_timeout = collector_info.get("timeout")
+                default_for_resolver = (
+                    int(raw_timeout)
+                    if isinstance(raw_timeout, (int, float)) and raw_timeout > 0
+                    else 300
+                )
+                try:
+                    timeout = get_collector_timeout(
+                        collector_id,
+                        collector_info,
+                        per_dut_config,
+                        default_for_resolver,
+                        tool_config,
+                    )
+                except Exception:
+                    # Never fail collection setup on a reporting concern.
+                    # Mirror the success path: store a deterministic int (or
+                    # None), never a raw float and never coerce a legitimate 0
+                    # timeout into None via a truthiness check.
+                    if raw_timeout is None:
+                        timeout = None
+                    else:
+                        try:
+                            timeout = int(raw_timeout)
+                        except (TypeError, ValueError):
+                            timeout = None
 
                 status_entry = CollectorStatusEntry(
                     dut_id=dut_id,
@@ -345,6 +371,7 @@ class CollectionStatusTracker:
         output_files: Optional[List[str]] = None,
         discovered_files: Optional[Dict[str, List[str]]] = None,
         context: Optional[Dict[str, Any]] = None,
+        skip_status_update: bool = False,
     ) -> None:
         """
         Mark a collector as completed with final status.
@@ -358,6 +385,8 @@ class CollectionStatusTracker:
             output_files: List of output file paths.
             discovered_files: Dictionary of discovered files by type.
             context: Additional context information.
+            skip_status_update: If True, skip writing status files to disk.
+                Use when bulk-updating many entries and call _update_status() once after.
         """
         key = f"{dut_id}:{collector_id}"
         if key in self.collector_statuses:
@@ -368,6 +397,8 @@ class CollectionStatusTracker:
                 # Map the new status to enum for comparison
                 new_status_enum = None
                 if status in ["success", "pass", True]:
+                    new_status_enum = CollectorStatus.SUCCESS
+                elif status in ["complete", "completed"]:
                     new_status_enum = CollectorStatus.SUCCESS
                 elif status in ["partial"]:
                     new_status_enum = CollectorStatus.PARTIAL
@@ -410,6 +441,9 @@ class CollectionStatusTracker:
 
             # Map status to enum and update stats (we know this is the first completion)
             if status in ["success", "pass", True]:
+                entry.status = CollectorStatus.SUCCESS
+                self.stats["completed_collectors"] += 1
+            elif status in ["complete", "completed"]:
                 entry.status = CollectorStatus.SUCCESS
                 self.stats["completed_collectors"] += 1
             elif status in ["partial"]:
@@ -457,6 +491,37 @@ class CollectionStatusTracker:
                 f"Stats after completion: {self.stats}",
             )
 
+            if not skip_status_update:
+                await self._update_status()
+
+    async def increment_baseboard_excluded(
+        self, skip_status_update: bool = False
+    ) -> None:
+        """
+        Increment the count of collectors excluded by baseboard filtering.
+
+        Args:
+            skip_status_update: If True, skip writing status files to disk.
+                Use when bulk-updating many entries and call _update_status() once after.
+        """
+        self.stats["baseboard_excluded"] += 1
+
+        if not skip_status_update:
+            await self._update_status()
+
+    async def increment_config_excluded(
+        self, skip_status_update: bool = False
+    ) -> None:
+        """
+        Increment the count of collectors excluded by config filtering.
+
+        Args:
+            skip_status_update: If True, skip writing status files to disk.
+                Use when bulk-updating many entries and call _update_status() once after.
+        """
+        self.stats["config_excluded"] += 1
+
+        if not skip_status_update:
             await self._update_status()
 
     async def _update_status(self) -> None:
@@ -482,12 +547,38 @@ class CollectionStatusTracker:
         """
         async with self._file_lock:
             try:
+                # Derive filtered-out (pre-execution skipped) and collectors_to_run
+                total_collectors_global = len(self.collector_statuses)
+                filtered_out_global = 0
+                for key, entry in self.collector_statuses.items():
+                    if (
+                        entry.status == CollectorStatus.SKIPPED
+                        and getattr(entry, "start_time", None) is None
+                    ):
+                        filtered_out_global += 1
+                collectors_to_run_global = max(
+                    total_collectors_global - filtered_out_global, 0
+                )
+
+                # Adjust skipped to reflect runtime-skipped only
+                runtime_skipped_global = max(
+                    self.stats.get("skipped_collectors", 0) - filtered_out_global, 0
+                )
+
+                # Build an aligned stats view for JSON consumers
+                stats_aligned = dict(self.stats)
+                stats_aligned["skipped_collectors"] = runtime_skipped_global
+                stats_aligned["filtered_out_collectors"] = filtered_out_global
+                stats_aligned["collectors_to_run"] = collectors_to_run_global
+
                 status_data = {
                     "metadata": {
                         "last_updated": datetime.now().isoformat(),
-                        "stats": self.stats,
+                        "stats": stats_aligned,
                         "total_duts": len(self.dut_collectors),
-                        "total_collectors": len(self.collector_statuses),
+                        "total_collectors": total_collectors_global,
+                        "collectors_to_run": collectors_to_run_global,
+                        "filtered_out": filtered_out_global,
                     },
                     "collectors": {
                         key: entry.to_dict()
@@ -495,8 +586,8 @@ class CollectionStatusTracker:
                     },
                 }
 
-                async with aiofiles.open(self.global_status_file, "w") as f:
-                    await f.write(json.dumps(status_data, indent=2))
+                with open(self.global_status_file, "w", encoding="utf-8") as f:
+                    f.write(json.dumps(status_data, indent=2))
             except Exception as e:
                 # Log error but don't fail
                 print(f"Warning: Failed to save global status file: {e}")
@@ -516,21 +607,31 @@ class CollectionStatusTracker:
                     }
 
                     dut_stats = self._get_dut_stats(dut_id)
+                    # Derive collectors_to_run for this DUT
+                    collectors_to_run = max(
+                        dut_stats["total"] - dut_stats.get("filtered_out", 0), 0
+                    )
+
+                    # Also include collectors_to_run inside the stats block for parity
+                    dut_stats_with_run = dict(dut_stats)
+                    dut_stats_with_run["collectors_to_run"] = collectors_to_run
 
                     dut_status_data = {
                         "metadata": {
                             "dut_id": dut_id,
                             "last_updated": datetime.now().isoformat(),
-                            "stats": dut_stats,
+                            "stats": dut_stats_with_run,
                             "total_collectors": len(dut_collectors),
+                            "collectors_to_run": collectors_to_run,
+                            "filtered_out": dut_stats.get("filtered_out", 0),
                         },
                         "collectors": dut_collectors,
                     }
 
                     status_file = self.dut_status_files.get(dut_id)
                     if status_file:
-                        async with aiofiles.open(status_file, "w") as f:
-                            await f.write(json.dumps(dut_status_data, indent=2))
+                        with open(status_file, "w", encoding="utf-8") as f:
+                            f.write(json.dumps(dut_status_data, indent=2))
 
                 except Exception as e:
                     # Log error but don't fail
@@ -552,14 +653,34 @@ class CollectionStatusTracker:
 
                 # Overall statistics
                 summary_lines.append("Overall Statistics:")
-                summary_lines.append(
-                    f"  Total Collectors: {self.stats['total_collectors']}"
+                # Compute totals across DUTs to derive FilteredOut and Collectors to run
+                total_collectors_global = sum(
+                    len(cids) for cids in self.dut_collectors.values()
                 )
+                filtered_out_global = 0
+                for dut_id in self.dut_collectors.keys():
+                    for collector_id in self.dut_collectors[dut_id]:
+                        entry = self.collector_statuses.get(f"{dut_id}:{collector_id}")
+                        if (
+                            entry
+                            and entry.status == CollectorStatus.SKIPPED
+                            and entry.start_time is None
+                        ):
+                            filtered_out_global += 1
+                collectors_to_run_global = max(
+                    total_collectors_global - filtered_out_global, 0
+                )
+
+                summary_lines.append(f"  Total Collectors: {total_collectors_global}")
+                summary_lines.append(f"  Collectors to run: {collectors_to_run_global}")
+                summary_lines.append(f"  FilteredOut: {filtered_out_global}")
                 summary_lines.append(f"  Pending: {self.stats['pending_collectors']}")
                 summary_lines.append(f"  Running: {self.stats['running_collectors']}")
                 summary_lines.append(
                     f"  Completed: {self.stats['completed_collectors']}"
                 )
+                # Include Partial collectors in global summary output
+                summary_lines.append(f"  Partial: {self.stats['partial_collectors']}")
                 summary_lines.append(f"  Failed: {self.stats['failed_collectors']}")
                 summary_lines.append(f"  Skipped: {self.stats['skipped_collectors']}")
                 summary_lines.append("")
@@ -584,6 +705,7 @@ class CollectionStatusTracker:
                     summary_lines.append(f"  {dut_id}:")
                     summary_lines.append(f"    Total: {dut_stats['total']}")
                     summary_lines.append(f"    Completed: {dut_stats['completed']}")
+                    summary_lines.append(f"    Partial: {dut_stats.get('partial', 0)}")
                     summary_lines.append(f"    Failed: {dut_stats['failed']}")
                     summary_lines.append(f"    Skipped: {dut_stats['skipped']}")
                     summary_lines.append(f"    Running: {dut_stats['running']}")
@@ -596,6 +718,7 @@ class CollectionStatusTracker:
                     for entry in self.collector_statuses.values()
                     if entry.status
                     in [
+                        CollectorStatus.SUCCESS,
                         CollectorStatus.SUCCESS,
                         CollectorStatus.ERROR,
                         CollectorStatus.SKIPPED,
@@ -640,8 +763,8 @@ class CollectionStatusTracker:
                         )
                     summary_lines.append("")
 
-                async with aiofiles.open(self.global_summary_file, "w") as f:
-                    await f.write("\n".join(summary_lines))
+                with open(self.global_summary_file, "w", encoding="utf-8") as f:
+                    f.write("\n".join(summary_lines))
 
             except Exception as e:
                 # Log error but don't fail
@@ -666,32 +789,65 @@ class CollectionStatusTracker:
 
                     # DUT statistics
                     summary_lines.append(f"Statistics for {dut_id}:")
+                    # Compute FilteredOut for this DUT: SKIPPED with no start_time (pre-exec filtered)
+                    filtered_out = 0
+                    for collector_id in self.dut_collectors.get(dut_id, set()):
+                        entry = self.collector_statuses.get(f"{dut_id}:{collector_id}")
+                        if (
+                            entry
+                            and entry.status == CollectorStatus.SKIPPED
+                            and entry.start_time is None
+                        ):
+                            filtered_out += 1
+                    collectors_to_run = max(dut_stats["total"] - filtered_out, 0)
+
                     summary_lines.append(f"  Total Collectors: {dut_stats['total']}")
+                    summary_lines.append(f"  Collectors to run: {collectors_to_run}")
+                    summary_lines.append(f"  FilteredOut: {filtered_out}")
                     summary_lines.append(f"  Pending: {dut_stats['pending']}")
                     summary_lines.append(f"  Running: {dut_stats['running']}")
                     summary_lines.append(f"  Completed: {dut_stats['completed']}")
+                    summary_lines.append(f"  Partial: {dut_stats.get('partial', 0)}")
                     summary_lines.append(f"  Failed: {dut_stats['failed']}")
                     summary_lines.append(f"  Skipped: {dut_stats['skipped']}")
                     summary_lines.append("")
 
                     # Progress percentage for this DUT
                     if dut_stats["total"] > 0:
-                        completed = (
+                        # Denominator should exclude filtered-out collectors
+                        denom = max(collectors_to_run, 1)
+                        # Include partial in the numerator; skipped here is runtime-skipped
+                        finished = (
                             dut_stats["completed"]
+                            + dut_stats.get("partial", 0)
                             + dut_stats["failed"]
                             + dut_stats["skipped"]
                         )
-                        progress = (completed / dut_stats["total"]) * 100
+                        progress = (finished / denom) * 100
                         summary_lines.append(
-                            f"Progress: {progress:.1f}% ({completed}/{dut_stats['total']})"
+                            f"Progress: {progress:.1f}% ({finished}/{collectors_to_run})"
                         )
                         summary_lines.append("")
 
                     # Collectors for this DUT
-                    dut_entries = [
+                    all_dut_entries = [
                         entry
                         for key, entry in self.collector_statuses.items()
                         if key.startswith(f"{dut_id}:")
+                    ]
+
+                    # Split into runtime entries vs filtered-out (pre-execution) entries
+                    filtered_entries = [
+                        e
+                        for e in all_dut_entries
+                        if e.status == CollectorStatus.SKIPPED and e.start_time is None
+                    ]
+                    dut_entries = [
+                        e
+                        for e in all_dut_entries
+                        if not (
+                            e.status == CollectorStatus.SKIPPED and e.start_time is None
+                        )
                     ]
 
                     if dut_entries:
@@ -779,10 +935,26 @@ class CollectionStatusTracker:
 
                         summary_lines.append("")
 
+                    # Add separate section for pre-execution filtered collectors at the end
+                    if filtered_entries:
+                        summary_lines.append("Filtered Collectors:")
+                        summary_lines.append("")
+                        summary_lines.append(
+                            f"{'ID':<8} {'Group':<10} {'Level':<6} {'Reason'}"
+                        )
+                        summary_lines.append("-" * 80)
+                        for entry in sorted(
+                            filtered_entries, key=lambda x: x.collector_id
+                        ):
+                            summary_lines.append(
+                                f"{entry.collector_id:<8} {entry.group:<10} {entry.level:<6} {entry.reason}"
+                            )
+                        summary_lines.append("")
+
                     summary_file = self.dut_summary_files.get(dut_id)
                     if summary_file:
-                        async with aiofiles.open(summary_file, "w") as f:
-                            await f.write("\n".join(summary_lines))
+                        with open(summary_file, "w", encoding="utf-8") as f:
+                            f.write("\n".join(summary_lines))
 
                 except Exception as e:
                     # Log error but don't fail
@@ -806,8 +978,14 @@ class CollectionStatusTracker:
                         continue
 
                     # Calculate overall timing
-                    start_times = [e.start_time for e in dut_entries if e.start_time]
-                    end_times = [e.end_time for e in dut_entries if e.end_time]
+                    # Only include collectors that actually executed (have both start_time AND end_time)
+                    # Skipped collectors have end_time set at finalization but no start_time,
+                    # which would incorrectly inflate the wall clock duration
+                    executed_entries = [
+                        e for e in dut_entries if e.start_time and e.end_time
+                    ]
+                    start_times = [e.start_time for e in executed_entries]
+                    end_times = [e.end_time for e in executed_entries]
 
                     overall_start = min(start_times) if start_times else None
                     overall_end = max(end_times) if end_times else None
@@ -920,8 +1098,8 @@ class CollectionStatusTracker:
                     dut_metadata_dir.mkdir(parents=True, exist_ok=True)
                     timing_file = dut_metadata_dir / "timing.json"
 
-                    async with aiofiles.open(timing_file, "w") as f:
-                        await f.write(json.dumps(timing_data, indent=2))
+                    with open(timing_file, "w", encoding="utf-8") as f:
+                        f.write(json.dumps(timing_data, indent=2))
 
                 except Exception as e:
                     # Log error but don't fail
@@ -935,15 +1113,17 @@ class CollectionStatusTracker:
             dut_id: DUT ID.
 
         Returns:
-            Dictionary of statistics (total, completed, failed, skipped, running, pending).
+            Dictionary of statistics (total, completed, partial, failed, skipped, running, pending, filtered_out).
         """
         stats = {
             "total": 0,
             "completed": 0,
+            "partial": 0,
             "failed": 0,
             "skipped": 0,
             "running": 0,
             "pending": 0,
+            "filtered_out": 0,
         }
 
         for collector_id in self.dut_collectors.get(dut_id, []):
@@ -957,8 +1137,14 @@ class CollectionStatusTracker:
                     stats["completed"] += 1
                 elif entry.status == CollectorStatus.ERROR:
                     stats["failed"] += 1
+                elif entry.status == CollectorStatus.PARTIAL:
+                    stats["partial"] += 1
                 elif entry.status == CollectorStatus.SKIPPED:
-                    stats["skipped"] += 1
+                    # Count filtered-out (pre-execution) separately from runtime skipped
+                    if getattr(entry, "start_time", None) is None:
+                        stats["filtered_out"] += 1
+                    else:
+                        stats["skipped"] += 1
                 elif entry.status == CollectorStatus.RUNNING:
                     stats["running"] += 1
                 elif entry.status == CollectorStatus.PENDING:
@@ -1007,6 +1193,7 @@ class CollectionStatusTracker:
             if entry.status
             in [
                 CollectorStatus.SUCCESS,
+                CollectorStatus.COMPLETE,
                 CollectorStatus.ERROR,
                 CollectorStatus.SKIPPED,
                 CollectorStatus.RUNNING,
@@ -1043,14 +1230,6 @@ class CollectionStatusTracker:
 
         return table
 
-    async def enable_live_display(self) -> None:
-        """
-        Enable live display of collection status.
-        """
-        self._display_enabled = True
-        if self.collector_statuses:  # Only start if already initialized
-            await self._start_live_display()
-
     async def _start_live_display(self) -> None:
         """
         Start the Rich live display.
@@ -1079,29 +1258,6 @@ class CollectionStatusTracker:
             if self.console:
                 self.console.print("\n")  # Force a newline using console.print()
 
-    async def get_status_summary(self) -> Dict[str, Any]:
-        """
-        Get current status summary with statistics and recent activity.
-
-        Returns:
-            Dictionary containing stats, per-DUT stats, and recent activity.
-        """
-        return {
-            "stats": self.stats.copy(),
-            "dut_stats": {
-                dut_id: self._get_dut_stats(dut_id)
-                for dut_id in self.dut_collectors.keys()
-            },
-            "recent_activity": [
-                entry.to_dict()
-                for entry in sorted(
-                    [e for e in self.collector_statuses.values() if e.end_time],
-                    key=lambda x: x.end_time,
-                    reverse=True,
-                )[:10]
-            ],
-        }
-
     async def _mark_remaining_pending_as_skipped(self) -> None:
         """
         Mark any collectors that are still PENDING as SKIPPED.
@@ -1126,7 +1282,8 @@ class CollectionStatusTracker:
                 # Mark as skipped
                 entry.status = CollectorStatus.SKIPPED
                 entry.end_time = datetime.now()
-                entry.reason = "Collector was filtered out and not executed"
+                if not entry.reason:
+                    entry.reason = "Collector was filtered out and not executed"
 
                 # Update stats
                 self.stats["pending_collectors"] -= 1
@@ -1163,14 +1320,28 @@ class CollectionStatusTracker:
                 #     "[dim]·[/dim]"
                 # )
                 # Print a dimmed dot to force newline
+                pre_execution_excluded = (
+                    self.stats.get("baseboard_excluded", 0)
+                    + self.stats.get("config_excluded", 0)
+                )
+                total = self.stats["total_collectors"]
+                executed = total - pre_execution_excluded
+                execution_skipped = max(
+                    self.stats["skipped_collectors"] - pre_execution_excluded, 0
+                )
+
+                summary_text = (
+                    f"Collection Complete!\n"
+                    f"Total: {total} | Executed: {executed} | Excluded: {pre_execution_excluded}\n"
+                    f"Completed: {self.stats['completed_collectors']} | "
+                    f"Failed: {self.stats['failed_collectors']} | "
+                    f"Partial: {self.stats['partial_collectors']} | "
+                    f"Skipped: {execution_skipped}"
+                )
+
                 self.console.print(
                     Panel(
-                        f"Collection Complete!\n"
-                        f"Total: {self.stats['total_collectors']} | "
-                        f"Completed: {self.stats['completed_collectors']} | "
-                        f"Failed: {self.stats['failed_collectors']} | "
-                        f"Partial: {self.stats['partial_collectors']} | "
-                        f"Skipped: {self.stats['skipped_collectors']}",
+                        summary_text,
                         title="Final Summary",
                         border_style="green",
                     )

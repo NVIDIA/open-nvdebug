@@ -26,6 +26,6 @@ Attributes:
     __build_time__ (str): Build timestamp or 'unknown'.
 """
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 __build_hash__ = "unknown"
 __build_time__ = "unknown"

@@ -242,6 +242,22 @@ Collectors are organized by type and numbered:
 - **H1, H2, H3...** - Host collectors (e.g., `Host_H6_<collector_name>`)
 - **I1, I2, I3...** - IPMI collectors (e.g., `IPMI_I1_<collector_name>`)
 
+### SPA Report App
+
+The default report format in v2.1.0 is the Vue SPA report. The Python collector writes a `manifest.json` for the run, copies the prebuilt SPA bundle from `src/tool/report_app_dist/` into `reports/`, and embeds the manifest into `reports/index.html`.
+
+For source checkouts, build the SPA bundle before running collections:
+
+```shell
+make build-report-app
+```
+
+This runs `npm ci` and `npm run build` in `src/report-app`, then copies the single-file Vite build into `src/tool/report_app_dist/`. If the SPA bundle is not built, use the legacy report path explicitly:
+
+```shell
+python -m src.tool.main collect --report-format legacy ...
+```
+
 ### Viewing Results
 
 **HTML Reports (Recommended):**

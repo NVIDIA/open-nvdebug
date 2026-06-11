@@ -24,7 +24,7 @@ system status, component health, and error detection.
 import asyncio
 import json
 import logging
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 from .base_service import BaseService
 
@@ -148,7 +148,7 @@ class HealthCheckService(BaseService):
                 dut_id,
                 health_data,
                 kwargs.get("function_tag", "health_check"),
-                output_pattern=f"HealthCheck_C1_out_of_band_health_check.json",
+                output_pattern="HealthCheck_C1_out_of_band_health_check.json",
                 collector_id=kwargs.get("collector_id", "C1"),
             )
             if file_path:

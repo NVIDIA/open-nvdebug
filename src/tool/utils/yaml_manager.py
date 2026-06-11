@@ -21,12 +21,15 @@ support for schema validation and detailed error reporting.
 """
 
 import logging
+import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Tuple, Union
 
 import yaml
 
 logger = logging.getLogger(__name__)
+
+MAX_CONFIG_FILE_SIZE_MB = 50  # 50 MB max for any config file
 
 
 class YAMLManager:
@@ -36,6 +39,25 @@ class YAMLManager:
     Provides static methods for loading, validating, saving, and managing YAML
     configuration files with detailed error handling and reporting.
     """
+
+    @staticmethod
+    def _validate_file_size(
+        file_path: Path, max_size_mb: int = MAX_CONFIG_FILE_SIZE_MB
+    ) -> None:
+        """
+        Raise ValueError if file exceeds max size.
+
+        Args:
+            file_path: Path to the file to check
+            max_size_mb: Maximum allowed file size in megabytes
+        """
+        file_size = os.path.getsize(file_path)
+        max_bytes = max_size_mb * 1024 * 1024
+        if file_size > max_bytes:
+            raise ValueError(
+                f"Config file {file_path} ({file_size / (1024 * 1024):.1f} MB) "
+                f"exceeds maximum allowed size ({max_size_mb} MB)"
+            )
 
     @staticmethod
     def load_yaml(
@@ -54,7 +76,7 @@ class YAMLManager:
         Raises:
             FileNotFoundError: If file doesn't exist
             PermissionError: If file can't be read
-            ValueError: If YAML is invalid
+            ValueError: If YAML is invalid or exceeds size limit
         """
         file_path = Path(file_path)
 
@@ -68,6 +90,9 @@ class YAMLManager:
 
         if not file_path.stat().st_size > 0:
             raise ValueError(f"{context} is empty: {file_path}")
+
+        # Validate file size before loading
+        YAMLManager._validate_file_size(file_path)
 
         try:
             with open(file_path, "r", encoding="utf-8") as f:
@@ -91,147 +116,83 @@ class YAMLManager:
             raise ValueError(f"Error reading {context}: {e}")
 
     @staticmethod
-    def save_yaml(
-        data: Dict[str, Any],
-        file_path: Union[str, Path],
-        context: str = "YAML file",
-    ) -> None:
-        """
-        Save data to YAML file with error handling
-
-        Args:
-            data: Data to save
-            file_path: Path to save to
-            context: Context for error messages
-
-        Raises:
-            ValueError: If save fails
-        """
-        file_path = Path(file_path)
-
-        try:
-            # Ensure directory exists
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-
-            with open(file_path, "w", encoding="utf-8") as f:
-                yaml.dump(data, f, default_flow_style=False, sort_keys=False)
-
-        except Exception as e:
-            raise ValueError(f"Error saving {context}: {e}")
-
-    @staticmethod
     def validate_dut_config(data: Dict[str, Any]) -> Tuple[bool, List[str]]:
         """
-        Validate DUT configuration structure
+        Validate DUT configuration structure.
+
+        Separates hard errors (config will not work) from soft warnings
+        (config works but could be improved). Only hard errors cause
+        is_valid to be False.
 
         Args:
             data: Loaded YAML data
 
         Returns:
-            Tuple of (is_valid, list_of_issues)
+            Tuple of (is_valid, list_of_issues) where issues includes
+            both errors and warnings. is_valid is False only when
+            hard errors are present.
         """
-        issues = []
+        errors = []
+        warnings = []
 
         if not isinstance(data, dict):
-            issues.append("Root element must be a YAML mapping (dictionary)")
-            return False, issues
+            errors.append("Root element must be a YAML mapping (dictionary)")
+            return False, errors
 
         if not data:
-            issues.append("DUT configuration file is empty")
-            return False, issues
+            errors.append("DUT configuration file is empty")
+            return False, errors
 
-        # Check for DUT_Defaults (optional but recommended)
         if "DUT_Defaults" not in data:
-            issues.append("No DUT_Defaults section found (optional but recommended)")
+            warnings.append("No DUT_Defaults section found (optional but recommended)")
 
-        # Check for actual DUTs (handle both CLI format and regular format)
         duts = []
         if "duts" in data:
-            # CLI format: {"duts": {"cli-dut": {...}}}
             duts = [k for k in data["duts"].keys() if k != "DUT_Defaults"]
         else:
-            # Regular format: {"dut-1": {...}, "dut-2": {...}}
             duts = [k for k in data.keys() if k != "DUT_Defaults"]
 
         if not duts:
-            issues.append("No DUT configurations found. Add at least one DUT entry.")
-            return False, issues
+            errors.append("No DUT configurations found. Add at least one DUT entry.")
+            return False, errors
 
-        # Validate each DUT configuration
-        dut_configs = data.get(
-            "duts", data
-        )  # Handle both CLI format and regular format
+        dut_configs = data.get("duts", data)
 
         for dut_id, dut_config in dut_configs.items():
             if dut_id == "DUT_Defaults":
                 continue
 
             if not isinstance(dut_config, dict):
-                issues.append(
+                errors.append(
                     f"DUT '{dut_id}' configuration must be a mapping, not {type(dut_config).__name__}"
                 )
                 continue
 
-            # Check that at least one access method is provided (BMC_IP, HOST_IP, or local mode)
             bmc_ip = dut_config.get("BMC_IP")
             host_ip = dut_config.get("HOST_IP")
             execution_mode = dut_config.get("ExecutionMode", "remote").lower()
 
             if not bmc_ip and not host_ip and execution_mode != "local":
-                issues.append(
+                errors.append(
                     f"DUT '{dut_id}' must have at least one access method: BMC_IP, HOST_IP, or ExecutionMode: local"
                 )
 
-            # Check for recommended fields (optional but recommended)
             recommended_fields = []
             if bmc_ip and not host_ip:
-                recommended_fields.append(
-                    "HOST_IP"
-                )  # Recommend host access if only BMC is provided
+                recommended_fields.append("HOST_IP")
             elif host_ip and not bmc_ip:
-                recommended_fields.append(
-                    "BMC_IP"
-                )  # Recommend BMC access if only host is provided
+                recommended_fields.append("BMC_IP")
 
             missing_recommended = [
                 field for field in recommended_fields if not dut_config.get(field)
             ]
 
             if missing_recommended:
-                issues.append(
+                warnings.append(
                     f"DUT '{dut_id}' is missing recommended fields: {missing_recommended}"
                 )
 
-        return len(issues) == 0, issues
-
-    @staticmethod
-    def validate_tool_config(data: Dict[str, Any]) -> Tuple[bool, List[str]]:
-        """
-        Validate tool configuration structure
-
-        Args:
-            data: Loaded YAML data
-
-        Returns:
-            Tuple of (is_valid, list_of_issues)
-        """
-        issues = []
-
-        if not isinstance(data, dict):
-            issues.append("Root element must be a YAML mapping (dictionary)")
-            return False, issues
-
-        if not data:
-            issues.append("Tool configuration file is empty")
-            return False, issues
-
-        # Check for required sections
-        required_sections = ["execution_config", "collector_definitions"]
-        for section in required_sections:
-            if section not in data:
-                issues.append(f"Missing required section: {section}")
-
-        return len(issues) == 0, issues
+        return len(errors) == 0, errors + warnings
 
     @staticmethod
     def convert_legacy_dut_format(
@@ -239,9 +200,9 @@ class YAMLManager:
         default_baseboard: str = "Blackwell-HGX-8-GPU",
     ) -> Dict[str, Any]:
         """
-        Convert older format to current format
+        Convert legacy nvdebug format to new nvdebug format
 
-        Older format:
+        Legacy format:
         - Baseboard is stored in config.yaml as 'TargetBaseboard'
         - DUT config only contains connection details
 
@@ -296,7 +257,17 @@ class YAMLManager:
                 "HOST_USERNAME": dut_config.get("HOST_USERNAME"),
                 "HOST_PASSWORD": dut_config.get("HOST_PASSWORD"),
                 "HOST_SSH_PORT": dut_config.get("HOST_SSH_PORT", 22),
+                "HOST_SSH_KEY_PATH": dut_config.get("HOST_SSH_KEY_PATH"),
                 "HOST_SSH_PASSWORDLESS": dut_config.get("HOST_SSH_PASSWORDLESS", False),
+                # HMC Configuration
+                "HMC_IP": dut_config.get("HMC_IP"),
+                "HMC_USERNAME": dut_config.get("HMC_USERNAME"),
+                "HMC_PASSWORD": dut_config.get("HMC_PASSWORD"),
+                "HMC_SSH_USERNAME": dut_config.get("HMC_SSH_USERNAME"),
+                "HMC_SSH_PASSWORD": dut_config.get("HMC_SSH_PASSWORD"),
+                "HMC_SSH_PORT": dut_config.get("HMC_SSH_PORT", 22),
+                "HMC_SSH_KEY_PATH": dut_config.get("HMC_SSH_KEY_PATH"),
+                "HMC_SSH_PASSWORDLESS": dut_config.get("HMC_SSH_PASSWORDLESS", False),
                 # Network Configuration
                 "IP_NETWORK": dut_config.get("IP_NETWORK", "ipv4"),
                 # Execution Configuration
@@ -336,30 +307,6 @@ class YAMLManager:
         """
         error_str = str(yaml_error)
 
-        # Common YAML error patterns and their user-friendly explanations
-        error_patterns = {
-            "found duplicate anchor": "Duplicate anchor definition found. Each anchor (&name) must be unique.",
-            "found unconstructable recursive node": "Circular reference detected. An anchor is referencing itself.",
-            "found undefined alias": "Undefined alias reference. Make sure all aliases (*name) have corresponding anchors (&name).",
-            "found multiple documents": "Multiple YAML documents detected. Please use a single document.",
-            "found unknown tag": "Unknown YAML tag found. Please use standard YAML syntax.",
-            "found duplicate key": "Duplicate key found in YAML mapping.",
-            "found tab character": "Tab characters are not allowed in YAML. Use spaces for indentation.",
-            "found invalid escape sequence": "Invalid escape sequence in string value.",
-            "found invalid line break": "Invalid line break in string value.",
-            "found invalid character": "Invalid character in YAML content.",
-            "found unexpected end of stream": "Unexpected end of file. This usually means a quote, bracket, or brace is not properly closed.",
-            "while scanning a quoted scalar": "Quote mismatch detected. Check that all quoted strings are properly closed.",
-            "mapping values are not allowed here": "YAML structure error. This usually indicates indentation problems or missing colons after keys.",
-            "expected '<document start>'": "Missing YAML document start marker. Add '---' as the first line of the file.",
-            "while parsing a block mapping": "YAML structure/indentation problem. Check for correct indentation and proper key-value syntax.",
-        }
-
-        # Check for specific error patterns and provide helpful messages
-        for pattern, explanation in error_patterns.items():
-            if pattern in error_str.lower():
-                return f"{explanation}\n\nTechnical details: {error_str}"
-
         # For anchor/alias specific errors, provide additional guidance
         if "anchor" in error_str.lower() or "alias" in error_str.lower():
             return (
@@ -384,47 +331,28 @@ class YAMLManager:
                 f"- Example: 'HGX_I2CTRANSFER_WRITE_TO_ADDRESS: \"0x11\"' (note the closing quote)"
             )
 
+        # Common YAML error patterns and their user-friendly explanations
+        error_patterns = {
+            "found duplicate anchor": "Duplicate anchor definition found. Each anchor (&name) must be unique.",
+            "found unconstructable recursive node": "Circular reference detected. An anchor is referencing itself.",
+            "found undefined alias": "Undefined alias reference. Make sure all aliases (*name) have corresponding anchors (&name).",
+            "found multiple documents": "Multiple YAML documents detected. Please use a single document.",
+            "found unknown tag": "Unknown YAML tag found. Please use standard YAML syntax.",
+            "found duplicate key": "Duplicate key found in YAML mapping.",
+            "found tab character": "Tab characters are not allowed in YAML. Use spaces for indentation.",
+            "found invalid escape sequence": "Invalid escape sequence in string value.",
+            "found invalid line break": "Invalid line break in string value.",
+            "found invalid character": "Invalid character in YAML content.",
+            "found unexpected end of stream": "Unexpected end of file. This usually means a quote, bracket, or brace is not properly closed.",
+            "while scanning a quoted scalar": "Quote mismatch detected. Check that all quoted strings are properly closed.",
+            "mapping values are not allowed here": "YAML structure error. This usually indicates indentation problems or missing colons after keys.",
+            "expected '<document start>'": "Missing YAML document start marker. Add '---' as the first line of the file.",
+            "while parsing a block mapping": "YAML structure/indentation problem. Check for correct indentation and proper key-value syntax.",
+        }
+
+        # Check for specific error patterns and provide helpful messages
+        for pattern, explanation in error_patterns.items():
+            if pattern in error_str.lower():
+                return f"{explanation}\n\nTechnical details: {error_str}"
+
         return f"YAML parsing error: {error_str}"
-
-    @staticmethod
-    def get_dut_count(data: Dict[str, Any]) -> int:
-        """
-        Get the number of DUTs in the configuration.
-
-        Args:
-            data: Configuration data.
-
-        Returns:
-            Number of DUTs (excluding DUT_Defaults).
-        """
-        if not isinstance(data, dict):
-            return 0
-        return len([k for k in data.keys() if k != "DUT_Defaults"])
-
-    @staticmethod
-    def get_dut_names(data: Dict[str, Any]) -> List[str]:
-        """
-        Get the names of all DUTs in the configuration.
-
-        Args:
-            data: Configuration data.
-
-        Returns:
-            List of DUT names (excluding DUT_Defaults).
-        """
-        if not isinstance(data, dict):
-            return []
-        return [k for k in data.keys() if k != "DUT_Defaults"]
-
-    @staticmethod
-    def has_dut_defaults(data: Dict[str, Any]) -> bool:
-        """
-        Check if the configuration has DUT_Defaults section.
-
-        Args:
-            data: Configuration data.
-
-        Returns:
-            True if DUT_Defaults section exists, False otherwise.
-        """
-        return isinstance(data, dict) and "DUT_Defaults" in data

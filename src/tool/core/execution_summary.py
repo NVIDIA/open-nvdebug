@@ -32,7 +32,7 @@ from typing import Any, Dict, List, Optional
 
 class ExecutionSummaryManager:
     """
-    Manages execution summary file generation.
+    Manages execution summary file generation in legacy nvdebug format.
 
     Handles per-DUT execution summary tracking with collector status,
     timing information, and file paths.
@@ -375,7 +375,7 @@ class ExecutionSummaryManager:
                 if files_in_folder:
                     discovered_files[path] = files_in_folder
 
-            except (OSError, PermissionError) as e:
+            except (OSError, PermissionError):
                 # Skip directories that can't be accessed
                 continue
 

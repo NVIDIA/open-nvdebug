@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <!-- __NVDEBUG_MANIFEST_PLACEHOLDER__ -->
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>NVDebug Report</title>
+    <style>
+      body { margin: 0; background: #0a0a0a; }
+      .nv-splash {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        min-height: 100vh;
+        gap: 20px;
+        font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+        background: #0a0a0a;
+        background-image: radial-gradient(ellipse at 50% 40%, rgba(118, 185, 0, 0.04) 0%, transparent 60%);
+      }
+      .nv-splash__logo { opacity: 0; animation: nv-splash-fade 0.5s 0.1s ease forwards; }
+      .nv-splash__title {
+        color: #76B900;
+        font-size: 20px;
+        font-weight: 700;
+        letter-spacing: -0.015em;
+        opacity: 0;
+        animation: nv-splash-fade 0.5s 0.2s ease forwards;
+      }
+      .nv-splash__spinner {
+        width: 36px; height: 36px;
+        border: 3px solid rgba(118, 185, 0, 0.15);
+        border-top-color: #76B900;
+        border-radius: 50%;
+        opacity: 0;
+        animation: nv-splash-fade 0.4s 0.35s ease forwards, nv-splash-spin 0.75s 0.35s linear infinite;
+      }
+      .nv-splash__text {
+        color: #8f8f8f;
+        font-size: 12px;
+        letter-spacing: 0.05em;
+        opacity: 0;
+        animation: nv-splash-fade 0.4s 0.5s ease forwards;
+      }
+      @keyframes nv-splash-fade { to { opacity: 1; } }
+      @keyframes nv-splash-spin { to { transform: rotate(360deg); } }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <div class="nv-splash">
+        <svg class="nv-splash__logo" width="52" height="40" viewBox="0 0 34 30" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M16.889 8.985V6.28c.262-.02.528-.033.798-.042 7.4-.232 12.255 6.359 12.255 6.359s-5.244 7.282-10.866 7.282a6.82 6.82 0 0 1-2.187-.35v-8.204c2.88.348 3.46 1.62 5.192 4.508l3.852-3.248s-2.812-3.688-7.552-3.688c-.515 0-1.008.036-1.492.088zm0-8.938V4.09c.265-.021.531-.038.798-.048 10.29-.346 16.995 8.44 16.995 8.44s-7.7 9.364-15.723 9.364c-.735 0-1.424-.068-2.07-.183v2.498c.553.07 1.126.112 1.724.112 7.465 0 12.864-3.812 18.092-8.325.867.694 4.416 2.383 5.145 3.123-4.971 4.16-16.555 7.515-23.123 7.515a18.89 18.89 0 0 1-1.838-.096V30h28.375V.047H16.89zm0 19.482v2.133c-6.905-1.23-8.822-8.408-8.822-8.408s3.316-3.674 8.822-4.269v2.34l-.011-.001c-2.89-.347-5.147 2.353-5.147 2.353s1.265 4.544 5.158 5.852zM4.625 12.943s4.092-6.04 12.264-6.663V4.088C7.838 4.815 0 12.48 0 12.48s4.439 12.833 16.889 14.008V24.16C7.753 23.011 4.625 12.943 4.625 12.943z" fill="#76B900"/>
+        </svg>
+        <div class="nv-splash__title">NVDebug Report</div>
+        <div class="nv-splash__spinner"></div>
+        <div class="nv-splash__text">Loading...</div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

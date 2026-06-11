@@ -138,7 +138,7 @@ def process_value_for_json(value: Any) -> Any:
         return _process_value(value)
     except Exception as e:
         logger.warning(f"JSON conversion failed: {str(e)}")
-        return f"<error during JSON conversion>"
+        return "<error during JSON conversion>"
 
 
 def safe_json_dumps(obj: Any, **kwargs) -> str:

@@ -67,14 +67,17 @@ result = self._create_standardized_collector_result(
 import asyncio
 import json
 import logging
+import os
 import re
 import textwrap
 import traceback
+import weakref
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import aiohttp
 
+from ..core.async_logger import _collector_context
 from ..utils.dependency_checker import DependencyChecker
 from ..utils.enums import CollectorServiceMapping
 from ..utils.variable_substitution import VariableSubstitutionService
@@ -107,6 +110,7 @@ class BaseService:
         self.dependency_checker = None
         self.timing_manager = None
         self.variable_engine = None  # Will be created asynchronously
+        self._request_response_capture_states = weakref.WeakKeyDictionary()
         if orchestrator is not None:
             self.dut_manager = orchestrator.dut_manager
             self.logger = orchestrator.logger
@@ -153,6 +157,50 @@ class BaseService:
             config_resolver=None,  # TODO: Get from orchestrator
             dut_object=dut_object,
         )
+
+    def _get_dut_config_value(self, dut_id: str, config_key: str) -> Optional[Any]:
+        """
+        Retrieve a configuration value for the given DUT.
+
+        Args:
+            dut_id: DUT identifier
+            config_key: Configuration key to look up
+
+        Returns:
+            The configuration value if available, otherwise None.
+        """
+        if not config_key or not self.dut_manager:
+            return None
+
+        try:
+            dut = self.dut_manager.get_dut(dut_id)
+        except Exception:
+            return None
+
+        if not dut or not hasattr(dut, "config"):
+            return None
+
+        if config_key in dut.config:
+            return dut.config.get(config_key)
+
+        # Fallback to baseboard configuration if not present in DUT config
+        if self.dut_manager:
+            baseboard_name = dut.config.get("baseboard")
+            if baseboard_name:
+                manager_getter = getattr(
+                    self.dut_manager, "_get_baseboard_manager", None
+                )
+                baseboard_manager = (
+                    manager_getter() if callable(manager_getter) else None
+                )
+                if baseboard_manager:
+                    baseboard_config = baseboard_manager.get_baseboard_config(
+                        baseboard_name
+                    )
+                    if baseboard_config and config_key in baseboard_config:
+                        return baseboard_config.get(config_key)
+
+        return None
 
     async def _log_error(
         self,
@@ -204,19 +252,16 @@ class BaseService:
             str: Current collector ID
         """
         try:
-            # Try to get from orchestrator context
-            if hasattr(self, "orchestrator") and self.orchestrator:
-                # First try to get from per-collector context (new method)
-                if hasattr(self.orchestrator, "get_collector_execution_context"):
-                    # We need dut_id to get the proper context, but we don't have it here
-                    # This is a limitation of the current design
-                    pass
+            # Task-local context variable set by the execution engine — safe under concurrency.
+            ctx_id = _collector_context.get()
+            if ctx_id:
+                return ctx_id
 
-                # Check if orchestrator has current collector context (legacy)
+            # Fallback: shared orchestrator globals (race-prone under parallel execution).
+            if hasattr(self, "orchestrator") and self.orchestrator:
                 if hasattr(self.orchestrator, "current_collector_id"):
                     return self.orchestrator.current_collector_id
 
-                # Check if orchestrator has current execution context (legacy)
                 if hasattr(self.orchestrator, "current_execution_context"):
                     return self.orchestrator.current_execution_context.get(
                         "collector_id", "unknown"
@@ -331,51 +376,34 @@ class BaseService:
             output_files_count: Number of output files generated
             additional_details: Additional details to include in summary
         """
-        await self._log_runtime(
-            "INFO", self.service_name, f"=== {collection_name} Summary ===", dut_id
-        )
-        await self._log_runtime(
-            "INFO", self.service_name, f"Total operations: {total_operations}", dut_id
-        )
-        await self._log_runtime(
-            "INFO",
-            self.service_name,
-            f"Successful operations: {successful_operations}",
-            dut_id,
-        )
-        await self._log_runtime(
-            "INFO", self.service_name, f"Failed operations: {failed_operations}", dut_id
-        )
-        if skipped_operations > 0:
-            await self._log_runtime(
-                "INFO",
-                self.service_name,
-                f"Skipped operations: {skipped_operations}",
-                dut_id,
-            )
-        await self._log_runtime(
-            "INFO",
-            self.service_name,
-            f"Output files generated: {output_files_count}",
-            dut_id,
-        )
-
-        # Add additional details if provided
-        if additional_details:
-            for key, value in additional_details.items():
-                await self._log_runtime(
-                    "INFO", self.service_name, f"{key}: {value}", dut_id
-                )
-
-        # Calculate success rate
         success_rate = (
             (successful_operations / total_operations * 100)
             if total_operations > 0
             else 0
         )
-        await self._log_runtime(
-            "INFO", self.service_name, f"Success rate: {success_rate:.1f}%", dut_id
+
+        # Single-line summary at INFO; full breakdown at DEBUG
+        summary = (
+            f"{collection_name}: {successful_operations}/{total_operations} succeeded"
         )
+        if failed_operations:
+            summary += f", {failed_operations} failed"
+        if skipped_operations:
+            summary += f", {skipped_operations} skipped"
+        summary += f" ({output_files_count} files, {success_rate:.0f}%)"
+
+        await self._log_runtime(
+            "INFO" if not failed_operations else "WARN",
+            self.service_name,
+            summary,
+            dut_id,
+        )
+
+        if additional_details:
+            for key, value in additional_details.items():
+                await self._log_runtime(
+                    "DEBUG", self.service_name, f"{key}: {value}", dut_id
+                )
 
     async def _save_collection_summary_json(
         self,
@@ -707,41 +735,86 @@ class BaseService:
         elif collection_type == "file_search_and_archive":
             file_pattern = search_info.get("file_pattern", "*")
             search_directories = search_info.get("search_directories", [])
-            found_files = results.get("found_files", [])
+
+            # Collect discovered, processed, and failed files (with graceful fallbacks).
+            found_files = search_info.get("found_files") or results.get(
+                "found_files", []
+            )
+            processed_files = search_info.get("processed_files", [])
+            failed_files = search_info.get("failed_files", [])
+
+            # Gather error messages so we can infer failed files even when only the summary runs.
+            error_messages = search_info.get("error_messages") or results.get(
+                "error_messages", []
+            )
+            if error_messages:
+                failed_files_from_errors = []
+                for message in error_messages:
+                    match = re.search(r"Failed to process file:\s*(.+)", message)
+                    if match:
+                        failed_files_from_errors.append(match.group(1).strip())
+                if failed_files_from_errors:
+                    failed_files = (
+                        failed_files or []
+                    ) + failed_files_from_errors  # merge if already present
+
+            # Ensure lists are unique while preserving order.
+            def _dedupe(sequence: List[str]) -> List[str]:
+                seen = set()
+                ordered = []
+                for item in sequence:
+                    if item and item not in seen:
+                        seen.add(item)
+                        ordered.append(item)
+                return ordered
+
+            found_files = _dedupe(found_files or [])
+            processed_files = _dedupe(processed_files or [])
+            failed_files = _dedupe(failed_files or [])
+
+            # If we only know about failures, treat them as discovered files for reporting.
+            if not found_files and failed_files:
+                found_files = failed_files.copy()
+
+            processed_set = set(processed_files)
+            failed_set = set(failed_files)
 
             summary_lines.extend(
                 [
                     f"Search Pattern: {file_pattern}",
-                    f"Search Directories: {', '.join(search_directories)}",
+                    f"Search Directories: {', '.join(search_directories) or '(none)'}",
                     f"Files Found: {len(found_files)}",
                     "",
                 ]
             )
 
             if found_files:
-                summary_lines.extend(
-                    [
-                        "Files found and processed:",
-                        *[f"- {file}" for file in found_files],
-                        "",
-                    ]
-                )
+                summary_lines.append("Files discovered:")
+                for file in found_files:
+                    suffix = ""
+                    if file in failed_set and file in processed_set:
+                        suffix = " (processing failed after partial transfer)"
+                    elif file in failed_set:
+                        suffix = " (processing failed)"
+                    elif file in processed_set:
+                        suffix = " (processed)"
+                    summary_lines.append(f"- {file}{suffix}")
+                summary_lines.append("")
             else:
                 summary_lines.extend(
                     [
-                        "Files found and processed:",
+                        "Files discovered:",
                         "- None",
                         "",
                     ]
                 )
 
         # Add appropriate note based on results and configuration
+        # Use search_info for emptiness checks so summaries reflect archived content
         has_empty_results = (
-            collection_type == "file_collection" and results.get("empty_patterns", [])
-        ) or (
-            collection_type == "file_search_and_archive"
-            and not results.get("found_files", [])
-        )
+            collection_type == "file_collection"
+            and (search_info.get("empty_patterns") or [])
+        ) or (collection_type == "file_search_and_archive" and not found_files)
 
         # Determine status note - CHECK EMPTY RESULTS FIRST before operation counts
         # This ensures that when no files are found, we show the appropriate message
@@ -1200,7 +1273,7 @@ class BaseService:
 
     async def create_redfish_session(self) -> bool:
         """
-        Create persistent Redfish session - uses session pool.
+        Create persistent Redfish session (like legacy nvdebug) - Now uses session pool.
 
         Args:
             None
@@ -1219,7 +1292,10 @@ class BaseService:
             # Setup authentication for session pool
             username = connection_info["username"]
             password = connection_info["password"]
-            self.redfish_auth = aiohttp.BasicAuth(username, password)
+            if connection_info.get("auth_enabled", True) and username and password:
+                self.redfish_auth = aiohttp.BasicAuth(username, password)
+            else:
+                self.redfish_auth = None
 
             # Test the session pool with a simple request
             protocol = "https" if connection_info["use_https"] else "http"
@@ -1234,7 +1310,7 @@ class BaseService:
                     if session_obj:
                         try:
                             async with session_obj["session"].get(
-                                test_url, auth=session_obj["auth"], ssl=False
+                                test_url, auth=session_obj["auth"], ssl=dut.redfish_ssl
                             ) as response:
                                 if response.status == 200:
                                     await self._log_runtime(
@@ -1299,7 +1375,9 @@ class BaseService:
 
             # Create connector with configurable settings (fallback to defaults)
             self.redfish_connector = aiohttp.TCPConnector(
-                ssl=session_config.get("ssl", False),  # Configurable SSL verification
+                ssl=session_config.get(
+                    "ssl_verify", session_config.get("ssl", False)
+                ),  # Configurable SSL verification
                 limit=session_config.get(
                     "fallback_connection_pool_limit", 15
                 ),  # Configurable fallback connection pool size
@@ -1337,7 +1415,9 @@ class BaseService:
             test_url = f"{protocol}://{connection_info['host']}:{connection_info['port']}/redfish/v1"
 
             async with self.redfish_session.get(
-                test_url, auth=self.redfish_auth, ssl=False
+                test_url,
+                auth=self.redfish_auth,
+                ssl=session_config.get("ssl_verify", session_config.get("ssl", False)),
             ) as response:
                 if response.status == 200:
                     await self._log_runtime(
@@ -1366,7 +1446,7 @@ class BaseService:
 
     async def close_redfish_session(self) -> None:
         """
-        Close Redfish session.
+        Close Redfish session (like legacy nvdebug logout).
 
         Args:
             None
@@ -1394,7 +1474,7 @@ class BaseService:
 
     def normalize_redfish_uri(self, uri: str, ignore_prefix: bool = False) -> str:
         """
-        Normalize Redfish URI with prefix handling.
+        Normalize Redfish URI with prefix handling (like legacy nvdebug).
 
         Args:
             uri: URI to normalize
@@ -1403,7 +1483,7 @@ class BaseService:
         if ignore_prefix:
             return uri
 
-        # Handle prefix substitution
+        # Handle prefix substitution like legacy nvdebug
         if (
             self.redfish_default_prefix != "/redfish/v1"
             and not uri.startswith(self.redfish_default_prefix)
@@ -1419,7 +1499,7 @@ class BaseService:
 
     def reset_redfish_cache(self) -> None:
         """
-        Reset Redfish cache.
+        Reset Redfish cache (like legacy nvdebug).
 
         Args:
             None
@@ -1431,7 +1511,7 @@ class BaseService:
 
     def get_redfish_cache(self) -> Dict[str, Any]:
         """
-        Get Redfish cache.
+        Get Redfish cache (like legacy nvdebug).
 
         Args:
             None
@@ -1618,6 +1698,13 @@ class BaseService:
             f"Starting collector {collector_id} on DUT {dut_id}",
             dut_id,
         )
+        if hasattr(self, "orchestrator") and self.orchestrator:
+            try:
+                await self.orchestrator.record_execution_order_entry(
+                    dut_id, collector_id
+                )
+            except Exception:
+                pass
 
         # Start timing for this collector
         if self.timing_manager:
@@ -1664,7 +1751,7 @@ class BaseService:
                 }
 
             await self._log_runtime(
-                "INFO",
+                "DEBUG",
                 "BaseService",
                 f"Found collector definition for {collector_id}",
                 dut_id,
@@ -1680,9 +1767,34 @@ class BaseService:
                 "function_tag": collector_def.get("name", collector_id),
             }
 
+            # Attach baseboard config for downstream hooks (e.g., Redfish discovery)
+            baseboard_name = ""
+            baseboard_config = None
+            if self.dut_manager:
+                dut_config = self.dut_manager.get_dut_config(dut_id)
+                if dut_config:
+                    baseboard_name = dut_config.get(
+                        "TargetBaseboard", dut_config.get("baseboard", "")
+                    )
+                baseboard_manager = None
+                if hasattr(self.dut_manager, "_get_baseboard_manager"):
+                    baseboard_manager = self.dut_manager._get_baseboard_manager()
+                elif hasattr(self.dut_manager, "get_baseboard_manager"):
+                    baseboard_manager = self.dut_manager.get_baseboard_manager()
+                if baseboard_manager and baseboard_name:
+                    baseboard_config = baseboard_manager.get_baseboard_config(
+                        baseboard_name
+                    )
+
+            if baseboard_config:
+                context["baseboard_config"] = baseboard_config
+                context["baseboard_specific_config"] = {
+                    baseboard_name: baseboard_config
+                }
+
             # Check dependencies
             await self._log_runtime(
-                "INFO",
+                "DEBUG",
                 "BaseService",
                 f"Checking dependencies for {collector_id}",
                 dut_id,
@@ -1738,7 +1850,7 @@ class BaseService:
                 }
 
             await self._log_runtime(
-                "INFO",
+                "DEBUG",
                 "BaseService",
                 f"Dependencies satisfied for {collector_id}",
                 dut_id,
@@ -1751,7 +1863,7 @@ class BaseService:
             for stage in stages:
                 if stage in collector_def.get("stages", {}):
                     await self._log_runtime(
-                        "INFO",
+                        "DEBUG",
                         "BaseService",
                         f"Executing stage {stage} for {collector_id}",
                         dut_id,
@@ -1840,7 +1952,7 @@ class BaseService:
                             "execution_time": execution_time,
                         }
                     await self._log_runtime(
-                        "INFO",
+                        "DEBUG",
                         "BaseService",
                         f"Stage {stage} completed for {collector_id}",
                         dut_id,
@@ -1848,6 +1960,15 @@ class BaseService:
 
                     # Store stage results with stage-specific keys to avoid overwriting
                     stage_context = stage_result.get("context", {})
+
+                    # FIX: Copy top-level status and reason from stage_result into stage_context
+                    # so they can be propagated to the main context through the loop below.
+                    # This handles the case where _create_standardized_collector_result returns
+                    # status/reason at the top level but not inside the context dict.
+                    if "status" in stage_result and "status" not in stage_context:
+                        stage_context["status"] = stage_result["status"]
+                    if "reason" in stage_result and "reason" not in stage_context:
+                        stage_context["reason"] = stage_result["reason"]
 
                     # FIX: If stage_result is missing status but has success, add status to stage_result and stage_context
                     # This must be done BEFORE the context update loop so the status field gets processed
@@ -1904,6 +2025,10 @@ class BaseService:
                             # Execution stage status always takes precedence
                             context[key] = value
                             # print(f"DEBUG: Updated context with execution stage status: '{value}'")
+                        elif key == "skip_reasons":
+                            context[f"{stage}_skip_reasons"] = value
+                            if stage == "execution":
+                                context[key] = value
                         elif key not in context:
                             # For other fields, store if not already present
                             context[key] = value
@@ -1993,9 +2118,8 @@ class BaseService:
                                 dut_id,
                             )
 
-            # Finalize collector
             await self._log_runtime(
-                "INFO", "BaseService", f"Finalizing collector {collector_id}", dut_id
+                "DEBUG", "BaseService", f"Finalizing collector {collector_id}", dut_id
             )
 
             # Debug: Log context overview before status determination
@@ -2014,6 +2138,47 @@ class BaseService:
 
             # Determine final status based on overall collector success, not just stage status
             # Check multiple ways a collector could be skipped, but only if no output files were produced
+            # However, if ignore_empty_results is True, don't treat empty output as skipped
+
+            # First check if ignore_empty_results is set
+            ignore_empty_results = False
+            if "execution_result" in context:
+                ignore_empty_results = context.get("execution_result", {}).get(
+                    "ignore_empty_results", False
+                )
+
+            # If not found in execution_result, check the collector definition
+            if not ignore_empty_results:
+                collector_info = None
+                if hasattr(self, "orchestrator") and self.orchestrator:
+                    try:
+                        collector_info = self.orchestrator.get_collector_info(
+                            collector_id
+                        )
+                    except Exception:
+                        pass
+
+                if collector_info and "stages" in collector_info:
+                    execution_stage = collector_info.get("stages", {}).get(
+                        "execution", {}
+                    )
+                    for hook in execution_stage.get("hooks", []):
+                        if (
+                            "params" in hook
+                            and "ignore_empty_results" in hook["params"]
+                        ):
+                            ignore_empty_results = hook["params"][
+                                "ignore_empty_results"
+                            ]
+                            break
+
+            await self._log_runtime(
+                "DEBUG",
+                "BaseService",
+                f"Collector {collector_id}: ignore_empty_results={ignore_empty_results}, output_files={len(output_files)}",
+                dut_id,
+            )
+
             is_skipped = len(output_files) == 0 and (
                 ("status" in context and context["status"] == "skipped")
                 or (
@@ -2027,6 +2192,21 @@ class BaseService:
                     for stage_name in ["execution", "post_processing", "validation"]
                 )
             )
+
+            # Override is_skipped if ignore_empty_results is True and context indicates success
+            if is_skipped and ignore_empty_results:
+                # Check if the context indicates this was a successful execution with empty results
+                if (
+                    context.get("status") == "success"
+                    or context.get("execution_stage_status") == "success"
+                ):
+                    is_skipped = False
+                    await self._log_runtime(
+                        "DEBUG",
+                        "BaseService",
+                        f"Collector {collector_id}: Treating empty results as success (ignore_empty_results=True)",
+                        dut_id,
+                    )
 
             await self._log_runtime(
                 "DEBUG",
@@ -2114,9 +2294,25 @@ class BaseService:
                             if skip_reason:
                                 break
 
-                final_reason = skip_reason or context.get(
-                    "reason", "Collector was skipped"
-                )
+                aggregated_skip_reasons = []
+                for key in (
+                    "execution_skip_reasons",
+                    "skip_reasons",
+                    "post_processing_skip_reasons",
+                    "validation_skip_reasons",
+                ):
+                    values = context.get(key, [])
+                    if isinstance(values, list):
+                        for value in values:
+                            if value and value not in aggregated_skip_reasons:
+                                aggregated_skip_reasons.append(value)
+
+                if aggregated_skip_reasons:
+                    final_reason = "; ".join(aggregated_skip_reasons)
+                else:
+                    final_reason = skip_reason or context.get(
+                        "reason", "Collector was skipped"
+                    )
                 await self._log_runtime(
                     "DEBUG",
                     "BaseService",
@@ -2215,7 +2411,7 @@ class BaseService:
                 )
 
             await self._log_runtime(
-                "INFO",
+                "DEBUG",
                 "BaseService",
                 f"Collector {collector_id} completed successfully",
                 dut_id,
@@ -2242,7 +2438,7 @@ class BaseService:
                 )
 
             result = {
-                "success": final_status == "success",
+                "success": final_status in ("success", "partial"),
                 "status": final_status,
                 "reason": final_reason,
                 "context": context,
@@ -2335,6 +2531,8 @@ class BaseService:
 
             # Get platform information using BaseboardManager
             platform = "default"
+            baseboard = ""
+            baseboard_manager = None
             if self.dut_manager:
                 dut = self.dut_manager.get_dut(dut_id)
                 if dut and hasattr(dut, "config"):
@@ -2360,6 +2558,27 @@ class BaseService:
                     check_local = dep.get(
                         "check_local", False
                     )  # New flag for local checking
+                    config_key_name = dep.get("config_key")
+                    config_default = dep.get("config_default")
+
+                    if config_key_name:
+                        config_value = self._get_dut_config_value(
+                            dut_id, config_key_name
+                        )
+                        if config_value is None and config_default is not None:
+                            config_value = config_default
+
+                        if config_value is not None:
+                            dep_name = str(config_value)
+                        else:
+                            await self._log_runtime(
+                                "WARN",
+                                "BaseService",
+                                f"[{collector_id}] Required dependency '{dep_type}' "
+                                f"requested config '{config_key_name}' but no value was found; "
+                                f"falling back to '{dep_name}'",
+                                dut_id,
+                            )
 
                     if dep_type and dep_name:
                         # Use DUT-aware dependency checker based on type
@@ -2386,16 +2605,17 @@ class BaseService:
                             result = self.dependency_checker.check_service(dep_name)
                         elif dep_type == "file":
                             # For SSH collectors, check files on the BMC
-                            if collector_id.startswith(
-                                "S"
-                            ):  # SSH collectors start with "S"
+                            if self.dut_manager:
+                                use_bmc = collector_id.startswith(
+                                    "S"
+                                )  # SSH collectors start with "S"
                                 result = (
                                     await self.dependency_checker._check_file_on_dut(
-                                        dut_id, dep_name
+                                        dut_id, dep_name, use_bmc=use_bmc
                                     )
                                 )
                             else:
-                                # For now, fall back to local check for files
+                                # Fallback to local check if no DUT manager
                                 result = self.dependency_checker.check_file(dep_name)
                         elif dep_type == "command_version":
                             # Check command version on appropriate target
@@ -2708,8 +2928,10 @@ class BaseService:
 
             stage_context = context.copy()
             last_hook_result = None
+            stage_skip_reasons = list(stage_context.get("skip_reasons", []))
 
             for hook in hooks:
+                stage_context["current_stage"] = stage
                 hook_result = await self._execute_hook(hook, stage_context)
                 last_hook_result = hook_result  # Keep track of the last hook result
 
@@ -2726,6 +2948,12 @@ class BaseService:
                         "success": False,
                         "reason": f"Hook {hook.get('method', 'unknown')} failed: {hook_result.get('reason', 'No specific hook error reason provided')}",
                     }
+                if (
+                    hook_result.get("status") == "skipped"
+                    and hook_result.get("reason")
+                    and hook_result["reason"] not in stage_skip_reasons
+                ):
+                    stage_skip_reasons.append(hook_result["reason"])
                 # Update context with hook results
                 stage_context.update(hook_result.get("context", {}))
 
@@ -2781,6 +3009,9 @@ class BaseService:
                     context.get("dut_id"),
                 )
 
+            if stage_skip_reasons:
+                stage_context["skip_reasons"] = stage_skip_reasons
+
             # Debug logging for final stage result
             await self._log_runtime(
                 "DEBUG",
@@ -2818,7 +3049,10 @@ class BaseService:
             # Log hook execution start
             dut_id = context.get("dut_id", "unknown")
             await self._log_runtime(
-                "INFO", "BaseService", f"Starting hook execution: {method_name}", dut_id
+                "DEBUG",
+                "BaseService",
+                f"Starting hook execution: {method_name}",
+                dut_id,
             )
 
             # Start timing for this hook
@@ -2852,8 +3086,8 @@ class BaseService:
                 dut_id,
             )
 
-            # Merge context into hook_params
-            hook_params.update(context)
+            # Merge context into hook params without overwriting explicit hook config.
+            hook_params = {**context, **hook_params}
 
             # Check for output_pattern at hook level and add to params
             if "output_pattern" in hook:
@@ -2913,9 +3147,37 @@ class BaseService:
                 hook_params, context
             )
 
-            # Execute method
+            # Determine if request/response capture should be enabled for this hook
+            capture_config = hook.get("store_request_response", None)
+            capture_requested = method_name != "finalize_collector"
+            capture_options: Dict[str, Any] = {}
+
+            if isinstance(capture_config, dict):
+                capture_requested = True
+                capture_options = capture_config.copy()
+            elif capture_config is not None:
+                capture_requested = bool(capture_config)
+
+            current_stage = context.get("current_stage")
+            if (
+                capture_config is None
+                and current_stage in ("validation", "discovery")
+                and (
+                    method_name.startswith("_validate_")
+                    or method_name.startswith("_discover_")
+                )
+            ):
+                capture_requested = True
+
+            if hook.get("request_response_output_pattern"):
+                capture_options["output_pattern"] = hook[
+                    "request_response_output_pattern"
+                ]
+            if hook.get("request_response_function_tag"):
+                capture_options["function_tag"] = hook["request_response_function_tag"]
+
             await self._log_runtime(
-                "INFO",
+                "DEBUG",
                 "BaseService",
                 f"[{collector_id}] Executing method: {method_name}",
                 dut_id,
@@ -2936,75 +3198,370 @@ class BaseService:
                     dut_id,
                 )
 
-            if asyncio.iscoroutinefunction(method):
-                result = await method(**hook_params)
-            else:
-                result = method(**hook_params)
+            capture_token = None
+            result = None
+            capture_result = None
+            hook_exception = None
 
-            # Debug: Log method result
-            await self._log_runtime(
-                "DEBUG",
-                "BaseService",
-                f"[{collector_id}] Method {method_name} returned: {type(result).__name__} with keys: {list(result.keys()) if isinstance(result, dict) else 'N/A'}",
-                dut_id,
-            )
+            try:
+                if capture_requested:
+                    capture_token = await self._begin_request_response_capture(
+                        context, method_name, capture_options
+                    )
 
-            # End timing for this
-            if self.timing_manager:
-                self.timing_manager.end_hook(method_name)
+                if asyncio.iscoroutinefunction(method):
+                    result = await method(**hook_params)
+                else:
+                    result = method(**hook_params)
 
-            # Log hook execution result
-            if isinstance(result, dict) and "success" in result:
-                success = result.get("success", False)
-                reason = result.get("reason", "No reason provided")
+                # Debug: Log method result
                 await self._log_runtime(
-                    "INFO" if success else "ERROR",
+                    "DEBUG",
                     "BaseService",
-                    f"[{collector_id}] Hook {method_name} completed: success={success}, reason={reason}",
+                    f"[{collector_id}] Method {method_name} returned: {type(result).__name__} with keys: {list(result.keys()) if isinstance(result, dict) else 'N/A'}",
                     dut_id,
                 )
 
-                # Log context if present
-                if "context" in result and result["context"]:
-                    context_summary = {
-                        k: v
-                        for k, v in result["context"].items()
-                        if k not in ["password", "token", "secret"]
-                        and not isinstance(v, (list, dict))
-                    }
-                    if context_summary:
+                # Log hook execution result
+                if isinstance(result, dict) and "success" in result:
+                    success = result.get("success", False)
+                    reason = result.get("reason", "No reason provided")
+                    await self._log_runtime(
+                        "INFO" if success else "ERROR",
+                        "BaseService",
+                        f"[{collector_id}] Hook {method_name} completed: success={success}, reason={reason}",
+                        dut_id,
+                    )
+
+                    # Log context if present
+                    if "context" in result and result["context"]:
+                        context_summary = {
+                            k: v
+                            for k, v in result["context"].items()
+                            if k not in ["password", "token", "secret"]
+                            and not isinstance(v, (list, dict))
+                        }
+                        if context_summary:
+                            await self._log_runtime(
+                                "DEBUG",
+                                "BaseService",
+                                f"[{collector_id}] Hook {method_name} context: {context_summary}",
+                                dut_id,
+                            )
+                else:
+                    await self._log_runtime(
+                        "INFO",
+                        "BaseService",
+                        f"[{collector_id}] Hook {method_name} completed with simple result",
+                        dut_id,
+                    )
+
+            except Exception as e:
+                hook_exception = e
+                raise
+            finally:
+                if self.timing_manager:
+                    self.timing_manager.end_hook(method_name)
+
+                if capture_token:
+                    try:
+                        capture_result = await self._finalize_request_response_capture(
+                            capture_token,
+                            context,
+                            method_name,
+                            capture_options,
+                            result,
+                            hook_exception,
+                        )
+                    except Exception as capture_error:
+                        capture_result = None
                         await self._log_runtime(
-                            "DEBUG",
+                            "ERROR",
                             "BaseService",
-                            f"[{collector_id}] Hook {method_name} context: {context_summary}",
+                            f"[{collector_id}] Failed to finalize request/response capture for {method_name}: {capture_error}",
                             dut_id,
                         )
-            else:
-                await self._log_runtime(
-                    "INFO",
-                    "BaseService",
-                    f"[{collector_id}] Hook {method_name} completed with simple result",
-                    dut_id,
-                )
 
             # Check if the result indicates success/failure
             if isinstance(result, dict) and "success" in result:
-                # Method returned a structured result with success flag
-                return result
+                final_result = result
             else:
                 # Method returned a simple result, treat as success
-                return {
+                final_result = {
                     "success": True,
                     "context": (
                         result if isinstance(result, dict) else {"result": result}
                     ),
                 }
 
+            if capture_result and capture_result[0] and isinstance(final_result, dict):
+                self._attach_capture_metadata(
+                    final_result,
+                    capture_result,
+                    method_name,
+                    current_stage,
+                    context,
+                )
+
+            return final_result
+
         except Exception as e:
             return {
                 "success": False,
                 "reason": f"Hook execution error: {str(e)}",
             }
+
+    def _attach_capture_metadata(
+        self,
+        target_result: Dict[str, Any],
+        capture_result: Tuple[str, Dict[str, Any]],
+        method_name: str,
+        current_stage: Optional[str],
+        context: Dict[str, Any],
+    ) -> None:
+        """
+        Append request/response capture metadata to a hook result structure.
+        """
+        file_path, capture_data = capture_result
+        capture_data = capture_data or {}
+
+        output_files = target_result.setdefault("output_files", [])
+        if file_path not in output_files:
+            output_files.append(file_path)
+
+        context_block = target_result.setdefault("context", {})
+        output_files_block = context_block.setdefault("output_files", [])
+        if file_path not in output_files_block:
+            output_files_block.append(file_path)
+
+        logs_block = context_block.setdefault("request_response_logs", {})
+        capture_key = capture_data.get("key")
+        if not capture_key:
+            stage_hint = capture_data.get("stage")
+            stage_name = stage_hint or current_stage or context.get("current_stage")
+            method_key = method_name.strip("_")
+            capture_key = f"{stage_name}:{method_key}" if stage_name else method_key
+        logs_block[capture_key] = capture_data.get("requests", [])
+
+    def _sanitize_for_capture(self, value: Any, depth: int = 4) -> Any:
+        """
+        Convert arbitrary data into a JSON-serializable structure for request/response capture files.
+        """
+        if depth <= 0:
+            return str(value)
+
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+
+        if isinstance(value, bytes):
+            return {
+                "type": "bytes",
+                "length": len(value),
+                "note": "binary content omitted",
+            }
+
+        if isinstance(value, (list, tuple)):
+            return [self._sanitize_for_capture(item, depth - 1) for item in value]
+
+        if isinstance(value, dict):
+            return {
+                str(key): self._sanitize_for_capture(val, depth - 1)
+                for key, val in value.items()
+            }
+
+        return str(value)
+
+    async def _begin_request_response_capture(
+        self,
+        context: Dict[str, Any],
+        method_name: str,
+        options: Dict[str, Any],
+    ) -> Optional[asyncio.Task]:
+        """
+        Enable request/response capture for the current coroutine.
+        """
+        task = asyncio.current_task()
+        if not task:
+            return None
+
+        stack = self._request_response_capture_states.setdefault(task, [])
+        state = {
+            "collector_id": context.get("collector_id"),
+            "dut_id": context.get("dut_id"),
+            "stage": context.get("current_stage")
+            or options.get("stage")
+            or context.get("stage")
+            or "unknown_stage",
+            "method": method_name,
+            "options": options.copy(),
+            "requests": [],
+            "started_at": datetime.utcnow().isoformat() + "Z",
+        }
+        stack.append(state)
+
+        await self._log_runtime(
+            "DEBUG",
+            "BaseService",
+            f"Enabled request/response capture for {state['stage']}::{method_name}",
+            context.get("dut_id"),
+        )
+        return task
+
+    def _record_request_response(
+        self,
+        request_info: Dict[str, Any],
+        response_info: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Append a request/response pair to the capture buffer for the current coroutine.
+        """
+        task = asyncio.current_task()
+        if not task:
+            return
+
+        stack = self._request_response_capture_states.get(task)
+        if not stack:
+            return
+
+        state = stack[-1] if stack else None
+        if not state:
+            return
+
+        entry: Dict[str, Any] = {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "request": self._sanitize_for_capture(request_info),
+        }
+
+        if response_info is not None:
+            entry["response"] = self._sanitize_for_capture(response_info)
+
+        if metadata:
+            entry["metadata"] = self._sanitize_for_capture(metadata)
+
+        state["requests"].append(entry)
+
+    async def _finalize_request_response_capture(
+        self,
+        token: Optional[asyncio.Task],
+        context: Dict[str, Any],
+        method_name: str,
+        options: Dict[str, Any],
+        hook_result: Optional[Dict[str, Any]],
+        error: Optional[BaseException],
+    ) -> Optional[Tuple[str, Dict[str, Any]]]:
+        """
+        Flush captured request/response pairs to disk and return metadata.
+        """
+        task = token or asyncio.current_task()
+        if not task:
+            return None
+
+        stack = self._request_response_capture_states.get(task)
+        if not stack:
+            return None
+
+        state = stack.pop()
+        if not stack:
+            self._request_response_capture_states.pop(task, None)
+
+        if not state.get("requests"):
+            await self._log_runtime(
+                "DEBUG",
+                "BaseService",
+                f"No request/response data captured for {state.get('stage', 'unknown_stage')}::{method_name}",
+                context.get("dut_id"),
+            )
+            return None
+
+        capture_data: Dict[str, Any] = {
+            "collector_id": state.get("collector_id") or context.get("collector_id"),
+            "stage": state.get("stage")
+            or context.get("current_stage")
+            or "unknown_stage",
+            "hook": method_name,
+            "started_at": state.get("started_at"),
+            "captured_at": datetime.utcnow().isoformat() + "Z",
+            "requests": state.get("requests", []),
+        }
+
+        if isinstance(hook_result, dict):
+            capture_data["hook_result"] = {
+                key: hook_result.get(key)
+                for key in ("success", "status", "reason")
+                if hook_result.get(key) is not None
+            }
+
+        if error:
+            capture_data["hook_error"] = {
+                "type": type(error).__name__,
+                "message": str(error),
+            }
+
+        merged_options = state.get("options", {}).copy()
+        if options:
+            merged_options.update(options)
+        capture_data["options"] = merged_options
+
+        stage_name = capture_data["stage"] or "stage"
+        method_slug = method_name.strip("_") or method_name
+        capture_key = merged_options.get("capture_key") or f"{stage_name}:{method_slug}"
+        capture_data["key"] = capture_key
+
+        output_pattern = merged_options.get("output_pattern")
+        function_tag = merged_options.get("function_tag")
+
+        method_slug_for_tag = method_slug.replace(" ", "_")
+        if not function_tag:
+            function_tag = f"request_{method_slug_for_tag}"
+        if not output_pattern:
+            output_pattern = f"diagnostic/request_{method_slug_for_tag}.json"
+
+        target_dut_id = state.get("dut_id") or context.get("dut_id")
+        if not target_dut_id:
+            await self._log_runtime(
+                "WARN",
+                "BaseService",
+                f"Unable to write request/response capture for {method_name} without dut_id",
+                context.get("dut_id"),
+            )
+            return None
+
+        target_collector_id = (
+            state.get("collector_id")
+            or context.get("collector_id")
+            or self._get_current_collector_id()
+            or ""
+        )
+
+        file_path = await self.write_output_with_generalization(
+            target_dut_id,
+            target_collector_id,
+            capture_data,
+            output_pattern=output_pattern,
+            function_tag=function_tag,
+            default_extension=".json",
+        )
+
+        if not file_path:
+            await self._log_runtime(
+                "ERROR",
+                "BaseService",
+                f"Failed to write request/response capture file for {method_name}",
+                target_dut_id,
+            )
+            return None
+
+        capture_data["file_path"] = file_path
+
+        await self._log_runtime(
+            "DEBUG",
+            "BaseService",
+            f"Wrote request/response capture for {method_name} to {file_path}",
+            target_dut_id,
+        )
+
+        return file_path, capture_data
 
     async def _get_output_directory(self, dut_id: str) -> str:
         """
@@ -3234,6 +3791,22 @@ class BaseService:
                     dut_id,
                 )
 
+            # Optional follow-up hooks can legitimately report "skipped" after a primary
+            # collection hook already produced data (for example DGX-only sub-collections).
+            # Do not let that downgrade the collector when real output files exist.
+            if status == "skipped" and actual_output_files:
+                await self._log_runtime(
+                    "DEBUG",
+                    "BaseService",
+                    f"Preserving successful collector status for {collector_id} because {len(actual_output_files)} output file(s) were produced before a later skipped hook",
+                    dut_id,
+                )
+                status = "success"
+                if reason == "Not a DGX platform":
+                    reason = "Completed successfully (DGX-specific sub-collection not applicable)"
+                elif not reason:
+                    reason = "Completed successfully"
+
             # For skipped collectors, correct the reason early if it's generic
             # Only apply this correction if the collector was actually skipped:
             # - Has skip_message AND
@@ -3278,7 +3851,7 @@ class BaseService:
                 )
 
             # Check for ignore_empty_results case: status is success but no files collected
-            # This should be treated as "skipped" with appropriate message
+            # Keep success but surface the expected-empty reason when applicable; allow overrides
             elif status == "success":
                 # Check if ignore_empty_results is set (from execution_result or collector definition)
                 ignore_empty = False
@@ -3323,8 +3896,59 @@ class BaseService:
                         else []
                     )
 
-                    # If no real data files collected (only summary files or nothing), treat as skipped
+                    # If no real data files collected (only summary files or nothing),
+                    # keep the collector marked as success but allow overrides.
                     if not real_data_files or len(real_data_files) == 0:
+                        # Look for overrides in kwargs or execution_result
+                        status_override = kwargs.get("status_override")
+                        reason_override = kwargs.get("reason_override")
+                        if not status_override and "execution_result" in kwargs:
+                            er = kwargs.get("execution_result", {})
+                            status_override = er.get("status_override")
+                            reason_override = er.get("reason_override", reason_override)
+
+                        # Also honor overrides defined in post_processing hooks (collector definition)
+                        if (
+                            (not status_override or not reason_override)
+                            and hasattr(self, "orchestrator")
+                            and self.orchestrator
+                        ):
+                            collector_info = self.orchestrator.get_collector_info(
+                                collector_id
+                            )
+                            post_hooks = (
+                                collector_info.get("stages", {})
+                                .get("post_processing", {})
+                                .get("hooks", [])
+                                if collector_info
+                                else []
+                            )
+                            for hook in post_hooks:
+                                if hook.get("method") == "finalize_collector":
+                                    params = hook.get("params", {})
+                                    status_override = status_override or params.get(
+                                        "status_override"
+                                    )
+                                    reason_override = reason_override or params.get(
+                                        "reason_override"
+                                    )
+                                    break
+
+                        if status_override:
+                            status = status_override
+                        if reason_override:
+                            reason = reason_override
+
+                        # If the reason already indicates an empty-target completion, honor it.
+                        if "No URIs to collect; treating as success" in reason:
+                            return {
+                                "status": status,
+                                "reason": reason,
+                                "context": kwargs.get("execution_result", {}).get(
+                                    "context", {}
+                                ),
+                            }
+
                         # Try to get collector_config from multiple sources
                         collector_config = kwargs.get("collector_config", {})
 
@@ -3358,17 +3982,25 @@ class BaseService:
                         else:
                             reason = "No data collected (expected behavior)"
 
-                        status = "skipped"
+                        if reason_override:
+                            reason = reason_override
+                        if status_override:
+                            status = status_override
+                        else:
+                            # Default behavior: treat as success when empty results are explicitly allowed.
+                            # This avoids flagging "healthy system / no dumps" collectors as skipped.
+                            status = "success"
+
                         await self._log_runtime(
                             "INFO",
                             "BaseService",
-                            f"Collector {collector_id}: No data files collected (only {len(actual_output_files)} summary files) with ignore_empty_results=True, changing status from 'success' to 'skipped'",
+                            f"Collector {collector_id}: No data files collected (only {len(actual_output_files)} summary files) with ignore_empty_results=True; treating as {status}",
                             dut_id,
                         )
                         await self._log_runtime(
                             "DEBUG",
                             "BaseService",
-                            f"Using empty_expected_note as reason: {reason}",
+                            f"Using empty_expected_note/override as reason: {reason}",
                             dut_id,
                         )
 
@@ -3519,7 +4151,7 @@ class BaseService:
                 should_add_entry = True
 
             if should_add_entry and hasattr(self, "orchestrator") and self.orchestrator:
-                # For skipped collectors, create error log file
+                # For skipped collectors, create error log file (like legacy nvdebug)
                 # But don't create error log if this is a temporary "skipped" that will become "partial"
                 if status == "skipped" and len(output_files) == 0:
                     try:
@@ -3760,23 +4392,11 @@ class BaseService:
                         )
             else:
                 await self._log_runtime(
-                    "ERROR",
+                    "DEBUG",
                     "BaseService",
                     f"Cannot add execution summary entry for collector {collector_id}: orchestrator not available",
                     dut_id,
                 )
-
-            # Log to DUT-specific log using helper method
-            await self._log_runtime(
-                (
-                    "INFO"
-                    if status == "success"
-                    else "ERROR" if status == "error" else "WARN"
-                ),
-                collector_id,
-                f"Status: {status}, Reason: {reason}, Time: {execution_time:.2f}s",
-                dut_id,
-            )
 
             # Log collector result using helper method (after all corrections)
             await self._log_runtime(
@@ -3805,6 +4425,7 @@ class BaseService:
             )
 
             return {
+                "success": status in ["success", "partial", "skipped"],
                 "status": status,
                 "reason": reason,
                 "execution_time": execution_time,
@@ -3820,6 +4441,7 @@ class BaseService:
                 collector_id,
             )
             return {
+                "success": False,
                 "status": "error",
                 "reason": f"Finalization error: {str(e)}",
                 "execution_time": execution_time,
@@ -3955,6 +4577,10 @@ class BaseService:
             )
 
             if self.logger:
+                if hasattr(self.logger, "_apply_stream_window_to_filename"):
+                    filename = self.logger._apply_stream_window_to_filename(
+                        collector_id, filename
+                    )
                 await self._log_runtime(
                     "DEBUG",
                     "BaseService",
@@ -4214,7 +4840,7 @@ class BaseService:
                 await self._log_runtime(
                     "DEBUG",
                     "BaseService",
-                    f"Content is None, using empty string",
+                    "Content is None, using empty string",
                     dut_id,
                 )
             else:
@@ -4350,6 +4976,7 @@ class BaseService:
             "run_bmc_command": {
                 "command": "command",
                 "function_tag": "function_tag",
+                "baseboard_commands": "baseboard_commands",
             },
             "run_bmc_commands": {
                 "commands": "commands",
@@ -4473,7 +5100,7 @@ class BaseService:
     ) -> str:
         """
         Process command output to ensure it's in string format.
-        Standard implementation.
+        Matches legacy nvdebug implementation.
 
         Args:
             output: The command output to process (can be str, bytes, or None)
@@ -4493,7 +5120,7 @@ class BaseService:
                 try:
                     # Try latin1 as fallback - it can handle all byte values
                     return output.decode("latin1", errors="replace")
-                except Exception as e:
+                except Exception:
                     # Last resort - hex representation
                     return f"hex:{output.hex()}"
 
@@ -4518,7 +5145,7 @@ class BaseService:
     ) -> str:
         """
         Format error messages for command execution failures consistently.
-        Standard implementation.
+        Matches legacy nvdebug implementation.
 
         Args:
             command: The command that was executed
@@ -4567,7 +5194,7 @@ STDOUT    :
     ) -> None:
         """
         Log command execution results consistently.
-        Standard logging pattern.
+        Matches legacy nvdebug logging pattern.
 
         Args:
             command: The command that was executed
@@ -4606,7 +5233,7 @@ STDOUT    :
     ) -> str:
         """
         Create standardized command output content for file writing.
-        Standard output format.
+        Matches legacy nvdebug output format.
 
         Args:
             command: The command that was executed
@@ -4983,13 +5610,36 @@ STDOUT    :
         if additional_context is None:
             additional_context = {}
 
-        # Check if this should be treated as "skipped" based on additional context
-        if additional_context.get("status") == "skipped":
-            success = True  # Skipped is not a failure
-            status = "skipped"
-            reason = additional_context.get(
-                "reason", f"Collector {operation_name} was skipped"
-            )
+        # Allow explicit status overrides from additional context
+        override_status = additional_context.get("status")
+        if override_status in {"skipped", "partial", "error", "success"}:
+            status = override_status
+            if override_status == "skipped":
+                success = True  # Skipped is not a failure
+                reason = additional_context.get(
+                    "reason", f"Collector {operation_name} was skipped"
+                )
+            elif override_status == "error":
+                success = False
+                reason = additional_context.get(
+                    "reason",
+                    self._format_error_messages(error_messages, operation_name),
+                )
+            elif override_status == "partial":
+                success = True
+                reason = additional_context.get(
+                    "reason",
+                    f"Partial success: {successful_operations}/{total_operations} {operation_name} succeeded.\n"
+                    + self._format_error_messages(
+                        error_messages, operation_name, is_partial=True
+                    ),
+                )
+            else:
+                success = True
+                reason = additional_context.get(
+                    "reason",
+                    f"Successfully completed {successful_operations}/{total_operations} {operation_name}",
+                )
         elif successful_operations == 0 and total_operations == 0:
             # No operations attempted - treat as skipped
             success = True
@@ -5171,11 +5821,31 @@ STDOUT    :
         if additional_context is None:
             additional_context = {}
 
+        accounting_warning = None
+        if successful_operations > total_operations:
+            accounting_warning = (
+                "Collector accounting anomaly detected: "
+                f"successful_operations ({successful_operations}) exceeds "
+                f"total_operations ({total_operations}). Clamping to total_operations."
+            )
+            additional_context.setdefault("accounting_warnings", []).append(
+                accounting_warning
+            )
+            successful_operations = total_operations
+
         # Auto-detect dut_id and collector_id if not provided
         if dut_id is None:
             dut_id = self._get_current_dut_id()
         if collector_id is None:
             collector_id = self._get_current_collector_id()
+
+        if accounting_warning and hasattr(self, "_log_runtime"):
+            await self._log_runtime(
+                "WARNING",
+                "BaseService",
+                accounting_warning,
+                dut_id,
+            )
 
         # Add debug logging if dut_id and collector_id are available and not "unknown"
         if (
