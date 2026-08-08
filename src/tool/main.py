@@ -250,6 +250,7 @@ def get_higher_collection_level(level1: str, level2: str) -> str:
     invoke_without_command=True,
 )
 def main(
+    ctx: typer.Context,
     version: Optional[bool] = typer.Option(
         None,
         "--version",
@@ -274,7 +275,6 @@ def main(
     if env_file is not None:
         _load_env_file(env_file)
 
-    ctx = click.get_current_context()
     if ctx.invoked_subcommand is None:
         typer.echo(ctx.get_help())
         raise typer.Exit(0)
