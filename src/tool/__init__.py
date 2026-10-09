@@ -12,19 +12,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 """
 NVDebug Tool package.
 
 This tool collects system logs and debug information from NVIDIA platforms.
 
 This package exports:
-    - Config: Configuration management
-    - load_config: Load tool configuration
-    - load_dut_config: Load DUT configuration
-    - get_available_baseboards: Get available baseboard platforms
-    - validate_baseboard: Validate baseboard name
-    - __version__: Version string
-    - __build_hash__: Build hash
+
+- Config: Configuration management.
+- load_config: Load tool configuration.
+- load_dut_config: Load DUT configuration.
+- get_available_baseboards: Get available baseboard platforms.
+- validate_baseboard: Validate baseboard name.
+- __version__: Version string.
+- __build_hash__: Build hash.
 """
 
 from .config import (

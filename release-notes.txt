@@ -1,3 +1,60 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+NVDebug 2.2.0
+============
+
+Release Highlights
+------------------
+
+- Improved multi-system collection and time-windowed output for eligible
+  collectors.
+- Clearer reporting of successful, partial, and failed collections.
+- Updated collector and system coverage and setup guidance.
+- Added public catalog support for MGX Vera C1, MGX Vera C2, Vera Rubin NVL4,
+  Vera Rubin NVL72, and Vera Rubin NVL72-N6100-LD.
+- Complete pinned Python 3.12 installation and corrected source module startup
+  and catalog-listing commands.
+- Added native Linux amd64/arm64 build scripts that package the catalog,
+  default configuration, and validated report application for local use.
+- Updated report dependencies to resolve known security advisories and added
+  a dependency audit to the local report validation workflow.
+
+Upgrade Notes
+-------------
+
+For source execution, install requirements.txt in a Python 3.12 virtual
+environment and run ``make build-report-app`` before collecting data. The
+README documents both ``python -m src.tool.main`` and the locally built
+``nvdebug`` executable, including startup and catalog checks.
+
+Existing 2.x ``config.yaml`` discovery and documented field aliases,
+``execution_scheduler=legacy_global``, ``report_format=legacy`` and
+``report_format=both``, and supported historical status/manifest data and
+artifacts remain supported. A ``duts`` key in ``tool_config.yaml`` remains
+rejected; use ``dut_config.yaml``. No supported configuration or output
+compatibility behavior is removed for these legacy paths.
+
+SSH key logins that require password-based sudo now support
+``host_sudo_password``. Set it to the remote sudo password; ``host_pass``
+remains the local key passphrase. Password-based SSH and passwordless sudo
+keep their existing behavior.
+
+Earlier Release Highlights
+--------------------------
+
 May 15, 2026
 ===================
 

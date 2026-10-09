@@ -1,38 +1,201 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 @media print {
-  /* Hide non-printable elements */
-  .navbar, .sidebar, .directory-picker, .modal-overlay,
-  button, select, input[type="text"], input[type="checkbox"] {
+  /* Print has its own paper palette. Resetting only body/card backgrounds leaves
+     dark-theme tokens (including inline styles) painting white text on paper. */
+  :root, :root[data-theme] {
+    color-scheme: light;
+    --nv-text-primary: #202020;
+    --nv-text-secondary: #444444;
+    --nv-text-tertiary: #595959;
+    --nv-text-disabled: #595959;
+    --nv-text-strong: #000000;
+    --nv-bg-primary: #ffffff;
+    --nv-bg-secondary: #ffffff;
+    --nv-bg-tertiary: #f2f2f2;
+    --nv-bg-elevated: #ffffff;
+    --nv-bg-hover: #f2f2f2;
+    --nv-bg-active: #e2e2e2;
+    --nv-bg-canvas: #ffffff;
+    --nv-bg-highest: #ffffff;
+    --nv-glass-bg: #ffffff;
+    --nv-glass-bg-dense: #ffffff;
+    --nv-glass-bg-light: #ffffff;
+    --nv-glass-border: #cccccc;
+    --nv-glass-border-highlight: #aaaaaa;
+    --nv-glass-border-accent: #aaaaaa;
+    --nv-glass-accent-gradient: none;
+    --nv-border: #cccccc;
+    --nv-border-strong: #aaaaaa;
+    --nv-border-subtle: #dddddd;
+    --nv-accent: #365900;
+    --nv-success: #365900;
+    --nv-error: #a51e15;
+    --nv-warning: #805100;
+    --nv-warning-fg: #805100;
+    --nv-info: #155c9e;
+    --nv-action-view: #155c9e;
+    --nv-skipped: #9a3412;
+    --nv-service-redfish: #a51e15;
+    --nv-service-ssh: #805100;
+    --nv-service-ipmi: #155c9e;
+    --nv-service-health-check: #6f42c1;
+    --nv-service-host: #365900;
+    --nv-service-bmc: #9a3412;
+    --nv-service-preflight: #006b5e;
+    --nv-chart-blue: #155c9e;
+    --nv-chart-blue-light: #155c9e;
+    --nv-chart-green: #365900;
+    --nv-chart-green-light: #365900;
+    --nv-chart-amber: #805100;
+    --nv-chart-red: #a51e15;
+    --nv-chart-purple: #6f42c1;
+    --nv-chart-purple-light: #6f42c1;
+    --nv-chart-teal: #006b5e;
+    --nv-chart-slate: #444444;
+    --nv-chart-gray: #595959;
+  }
+
+  *, *::before, *::after {
+    box-shadow: none !important;
+    text-shadow: none !important;
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+    animation: none !important;
+    transition: none !important;
+  }
+
+  /* Hide navigation and controls, retaining the data shown by metric/status
+     buttons below. The table footer still identifies the printed row range. */
+  .navbar, .sidebar, .directory-picker, .modal-overlay, .nv-modal-overlay,
+  .nv-navbar, .nv-sidebar, .no-print, .nv-btn, .nv-input,
+  .charts-section, .dashboard-quick-actions, details:not(.print-keep),
+  .dt-toolbar, .dt-footer__controls, .dt-action-column,
+  button, select, input, textarea, dialog {
     display: none !important;
   }
 
-  /* Reset backgrounds for print */
-  body, [data-theme] {
-    background: white !important;
-    color: black !important;
+  button.exec-summary__metric,
+  button.preflight-statuses,
+  button.preflight-chip,
+  button.preflight-failures-toggle,
+  button.deps-chip {
+    display: flex !important;
+    transform: none !important;
   }
 
-  /* Tables print-friendly */
-  table {
+  html, body, #app {
+    min-height: 0 !important;
+    background: #ffffff !important;
+    color: var(--nv-text-primary) !important;
+  }
+
+  body { font-size: 11pt; }
+  #app { display: block !important; }
+  .nv-app-main {
+    margin-top: 0 !important;
+    padding-bottom: 0 !important;
+    overflow: visible !important;
+  }
+  .nv-page {
+    padding: 0 !important;
+    margin-left: 0 !important;
+  }
+
+  .nv-glass, .nv-glass--subtle, .nv-glass--elevated, .nv-glass--accent,
+  .nv-card, .nv-stat, .nv-chart-card {
+    background: #ffffff !important;
+    border: 1px solid #cccccc !important;
+  }
+  .nv-glass::before, .nv-stat::before, .nv-stat::after {
+    display: none !important;
+  }
+
+  /* Colored screen tiles use literal white text, not theme tokens. */
+  .nv-stat, .nv-stat *,
+  .exec-summary__metric-label, .exec-summary__metric-value {
+    color: var(--nv-text-primary) !important;
+  }
+  .exec-summary__body {
+    grid-template-columns: repeat(auto-fit, minmax(80px, 1fr)) !important;
+    gap: 6pt !important;
+  }
+  .exec-summary__metric {
+    min-width: 0 !important;
+    padding: 6pt !important;
+  }
+
+  /* Paper has no hover tooltips. Print each status and its count as text so
+     meaning survives monochrome output and disabled background graphics. */
+  .nv-progress--lg {
+    height: auto !important;
+    flex-wrap: wrap;
+    gap: 12pt;
+    border-radius: 0;
+    background: none !important;
+    overflow: visible;
+  }
+  .nv-progress--lg .nv-progress__segment {
+    width: auto !important;
+    background: none !important;
+    color: var(--nv-text-primary);
+  }
+  .nv-progress--lg .nv-progress__segment::before {
+    content: attr(title);
+    font-size: 9pt;
+    text-transform: capitalize;
+  }
+  .nv-progress--lg .nv-progress__segment > span { display: none !important; }
+
+  .dt-root { display: block !important; }
+  .dt-scroll, .nv-table-viewport {
+    max-height: none !important;
+    overflow: visible !important;
+  }
+  table, .nv-table {
     border-collapse: collapse;
     width: 100%;
-  }
-  th, td {
-    border: 1px solid #ddd;
-    padding: 4px 8px;
     font-size: 10pt;
   }
+  th, td, .nv-table th, .nv-table td {
+    position: static !important;
+    border: 1px solid #cccccc;
+    padding: 3pt 6pt;
+    font-size: 10pt !important;
+    white-space: normal !important;
+    overflow-wrap: anywhere;
+  }
 
-  /* Charts: show at reasonable size */
+  a { text-decoration: none; color: inherit !important; }
   canvas {
     max-width: 100%;
-    page-break-inside: avoid;
+    break-inside: avoid;
   }
-
-  /* Page breaks */
   h2, h3 {
-    page-break-after: avoid;
+    break-after: avoid;
   }
-  .card, .chart-card {
-    page-break-inside: avoid;
+  .card, .chart-card, .nv-card, .nv-chart-card, .nv-stat, .exec-summary, tr {
+    break-inside: avoid;
+  }
+  .print-only-full { break-after: avoid; }
+
+  @page {
+    margin: 1.5cm;
+    size: A4 landscape;
   }
 }

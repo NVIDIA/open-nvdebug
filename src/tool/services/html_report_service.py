@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 """
 HTML Report Service.
 
@@ -20,21 +21,219 @@ Generates comprehensive multi-level HTML reports from structured log directories
 with collector metadata, execution times, and interactive navigation.
 """
 
+import asyncio
 import json
+import logging
 import os
 import re
+import secrets
 import shutil
+import stat
 from collections import defaultdict
-from html import escape
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
+from urllib.parse import quote
+
+from ..core.collector_outcome import normalize_collector_failure_category
+from ..core.finalization_receipt import (
+    FinalizationReceipt,
+    validate_consumable_finalization_receipt,
+)
+from ..core.run_result import RunResult, validate_run_result_document
+from ..utils.bounded_archive import (
+    ArchiveLimits,
+    archive_creation_limits_from_runtime_boundaries,
+    resolve_archive_limits,
+)
+from ..utils.filesystem_identity import directory_security_identity
+from ..utils.managed_filesystem import run_managed_filesystem_operation
+from ..utils.status_snapshot import (
+    RECEIPTLESS_SNAPSHOT_COMPATIBILITY_VERSION,
+    SnapshotArtifactFormatError,
+    SnapshotConsistencyError,
+    TerminalSnapshotBinding,
+    read_snapshot_status,
+    read_snapshot_timing,
+    validate_committed_terminal_snapshot,
+)
+from .html_report_execution_model import (
+    combine_execution_statuses,
+    create_execution_summary_from_metadata,
+    execution_summary_to_legacy_dict,
+    metadata_execution_summary_to_legacy_list,
+    parse_execution_summary_lines,
+    summary_diagnostics_to_legacy_list,
+)
+from .html_report_file_view import HTMLReportFileView
+from .html_report_log_parser import (
+    DEFAULT_RUNTIME_LOG_FORMAT,
+    LOG_FIELD_ROLES,
+    MAX_LOG_FORMAT_DIRECTIVES,
+    PERCENT_LOG_DIRECTIVE,
+    browser_log_parser_metadata,
+    build_log_parser_specs,
+    canonical_lifecycle_parser,
+    compile_log_format_parser,
+    escape_shared_regex_literal,
+    parse_log_line,
+)
+from .html_report_log_viewer import (
+    HTMLReportLogViewer,
+    LogViewerRenderModel,
+)
+from .html_report_node_sidebar import (
+    HTMLReportNodeSidebar,
+    NodeSidebarLink,
+    NodeSidebarLinkGroup,
+    NodeSidebarRenderModel,
+)
+from .html_report_page_assets import (
+    HTML_REPORT_PAGE_ASSETS,
+    NavbarRenderModel,
+)
+from .html_report_renderer import (
+    BackButtonRenderModel,
+    HTMLPageRenderModel,
+    HTMLReportRenderer,
+    SystemDetailsRenderModel,
+)
+from .manifest_service import HARD_MAX_AUXILIARY_JSON_FILES, ManifestService
+
+logger = logging.getLogger(__name__)
+
+_REPORT_INPUT_READ_CHUNK_BYTES = 64 * 1024
+
+
+class ReportInputSafetyError(RuntimeError):
+    """
+    A report source escaped its finite, no-follow input boundary.
+
+    Callers receive this exception when the report input safety error invariant
+    prevents the requested operation from completing. The distinct type lets
+    them handle that boundary without parsing an error message.
+    """
+
+
+@dataclass(frozen=True)
+class _ReportInputEntry:
+    """
+    One identity-bound regular file or directory discovered for a report.
+
+    The immutable record keeps ``path`` and ``metadata`` together so consumers
+    observe one report input entry state. Consumers receive the fields as one
+    unit instead of assembling partial state.
+
+    Attributes:
+        path: Validated filesystem location associated with path.
+        metadata: Metadata retained as part of the record's public state.
+    """
+
+    path: Path
+    metadata: os.stat_result
+
+    @property
+    def is_file(self) -> bool:
+        """
+        Return whether ``the current value`` is file.
+
+        Each access computes the value from ``metadata`` on the current
+        instance; the derived view is not stored as independent state.
+
+        Returns:
+            Whether ``the current value`` is file.
+        """
+        return stat.S_ISREG(self.metadata.st_mode)
+
+    @property
+    def is_dir(self) -> bool:
+        """
+        Return whether ``the current value`` is dir.
+
+        Each access computes the value from ``metadata`` on the current
+        instance; the derived view is not stored as independent state.
+
+        Returns:
+            Whether ``the current value`` is dir.
+        """
+        return stat.S_ISDIR(self.metadata.st_mode)
+
+
+def _same_report_input(first: os.stat_result, second: os.stat_result) -> bool:
+    """
+    Compare the fields that expose replacement or in-place source drift.
+
+    After applying local validation, the function forwards ``first`` and
+    ``second`` to ``all`` and preserves its return and exception contract.
+
+    Args:
+        first: First consumed while the function attempts to compare the fields
+            that expose replacement or in-place source drift.
+        second: Second consumed while the function attempts to compare the
+            fields that expose replacement or in-place source drift.
+
+    Returns:
+        Whether the compare the fields that expose replacement or in-place
+        source drift operation succeeds.
+    """
+
+    fields = (
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_uid",
+        "st_gid",
+        "st_nlink",
+        "st_size",
+        "st_mtime_ns",
+        "st_ctime_ns",
+    )
+    return all(getattr(first, field) == getattr(second, field) for field in fields)
+
+
+def _same_directory_identity(first: os.stat_result, second: os.stat_result) -> bool:
+    """
+    Compare stable directory identity without treating child writes as drift.
+
+    After applying local validation, the function forwards ``first`` and
+    ``second`` to ``all`` and preserves its return and exception contract.
+
+    Args:
+        first: First consumed while the function attempts to compare stable
+            directory identity without treating child writes as drift.
+        second: Second consumed while the function attempts to compare stable
+            directory identity without treating child writes as drift.
+
+    Returns:
+        Whether the compare stable directory identity without treating child
+        writes as drift operation succeeds.
+    """
+
+    return directory_security_identity(first) == directory_security_identity(second)
+
+
+_HTML_RENDERER = HTMLReportRenderer()
+escape = HTMLReportRenderer.escape_html_text
+_HTML_LOG_VIEWER = HTMLReportLogViewer()
+_HTML_NODE_SIDEBAR = HTMLReportNodeSidebar()
 
 
 class HTMLReportService:
     """
-    A class to generate comprehensive multi-level HTML reports from a structured directory containing
-    node logs and configurations, including collector JSON metadata for execution times.
+    Manage HTML report service operations for the NVDebug runtime.
+
+    The type coordinates ``_json_for_script``, ``_normalize_failure_category``,
+    ``_has_unsafe_html_control``, ``_escape_html_text``, and
+    ``_safe_external_url`` and retains the state those operations share between
+    calls. Resource ownership remains inside the instance until the matching
+    close, exit, or cleanup operation completes.
     """
+
+    _DEFAULT_RUNTIME_LOG_FORMAT = DEFAULT_RUNTIME_LOG_FORMAT
+    _PERCENT_LOG_DIRECTIVE = PERCENT_LOG_DIRECTIVE
+    _LOG_FIELD_ROLES = LOG_FIELD_ROLES
+    _MAX_LOG_FORMAT_DIRECTIVES = MAX_LOG_FORMAT_DIRECTIVES
 
     def __init__(
         self,
@@ -42,21 +241,37 @@ class HTMLReportService:
         total_runtime: float = None,
         logger=None,
         orchestrator=None,
+        finalization_receipt: Optional[FinalizationReceipt] = None,
+        enforce_snapshot_consistency: bool = True,
     ):
         """
         Initializes the HTMLReportService for nvdebug.
 
+        Initialize missing attributes that are used in the report generation.
+
         Args:
-            log_dir: Path to the log directory containing DUT directories.
-            total_runtime: Total runtime of the collection.
-            logger: Async logger instance for writing to runtime logs.
-            orchestrator: WorkflowOrchestrator instance for accessing collector definitions.
+            log_dir: filesystem location used as the log dir for this operation.
+            total_runtime: Optional total runtime; ``None`` selects the
+                function's default behavior.
+            logger: Sanitized logger used for operator-visible diagnostics.
+            orchestrator: Optional orchestrator; ``None`` selects the function's
+                default behavior.
+            finalization_receipt: Optional finalization receipt; ``None``
+                selects the function's default behavior.
+            enforce_snapshot_consistency: Whether enforce snapshot consistency
+                is enabled or required for this operation.
         """
         # Set basic attributes that are needed before async initialization
         self.logger = logger
         self.orchestrator = orchestrator
         self.root_dir = log_dir
         self.total_runtime = total_runtime
+        self._finalization_receipt = finalization_receipt
+        self._enforce_snapshot_consistency = enforce_snapshot_consistency
+        self._terminal_snapshot_generation: Optional[str] = None
+        self._terminal_dut_roster: Optional[Tuple[str, ...]] = None
+        self._snapshot_binding: Optional[TerminalSnapshotBinding] = None
+        self._unbound_root_dir: Optional[Path] = None
 
         # Initialize missing attributes that are used in the report generation
         self.node_collector_json = {}
@@ -73,18 +288,217 @@ class HTMLReportService:
         ]
         # Maximum file size for parsing (50 MB) - larger files will be download-only
         self.max_parseable_file_size = 50 * 1024 * 1024  # 50 MB in bytes
+        self.max_json_tree_depth = 64
+        config_manager = getattr(orchestrator, "config_manager", None)
+        if config_manager is not None:
+            try:
+                report_tool_config = config_manager.get_tool_config()
+                if isinstance(report_tool_config, Mapping):
+                    output_config = report_tool_config.get("output", {})
+                else:
+                    output_config = getattr(report_tool_config, "output", {})
+                if isinstance(output_config, Mapping):
+                    configured_depth = output_config.get("max_json_tree_depth", 64)
+                else:
+                    configured_depth = getattr(output_config, "max_json_tree_depth", 64)
+                if type(configured_depth) is int and 1 <= configured_depth <= 512:
+                    self.max_json_tree_depth = configured_depth
+            except Exception:
+                # Configuration parsing owns diagnostics. Report construction
+                # retains its documented safe default if an alternate test or
+                # compatibility manager cannot expose the optional field.
+                pass
+        # A live orchestrator supplies the tool-owned completed collection tree;
+        # it must not inherit the deliberately small inbound-archive default.
+        # Receipt-less/offline callers retain the strict untrusted-input policy.
+        finalization_boundaries = None
+        boundary_resolver = getattr(
+            orchestrator, "get_finalization_runtime_boundaries", None
+        )
+        if callable(boundary_resolver):
+            try:
+                candidate_boundaries = boundary_resolver()
+            except Exception:
+                candidate_boundaries = None
+            if isinstance(candidate_boundaries, Mapping):
+                finalization_boundaries = candidate_boundaries
+        self._finalization_boundaries = finalization_boundaries
+        self._report_input_limits: ArchiveLimits = (
+            archive_creation_limits_from_runtime_boundaries(finalization_boundaries)
+            if orchestrator is not None
+            else resolve_archive_limits()
+        )
+        self._report_input_entries: Dict[str, os.stat_result] = {}
+        self._report_input_file_count = 0
+        self._report_input_total_bytes = 0
+        self._report_output_root_path: Optional[Path] = None
+        self._report_output_root_fd: Optional[int] = None
+        self._report_output_root_identity: Optional[os.stat_result] = None
+        self._report_output_dir_identity: Optional[os.stat_result] = None
+
+    def __del__(self) -> None:
+        """
+        Release remaining resources owned by the HTMLReportService.
+
+        The implementation uses current instance state to release remaining
+        resources owned by the HTMLReportService. It updates
+        ``_report_output_root_fd`` on the instance as part of that state
+        transition.
+        """
+        descriptor = getattr(self, "_report_output_root_fd", None)
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            self._report_output_root_fd = None
 
     @staticmethod
     def _json_for_script(value: Any, **kwargs) -> str:
-        """Serialize JSON safely for direct embedding inside script tags."""
-        return (
-            json.dumps(value, **kwargs)
-            .replace("&", "\\u0026")
-            .replace("<", "\\u003c")
-            .replace(">", "\\u003e")
-            .replace("\u2028", "\\u2028")
-            .replace("\u2029", "\\u2029")
-        )
+        """
+        Serialize JSON safely for direct embedding inside script tags.
+
+        After applying local validation, the function forwards ``value`` and
+        ``kwargs`` to ``_HTML_RENDERER.json_for_script`` and preserves its
+        return and exception contract.
+
+        Args:
+            value: Value evaluated while performing serialize JSON safely for
+                direct embedding inside script tags.
+            kwargs: Additional named values forwarded without changing their
+                keys.
+
+        Returns:
+            The canonical JSON for script text.
+        """
+        return _HTML_RENDERER.json_for_script(value, **kwargs)
+
+    @staticmethod
+    def _normalize_failure_category(status: Any, value: Any) -> Optional[str]:
+        """
+        Normalize categories after containing legacy HTML status aliases.
+
+        After applying local validation, the function forwards ``status`` and
+        ``value`` to ``normalize_collector_failure_category`` and preserves its
+        return and exception contract. The source value keeps its ownership
+        while the normalized representation is returned separately.
+
+        Args:
+            status: Status consumed while the function attempts to normalize
+                categories after containing legacy HTML status aliases.
+            value: Value evaluated while performing categories after containing
+                legacy HTML status aliases.
+
+        Returns:
+            The canonical failure category text, or ``None`` when the requested
+            value is unavailable.
+        """
+        status_value = str(getattr(status, "value", status) or "").strip().casefold()
+        status_value = status_value.split()[0] if status_value else ""
+        canonical_status = {
+            "degraded": "degraded",
+            "error": "error",
+            "fail": "error",
+            "failed": "error",
+            "partial": "partial",
+        }.get(status_value)
+        if canonical_status is None:
+            return None
+        return normalize_collector_failure_category(canonical_status, value)
+
+    @staticmethod
+    def _has_unsafe_html_control(value: str) -> bool:
+        """
+        Return whether ``value`` has unsafe HTML control.
+
+        After applying local validation, the function forwards ``value`` to
+        ``_HTML_RENDERER.has_unsafe_html_control`` and preserves its return and
+        exception contract.
+
+        Args:
+            value: Text supplied as value in the format accepted by this
+                function.
+
+        Returns:
+            Whether ``value`` has unsafe HTML control.
+        """
+        return _HTML_RENDERER.has_unsafe_html_control(value)
+
+    @classmethod
+    def _escape_html_text(cls, value: Any) -> str:
+        """
+        Escape untrusted text and replace controls forbidden by HTML.
+
+        After applying local validation, the function forwards ``value`` to
+        ``_HTML_RENDERER.escape_html_text`` and preserves its return and
+        exception contract.
+
+        Args:
+            value: Value evaluated while performing escape untrusted text and
+                replace controls forbidden by HTML.
+
+        Returns:
+            The canonical escape HTML text.
+        """
+        return _HTML_RENDERER.escape_html_text(value)
+
+    @classmethod
+    def _safe_external_url(cls, value: str) -> Optional[str]:
+        """
+        Return an absolute HTTP(S) URL only when it is safe for navigation.
+
+        After applying local validation, the function forwards ``value`` to
+        ``_HTML_RENDERER.safe_external_url`` and preserves its return and
+        exception contract.
+
+        Args:
+            value: Text supplied as value in the format accepted by this
+                function.
+
+        Returns:
+            The canonical safe external URL text, or ``None`` when the requested
+            value is unavailable.
+        """
+        return _HTML_RENDERER.safe_external_url(value)
+
+    @classmethod
+    def _encoded_relative_report_link(
+        cls, node_name: str, relative_link: str
+    ) -> Optional[str]:
+        """
+        Encode a report-local link without permitting URL/path reinterpretation.
+
+        After applying local validation, the function forwards ``node_name`` and
+        ``relative_link`` to ``_HTML_RENDERER.encoded_relative_report_link`` and
+        preserves its return and exception contract.
+
+        Args:
+            node_name: Stable node name used for lookup and operator-facing
+                diagnostics.
+            relative_link: Text supplied as relative link in the format accepted
+                by this function.
+
+        Returns:
+            The canonical encoded relative report link text, or ``None`` when
+            the requested value is unavailable.
+        """
+        return _HTML_RENDERER.encoded_relative_report_link(node_name, relative_link)
+
+    @classmethod
+    def _encoded_report_relative_path(cls, relative_link: str) -> Optional[str]:
+        """
+        Encode a report-relative path without permitting path reinterpretation.
+
+        The renderer performs the authoritative segment validation and percent
+        encoding; this facade preserves that result for legacy report callers.
+
+        Args:
+            relative_link: Text supplied as a report-local relative path.
+
+        Returns:
+            The encoded relative path, or ``None`` when it is unsafe.
+        """
+        return _HTML_RENDERER.encoded_report_relative_path(relative_link)
 
     @classmethod
     async def create(
@@ -94,21 +508,1402 @@ class HTMLReportService:
         logger=None,
         orchestrator=None,
         collector_ids: Optional[List[str]] = None,
+        finalization_receipt: Optional[FinalizationReceipt] = None,
+        enforce_snapshot_consistency: bool = True,
     ):
         """
         Factory method to create and initialize HTMLReportService asynchronously.
 
+        The implementation uses ``log_dir``, ``total_runtime``, ``logger``,
+        ``orchestrator``, and ``collector_ids`` to factory method to create and
+        initialize HTMLReportService asynchronously. Owned asynchronous work is
+        awaited before return, so completion does not leave an unobserved task
+        behind.
+
         Args:
-            log_dir: Path to the log directory containing DUT directories.
-            total_runtime: Total runtime of the collection.
-            logger: Async logger instance for writing to runtime logs.
-            orchestrator: WorkflowOrchestrator instance for accessing collector definitions.
-            collector_ids: List of collector IDs that were requested to run.
+            log_dir: filesystem location used as the log dir for this operation.
+            total_runtime: Optional total runtime; ``None`` selects the
+                function's default behavior.
+            logger: Sanitized logger used for operator-visible diagnostics.
+            orchestrator: Optional orchestrator; ``None`` selects the function's
+                default behavior.
+            collector_ids: Optional collector identifiers; ``None`` selects the
+                function's default behavior.
+            finalization_receipt: Optional finalization receipt; ``None``
+                selects the function's default behavior.
+            enforce_snapshot_consistency: Whether enforce snapshot consistency
+                is enabled or required for this operation.
+
+        Returns:
+            The validated ``instance``.
         """
-        instance = cls(log_dir, total_runtime, logger, orchestrator)
+        instance = cls(
+            log_dir,
+            total_runtime,
+            logger,
+            orchestrator,
+            finalization_receipt,
+            enforce_snapshot_consistency,
+        )
         instance.requested_collector_ids = collector_ids
         await instance._initialize()
         return instance
+
+    def _bind_terminal_snapshot(self) -> None:
+        """
+        Bind current-run reports to receipt evidence, or use offline discovery.
+
+        The implementation uses current instance state to bind current-run
+        reports to receipt evidence, or use offline discovery. It updates
+        ``_snapshot_binding``, ``_terminal_dut_roster``,
+        ``_terminal_snapshot_generation``, ``_unbound_root_dir``, and
+        ``report_dir`` on the instance as part of that state transition.
+        """
+
+        if self._snapshot_binding is not None:
+            return
+        if not self._enforce_snapshot_consistency:
+            self._terminal_snapshot_generation = None
+            self._terminal_dut_roster = None
+            return
+        if self._finalization_receipt is None:
+            self._terminal_snapshot_generation = validate_committed_terminal_snapshot(
+                self.root_dir,
+                compatibility_version=RECEIPTLESS_SNAPSHOT_COMPATIBILITY_VERSION,
+            )
+            self._terminal_dut_roster = None
+            return
+        (
+            self._terminal_snapshot_generation,
+            self._terminal_dut_roster,
+        ) = validate_consumable_finalization_receipt(self._finalization_receipt)
+        binding = TerminalSnapshotBinding(
+            self.root_dir,
+            self._terminal_dut_roster,
+            expected_generation=self._terminal_snapshot_generation,
+            expected_leaf_digests=self._finalization_receipt.snapshot_leaf_digests,
+        )
+        self._unbound_root_dir = self.root_dir
+        self._snapshot_binding = binding
+        self.root_dir = binding.root_path
+        self.report_dir = self.root_dir / "reports"
+
+    def _release_terminal_snapshot(self) -> None:
+        """
+        Release a current-run descriptor binding and restore lexical paths.
+
+        The implementation uses current instance state to release a current-run
+        descriptor binding and restore lexical paths. It updates
+        ``_snapshot_binding``, ``_unbound_root_dir``, ``report_dir``, and
+        ``root_dir`` on the instance as part of that state transition. Cleanup
+        in the ``finally`` path runs for successful, failed, and cancelled
+        execution.
+        """
+
+        binding = self._snapshot_binding
+        if binding is None:
+            return
+        original_root = self._unbound_root_dir
+        self._snapshot_binding = None
+        self._unbound_root_dir = None
+        try:
+            binding.close()
+        finally:
+            if original_root is not None:
+                self.root_dir = original_root
+                self.report_dir = original_root / "reports"
+
+    def _iter_node_directories(self) -> Tuple[Path, ...]:
+        """
+        Return the receipt roster for current runs without disk discovery.
+
+        The implementation uses current instance state to produce the receipt
+        roster for current runs without disk discovery. If the function cannot
+        produce the receipt roster for current runs without disk discovery, its
+        exception reaches the caller instead of being converted into a
+        successful result.
+
+        Returns:
+            The iter node directories returned in operation-defined order.
+
+        Raises:
+            SnapshotConsistencyError: If receipt DUT binding is unavailable.
+        """
+
+        if self._snapshot_binding is not None:
+            return self._snapshot_binding.dut_directories
+        if self._terminal_dut_roster is None:
+            return tuple(
+                entry.path
+                for entry in self._walk_report_inputs(
+                    self.root_dir,
+                    recursive=False,
+                    excluded_directories=frozenset({"report", "reports"}),
+                )
+                if entry.is_dir
+            )
+        raise SnapshotConsistencyError("Receipt DUT binding is unavailable")
+
+    def _read_terminal_status(
+        self, dut_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Read status through the active receipt binding when present.
+
+        The implementation uses ``dut_id`` to read status through the active
+        receipt binding when present. Parsing or I/O must finish before the
+        validated representation is made available to the caller.
+
+        Args:
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+
+        Returns:
+            A mapping containing terminal status, or ``None`` when the requested
+            value is unavailable.
+        """
+
+        if self._snapshot_binding is not None:
+            return self._snapshot_binding.read_status(dut_id)
+        return read_snapshot_status(
+            self.root_dir,
+            dut_id=dut_id,
+            expected_generation=self._terminal_snapshot_generation,
+            required=self._terminal_snapshot_generation is not None,
+        )
+
+    def _read_run_result(self) -> Optional[RunResult]:
+        """
+        Read the exact canonical result through the active snapshot binding.
+
+        After applying local validation, the function forwards current instance
+        state to ``validate_run_result_document`` and preserves its return and
+        exception contract. Parsing or I/O must finish before the validated
+        representation is made available to the caller.
+
+        Returns:
+            A ``RunResult`` representing run result, or ``None`` when the
+            requested value is unavailable.
+
+        Raises:
+            SnapshotArtifactFormatError: If terminal status snapshot is missing
+                canonical RunResult; or terminal status snapshot contains an
+                invalid canonical RunResult.
+        """
+
+        document = self._read_terminal_status()
+        if document is None:
+            return None
+        metadata = document.get("metadata")
+        raw_result = metadata.get("run_result") if isinstance(metadata, dict) else None
+        if raw_result is None:
+            if self._terminal_snapshot_generation is not None:
+                raise SnapshotArtifactFormatError(
+                    "Terminal status snapshot is missing canonical RunResult"
+                )
+            return None
+        try:
+            return validate_run_result_document(raw_result)
+        except (TypeError, ValueError) as error:
+            raise SnapshotArtifactFormatError(
+                "Terminal status snapshot contains an invalid canonical RunResult"
+            ) from error
+
+    def _read_terminal_timing(self, dut_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Read timing through the active receipt binding when present.
+
+        The implementation uses ``dut_id`` to read timing through the active
+        receipt binding when present. Parsing or I/O must finish before the
+        validated representation is made available to the caller.
+
+        Args:
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+
+        Returns:
+            A mapping containing terminal timing, or ``None`` when the requested
+            value is unavailable.
+        """
+
+        if self._snapshot_binding is not None:
+            return self._snapshot_binding.read_timing(dut_id)
+        return read_snapshot_timing(
+            self.root_dir,
+            dut_id,
+            expected_generation=self._terminal_snapshot_generation,
+            required=self._terminal_snapshot_generation is not None,
+        )
+
+    @staticmethod
+    def _open_lexical_directory_without_links(
+        path: Path,
+    ) -> Tuple[Path, int, os.stat_result]:
+        """
+        Open an absolute directory one no-follow component at a time.
+
+        The implementation uses ``path`` to open an absolute directory one
+        no-follow component at a time. If the function cannot open an absolute
+        directory one no-follow component at a time, its exception reaches the
+        caller instead of being converted into a successful result.
+
+        Args:
+            path: filesystem location used as the path for this operation.
+
+        Returns:
+            A tuple containing ``absolute``, ``descriptor``, and ``identity`` in
+            that order.
+
+        Raises:
+            ReportInputSafetyError: If the filesystem root cannot be used as a
+                report collection root; report collection root traverses a link
+                or non-directory; or report collection root identity changed
+                while opening.
+        """
+
+        absolute = Path(os.path.abspath(os.fspath(path)))
+        if absolute == Path(absolute.anchor):
+            raise ReportInputSafetyError(
+                "the filesystem root cannot be used as a report collection root"
+            )
+
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(absolute.anchor, flags)
+        try:
+            for part in absolute.parts[1:]:
+                before = os.stat(part, dir_fd=descriptor, follow_symlinks=False)
+                if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+                    raise ReportInputSafetyError(
+                        "report collection root traverses a link or non-directory"
+                    )
+                child_descriptor = os.open(part, flags, dir_fd=descriptor)
+                try:
+                    opened = os.fstat(child_descriptor)
+                    if not _same_directory_identity(before, opened):
+                        raise ReportInputSafetyError(
+                            "report collection root identity changed while opening"
+                        )
+                except BaseException:
+                    os.close(child_descriptor)
+                    raise
+                os.close(descriptor)
+                descriptor = child_descriptor
+            identity = os.fstat(descriptor)
+            return absolute, descriptor, identity
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def _prepare_report_output_root(self) -> None:
+        """
+        Pin the collection root and privately recreate only its reports child.
+
+        The implementation uses current instance state to pin the collection
+        root and privately recreate only its reports child. It updates
+        ``_report_output_dir_identity``, ``_report_output_root_fd``,
+        ``_report_output_root_identity``, and ``_report_output_root_path`` on
+        the instance as part of that state transition. Filesystem effects remain
+        confined to the caller-selected paths and the owning resource lifecycle.
+        If the function cannot pin the collection root and privately recreate
+        only its reports child, its exception reaches the caller instead of
+        being converted into a successful result. Cleanup in the ``finally``
+        path runs for successful, failed, and cancelled execution.
+
+        Raises:
+            ReportInputSafetyError: If existing report output is a link or
+                non-directory; safe descriptor-relative report cleanup is
+                unavailable; or report output directory is not a private stable
+                directory.
+        """
+
+        root_path, root_descriptor, _identity = (
+            self._open_lexical_directory_without_links(self.root_dir)
+        )
+        try:
+            try:
+                existing = os.stat(
+                    "reports",
+                    dir_fd=root_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                existing = None
+
+            if existing is not None:
+                if stat.S_ISLNK(existing.st_mode) or not stat.S_ISDIR(existing.st_mode):
+                    raise ReportInputSafetyError(
+                        "existing report output is a link or non-directory"
+                    )
+                if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
+                    raise ReportInputSafetyError(
+                        "safe descriptor-relative report cleanup is unavailable"
+                    )
+                shutil.rmtree("reports", dir_fd=root_descriptor)
+
+            os.mkdir("reports", mode=0o700, dir_fd=root_descriptor)
+            report_flags = (
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            before = os.stat(
+                "reports",
+                dir_fd=root_descriptor,
+                follow_symlinks=False,
+            )
+            report_descriptor = os.open(
+                "reports",
+                report_flags,
+                dir_fd=root_descriptor,
+            )
+            try:
+                opened = os.fstat(report_descriptor)
+                if (
+                    not stat.S_ISDIR(opened.st_mode)
+                    or not _same_directory_identity(before, opened)
+                    or opened.st_mode & 0o077
+                ):
+                    raise ReportInputSafetyError(
+                        "report output directory is not a private stable directory"
+                    )
+                self._report_output_dir_identity = opened
+            finally:
+                os.close(report_descriptor)
+
+            previous_descriptor = self._report_output_root_fd
+            self._report_output_root_path = root_path
+            self._report_output_root_identity = os.fstat(root_descriptor)
+            self._report_output_root_fd = root_descriptor
+            root_descriptor = -1
+            if previous_descriptor is not None:
+                os.close(previous_descriptor)
+        finally:
+            if root_descriptor >= 0:
+                os.close(root_descriptor)
+
+    def _require_report_output_root(self) -> int:
+        """
+        Reauthorize the lexical root against the retained descriptor.
+
+        The implementation uses current instance state to reauthorize the
+        lexical root against the retained descriptor. Filesystem effects remain
+        confined to the caller-selected paths and the owning resource lifecycle.
+        If the function cannot reauthorize the lexical root against the retained
+        descriptor, its exception reaches the caller instead of being converted
+        into a successful result. Cleanup in the ``finally`` path runs for
+        successful, failed, and cancelled execution.
+
+        Returns:
+            The validated ``descriptor``.
+
+        Raises:
+            ReportInputSafetyError: If report output root is not initialized;
+                report output root identity changed; pinned report output root
+                identity changed; or report output directory is unavailable; or
+                another input invariant is violated.
+        """
+
+        descriptor = self._report_output_root_fd
+        expected = self._report_output_root_identity
+        root_path = self._report_output_root_path
+        report_expected = self._report_output_dir_identity
+        if (
+            descriptor is None
+            or expected is None
+            or root_path is None
+            or report_expected is None
+        ):
+            raise ReportInputSafetyError("report output root is not initialized")
+
+        current_path, current_descriptor, current = (
+            self._open_lexical_directory_without_links(root_path)
+        )
+        try:
+            if current_path != root_path or not _same_directory_identity(
+                expected, current
+            ):
+                raise ReportInputSafetyError("report output root identity changed")
+        finally:
+            os.close(current_descriptor)
+
+        if not _same_directory_identity(expected, os.fstat(descriptor)):
+            raise ReportInputSafetyError("pinned report output root identity changed")
+        try:
+            current_report = os.stat(
+                "reports",
+                dir_fd=descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise ReportInputSafetyError(
+                "report output directory is unavailable"
+            ) from error
+        if stat.S_ISLNK(current_report.st_mode) or not _same_directory_identity(
+            report_expected, current_report
+        ):
+            raise ReportInputSafetyError("report output directory identity changed")
+        return descriptor
+
+    def _report_output_parts(self, path: Path) -> Tuple[str, ...]:
+        """
+        Authorize one output path lexically below the active reports directory.
+
+        After applying local validation, the function forwards ``path`` to
+        ``tuple`` and preserves its return and exception contract.
+
+        Args:
+            path: filesystem location used as the path for this operation.
+
+        Returns:
+            The report output parts returned in operation-defined order.
+
+        Raises:
+            ReportInputSafetyError: If report output path is unsafe; or report
+                output is outside the reports directory.
+        """
+
+        raw_path = os.fspath(path)
+        if "\x00" in raw_path:
+            raise ReportInputSafetyError("report output path is unsafe")
+        report_root = Path(os.path.abspath(os.fspath(self.report_dir)))
+        candidate = Path(os.path.abspath(raw_path))
+        try:
+            relative = candidate.relative_to(report_root)
+        except ValueError as error:
+            raise ReportInputSafetyError(
+                "report output is outside the reports directory"
+            ) from error
+        parts = relative.parts
+        if (
+            not parts
+            or len(parts) > self._report_input_limits.max_path_depth
+            or any(part in {"", ".", ".."} for part in parts)
+        ):
+            raise ReportInputSafetyError("report output path is unsafe")
+        return tuple(parts)
+
+    @contextmanager
+    def _open_report_output_directory(self, parts: Tuple[str, ...]) -> Iterator[int]:
+        """
+        Open or create a private report directory through retained descriptors.
+
+        The implementation uses ``parts`` to open or create a private report
+        directory through retained descriptors. If the function cannot open or
+        create a private report directory through retained descriptors, its
+        exception reaches the caller instead of being converted into a
+        successful result. Cleanup in the ``finally`` path runs for successful,
+        failed, and cancelled execution.
+
+        Args:
+            parts: Entries supplied as ``parts`` without transferring container
+                ownership.
+
+        Yields:
+            Each open report output directory admitted by the operation, in
+            deterministic iteration order.
+
+        Raises:
+            ReportInputSafetyError: If report output directory identity changed;
+                report output traverses a link or non-directory; report output
+                directory identity changed while opening; or report output
+                directory is unavailable; or another input invariant is
+                violated.
+            BaseException: If a delegated failure occurs while the function
+                attempts to open or create a private report directory through
+                retained descriptors.
+        """
+
+        root_descriptor = self._require_report_output_root()
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        expected_report = self._report_output_dir_identity
+        assert expected_report is not None
+        report_descriptor = os.open("reports", flags, dir_fd=root_descriptor)
+        descriptors: List[Tuple[int, os.stat_result, int, str]] = [
+            (report_descriptor, expected_report, root_descriptor, "reports")
+        ]
+        try:
+            if not _same_directory_identity(
+                expected_report, os.fstat(report_descriptor)
+            ):
+                raise ReportInputSafetyError("report output directory identity changed")
+
+            descriptor = report_descriptor
+            for part in parts:
+                try:
+                    before = os.stat(
+                        part,
+                        dir_fd=descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    os.mkdir(part, mode=0o700, dir_fd=descriptor)
+                    before = os.stat(
+                        part,
+                        dir_fd=descriptor,
+                        follow_symlinks=False,
+                    )
+                if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+                    raise ReportInputSafetyError(
+                        "report output traverses a link or non-directory"
+                    )
+                child_descriptor = os.open(part, flags, dir_fd=descriptor)
+                try:
+                    opened = os.fstat(child_descriptor)
+                    if not _same_directory_identity(before, opened):
+                        raise ReportInputSafetyError(
+                            "report output directory identity changed while opening"
+                        )
+                except BaseException:
+                    os.close(child_descriptor)
+                    raise
+                descriptors.append((child_descriptor, opened, descriptor, part))
+                descriptor = child_descriptor
+
+            yield descriptor
+        except ReportInputSafetyError:
+            raise
+        except OSError as error:
+            raise ReportInputSafetyError(
+                "report output directory is unavailable"
+            ) from error
+        finally:
+            verification_error: Optional[BaseException] = None
+            for descriptor, expected, parent_descriptor, name in reversed(descriptors):
+                try:
+                    opened = os.fstat(descriptor)
+                    current = os.stat(
+                        name,
+                        dir_fd=parent_descriptor,
+                        follow_symlinks=False,
+                    )
+                    if not _same_directory_identity(expected, opened) or not (
+                        _same_directory_identity(expected, current)
+                    ):
+                        raise ReportInputSafetyError(
+                            "report output directory changed during publication"
+                        )
+                except BaseException as error:
+                    verification_error = verification_error or error
+                finally:
+                    os.close(descriptor)
+            if verification_error is not None:
+                raise verification_error
+
+    def _publish_report_text(self, path: Path, text: str) -> None:
+        """
+        Atomically publish a private regular file beneath the reports root.
+
+        The implementation uses ``path`` and ``text`` to atomically publish a
+        private regular file beneath the reports root. Filesystem effects remain
+        confined to the caller-selected paths and the owning resource lifecycle.
+        If the function cannot atomically publish a private regular file beneath
+        the reports root, its exception reaches the caller instead of being
+        converted into a successful result. Cleanup in the ``finally`` path runs
+        for successful, failed, and cancelled execution.
+
+        Args:
+            path: filesystem location used as the path for this operation.
+            text: Text supplied as text in the format accepted by this function.
+
+        Raises:
+            ReportInputSafetyError: If report output destination is not a
+                single-link regular file; or published report output is not a
+                private stable file.
+            OSError: If short write while publishing report output.
+        """
+
+        parts = self._report_output_parts(path)
+        directory_parts, filename = parts[:-1], parts[-1]
+        data = text.encode("utf-8", errors="strict")
+        with self._open_report_output_directory(directory_parts) as descriptor:
+            try:
+                destination = os.stat(
+                    filename,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                destination = None
+            if destination is not None and (
+                not stat.S_ISREG(destination.st_mode) or destination.st_nlink != 1
+            ):
+                raise ReportInputSafetyError(
+                    "report output destination is not a single-link regular file"
+                )
+
+            temporary_name = f".{filename}.{secrets.token_hex(16)}.tmp"
+            temporary_descriptor: Optional[int] = None
+            published = False
+            try:
+                temporary_descriptor = os.open(
+                    temporary_name,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                    dir_fd=descriptor,
+                )
+                view = memoryview(data)
+                while view:
+                    written = os.write(temporary_descriptor, view)
+                    if written <= 0:
+                        raise OSError("short write while publishing report output")
+                    view = view[written:]
+                os.fsync(temporary_descriptor)
+                os.close(temporary_descriptor)
+                temporary_descriptor = None
+                os.replace(
+                    temporary_name,
+                    filename,
+                    src_dir_fd=descriptor,
+                    dst_dir_fd=descriptor,
+                )
+                published = True
+                current = os.stat(
+                    filename,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISREG(current.st_mode)
+                    or current.st_nlink != 1
+                    or current.st_size != len(data)
+                    or current.st_mode & 0o077
+                ):
+                    raise ReportInputSafetyError(
+                        "published report output is not a private stable file"
+                    )
+                os.fsync(descriptor)
+            finally:
+                if temporary_descriptor is not None:
+                    os.close(temporary_descriptor)
+                if not published:
+                    try:
+                        os.unlink(temporary_name, dir_fd=descriptor)
+                    except FileNotFoundError:
+                        pass
+
+    def _reset_report_input_budget(self) -> None:
+        """
+        Start one finite discovery/read budget for a report generation.
+
+        The implementation uses current instance state to start one finite
+        discovery/read budget for a report generation. It updates
+        ``_report_input_file_count`` and ``_report_input_total_bytes`` on the
+        instance as part of that state transition.
+        """
+
+        self._report_input_entries.clear()
+        self._report_input_file_count = 0
+        self._report_input_total_bytes = 0
+
+    def _report_input_anchors(self) -> Tuple[Path, ...]:
+        """
+        Return lexical roots authorized for offline and receipt-bound inputs.
+
+        After applying local validation, the function forwards current instance
+        state to ``tuple`` and preserves its return and exception contract.
+
+        Returns:
+            The report input anchors returned in operation-defined order.
+        """
+
+        anchors = [Path(os.path.abspath(os.fspath(self.root_dir)))]
+        if self._snapshot_binding is not None:
+            anchors.extend(
+                Path(os.path.abspath(os.fspath(path)))
+                for path in self._snapshot_binding.dut_directories
+            )
+        return tuple(dict.fromkeys(anchors))
+
+    def _report_input_anchor(self, path: Path) -> Tuple[Path, Tuple[str, ...]]:
+        """
+        Resolve a path lexically below an authorized root without resolving links.
+
+        The implementation uses ``path`` to resolve a path lexically below an
+        authorized root without resolving links. If the function cannot resolve
+        a path lexically below an authorized root without resolving links, its
+        exception reaches the caller instead of being converted into a
+        successful result.
+
+        Args:
+            path: filesystem location used as the path for this operation.
+
+        Returns:
+            A tuple containing ``anchor`` and ``tuple`` in that order.
+
+        Raises:
+            ReportInputSafetyError: If report input is outside the collection
+                root; report input path depth limit exceeded; or report input
+                path is unsafe.
+        """
+
+        candidate = Path(os.path.abspath(os.fspath(path)))
+        matches: List[Tuple[int, Path, Tuple[str, ...]]] = []
+        for anchor in self._report_input_anchors():
+            try:
+                relative = candidate.relative_to(anchor)
+            except ValueError:
+                continue
+            matches.append((len(anchor.parts), anchor, relative.parts))
+        if not matches:
+            raise ReportInputSafetyError("report input is outside the collection root")
+        _length, anchor, parts = max(matches, key=lambda item: item[0])
+        if len(parts) > self._report_input_limits.max_path_depth:
+            raise ReportInputSafetyError("report input path depth limit exceeded")
+        if any(part in {"", ".", ".."} for part in parts):
+            raise ReportInputSafetyError("report input path is unsafe")
+        return anchor, tuple(parts)
+
+    def _logical_report_input_relative_path(self, path: Path) -> Path:
+        """
+        Map an authorized input anchor to one logical bundle-relative path.
+
+        Receipt-bound rendering pins the bundle root and each DUT directory
+        independently, so their ``/proc/self/fd`` paths are intentionally not
+        ancestors of one another. This mapper first authorizes ``path`` through
+        the existing no-follow anchor boundary, then restores the receipt DUT
+        identity as the logical first component. It performs no path resolution
+        and never consults the replaceable lexical DUT ancestor.
+
+        Args:
+            path: Input file or directory below the pinned root or one pinned
+                DUT descriptor.
+
+        Returns:
+            The canonical logical path relative to the collection bundle root.
+
+        Raises:
+            ReportInputSafetyError: If the authorized anchor has no logical
+                bundle mapping or the resulting logical path exceeds the
+                configured depth bound.
+        """
+
+        anchor, relative_parts = self._report_input_anchor(path)
+        root_anchor = Path(os.path.abspath(os.fspath(self.root_dir)))
+        logical_parts = relative_parts if anchor == root_anchor else None
+
+        binding = self._snapshot_binding
+        if logical_parts is None and binding is not None:
+            for dut_path in binding.dut_directories:
+                dut_anchor = Path(os.path.abspath(os.fspath(dut_path)))
+                if anchor == dut_anchor:
+                    logical_parts = (dut_path.name, *relative_parts)
+                    break
+
+        if logical_parts is None:
+            raise ReportInputSafetyError(
+                "report input anchor has no logical bundle mapping"
+            )
+        if len(logical_parts) > self._report_input_limits.max_path_depth:
+            raise ReportInputSafetyError("report input path depth limit exceeded")
+        return Path(*logical_parts)
+
+    @contextmanager
+    def _open_report_input_directory(self, path: Path) -> Iterator[int]:
+        """
+        Open a directory through retained no-follow descriptors and revalidate it.
+
+        The implementation uses ``path`` to open a directory through retained
+        no-follow descriptors and revalidate it. If the function cannot open a
+        directory through retained no-follow descriptors and revalidate it, its
+        exception reaches the caller instead of being converted into a
+        successful result. Cleanup in the ``finally`` path runs for successful,
+        failed, and cancelled execution.
+
+        Args:
+            path: filesystem location used as the path for this operation.
+
+        Yields:
+            Each open report input directory admitted by the operation, in
+            deterministic iteration order.
+
+        Raises:
+            ReportInputSafetyError: If report input root is unavailable; report
+                input root is a symbolic link; report input root is not a
+                directory; or report input root identity changed; or another
+                input invariant is violated.
+            BaseException: If a delegated failure occurs while the function
+                attempts to open a directory through retained no-follow
+                descriptors and revalidate it.
+        """
+
+        anchor, parts = self._report_input_anchor(path)
+        snapshot_pinned_anchor = self._snapshot_binding is not None and str(
+            anchor
+        ).startswith("/proc/self/fd/")
+        output_root_pinned_anchor = (
+            self._report_output_root_fd is not None
+            and self._report_output_root_path == anchor
+        )
+        try:
+            if output_root_pinned_anchor:
+                root_descriptor = self._require_report_output_root()
+                anchor_before = os.fstat(root_descriptor)
+            else:
+                anchor_before = (
+                    anchor.stat() if snapshot_pinned_anchor else anchor.lstat()
+                )
+        except FileNotFoundError:
+            raise
+        except OSError as error:
+            raise ReportInputSafetyError("report input root is unavailable") from error
+        if not (snapshot_pinned_anchor or output_root_pinned_anchor) and stat.S_ISLNK(
+            anchor_before.st_mode
+        ):
+            raise ReportInputSafetyError("report input root is a symbolic link")
+        if not stat.S_ISDIR(anchor_before.st_mode):
+            raise ReportInputSafetyError("report input root is not a directory")
+
+        directory_flags = (
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0)
+        )
+        if not snapshot_pinned_anchor:
+            directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+
+        descriptors: List[Tuple[int, os.stat_result, Optional[int], Optional[str]]] = []
+        try:
+            if output_root_pinned_anchor:
+                descriptor = os.dup(root_descriptor)
+            else:
+                descriptor = os.open(anchor, directory_flags)
+            try:
+                opened_anchor = os.fstat(descriptor)
+            except BaseException:
+                os.close(descriptor)
+                raise
+            descriptors.append((descriptor, opened_anchor, None, None))
+            if not stat.S_ISDIR(opened_anchor.st_mode) or not _same_report_input(
+                anchor_before, opened_anchor
+            ):
+                raise ReportInputSafetyError("report input root identity changed")
+
+            child_flags = directory_flags | getattr(os, "O_NOFOLLOW", 0)
+            for part in parts:
+                parent_descriptor = descriptor
+                before = os.stat(
+                    part,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+                    raise ReportInputSafetyError(
+                        "report input directory traverses a link or non-directory"
+                    )
+                descriptor = os.open(
+                    part,
+                    child_flags,
+                    dir_fd=parent_descriptor,
+                )
+                try:
+                    opened = os.fstat(descriptor)
+                except BaseException:
+                    os.close(descriptor)
+                    raise
+                descriptors.append((descriptor, opened, parent_descriptor, part))
+                if not _same_report_input(before, opened):
+                    raise ReportInputSafetyError(
+                        "report input directory identity changed"
+                    )
+
+            yield descriptor
+        except (FileNotFoundError, ReportInputSafetyError):
+            raise
+        except OSError as error:
+            raise ReportInputSafetyError(
+                "report input directory is unavailable"
+            ) from error
+        finally:
+            verification_error: Optional[BaseException] = None
+            for descriptor, expected, parent_descriptor, name in reversed(descriptors):
+                try:
+                    if not _same_report_input(expected, os.fstat(descriptor)):
+                        raise ReportInputSafetyError(
+                            "report input directory changed during traversal"
+                        )
+                    if parent_descriptor is not None and name is not None:
+                        current = os.stat(
+                            name,
+                            dir_fd=parent_descriptor,
+                            follow_symlinks=False,
+                        )
+                        if not _same_report_input(expected, current):
+                            raise ReportInputSafetyError(
+                                "report input directory path changed during traversal"
+                            )
+                except BaseException as error:
+                    verification_error = verification_error or error
+                finally:
+                    os.close(descriptor)
+            if descriptors and not (
+                snapshot_pinned_anchor or output_root_pinned_anchor
+            ):
+                try:
+                    if not _same_report_input(anchor_before, anchor.lstat()):
+                        raise ReportInputSafetyError(
+                            "report input root changed during traversal"
+                        )
+                except BaseException as error:
+                    verification_error = verification_error or error
+            if verification_error is not None:
+                raise verification_error
+
+    def _record_report_input(self, entry: _ReportInputEntry) -> None:
+        """
+        Charge a unique discovered path to member and aggregate limits.
+
+        The implementation uses ``entry`` to charge a unique discovered path to
+        member and aggregate limits. It updates ``_report_input_file_count`` and
+        ``_report_input_total_bytes`` on the instance as part of that state
+        transition. If the function cannot charge a unique discovered path to
+        member and aggregate limits, its exception reaches the caller instead of
+        being converted into a successful result.
+
+        Args:
+            entry: Entry object whose ``is_file``, ``metadata``, ``path``,
+                ``st_nlink``, and ``st_size`` state is read while performing
+                charge a unique discovered path to member and aggregate limits.
+
+        Raises:
+            ReportInputSafetyError: If report input identity changed; report
+                input path count limit exceeded; report input file has multiple
+                links; or report input per-file limit exceeded; or another input
+                invariant is violated.
+        """
+
+        key = os.path.abspath(os.fspath(entry.path))
+        previous = self._report_input_entries.get(key)
+        if previous is not None:
+            if not _same_report_input(previous, entry.metadata):
+                raise ReportInputSafetyError("report input identity changed")
+            return
+
+        if len(self._report_input_entries) >= self._report_input_limits.max_path_nodes:
+            raise ReportInputSafetyError("report input path count limit exceeded")
+        if entry.is_file:
+            if entry.metadata.st_nlink != 1:
+                raise ReportInputSafetyError("report input file has multiple links")
+            if entry.metadata.st_size > self._report_input_limits.max_member_bytes:
+                raise ReportInputSafetyError("report input per-file limit exceeded")
+            if self._report_input_file_count >= self._report_input_limits.max_members:
+                raise ReportInputSafetyError("report input file count limit exceeded")
+            if (
+                self._report_input_total_bytes + entry.metadata.st_size
+                > self._report_input_limits.max_total_bytes
+            ):
+                raise ReportInputSafetyError(
+                    "report input aggregate byte limit exceeded"
+                )
+            self._report_input_file_count += 1
+            self._report_input_total_bytes += entry.metadata.st_size
+        self._report_input_entries[key] = entry.metadata
+
+    def _walk_report_inputs(
+        self,
+        root: Path,
+        *,
+        recursive: bool,
+        excluded_directories: frozenset[str] = frozenset(),
+    ) -> List[_ReportInputEntry]:
+        """
+        Discover a finite regular-file tree without following any link.
+
+        After applying local validation, the function forwards ``root``,
+        ``recursive``, and ``excluded_directories`` to ``sorted`` and preserves
+        its return and exception contract. Cleanup in the ``finally`` path runs
+        for successful, failed, and cancelled execution.
+
+        Args:
+            root: filesystem location used as the root for this operation.
+            recursive: Whether recursive is enabled or required for this
+                operation.
+            excluded_directories: Entries supplied as ``excluded_directories``
+                without transferring container ownership.
+
+        Returns:
+            The walk report inputs returned in operation-defined order.
+        """
+
+        root_path = Path(root)
+        discovered: List[_ReportInputEntry] = []
+        with self._open_report_input_directory(root_path) as root_descriptor:
+
+            def visit(descriptor: int, directory: Path, depth: int) -> None:
+                """
+                Visit the current syntax or data node.
+
+                The implementation uses ``descriptor``, ``directory``, and
+                ``depth`` to visit the current syntax or data node. Filesystem
+                effects remain confined to the caller-selected paths and the
+                owning resource lifecycle. If the function cannot visit the
+                current syntax or data node, its exception reaches the caller
+                instead of being converted into a successful result. Cleanup in
+                the ``finally`` path runs for successful, failed, and cancelled
+                execution.
+
+                Args:
+                    descriptor: Numeric descriptor used while the operation
+                        performs bounded accounting.
+                    directory: filesystem location used as the directory for
+                        this operation.
+                    depth: Numeric depth used while the operation performs
+                        bounded accounting.
+
+                Raises:
+                    ReportInputSafetyError: If report input entry is unreadable;
+                        report input tree contains a symbolic link; report input
+                        tree contains a special file; or report input path depth
+                        limit exceeded; or another input invariant is violated.
+                """
+                before = os.fstat(descriptor)
+                try:
+                    with os.scandir(descriptor) as iterator:
+                        for child in iterator:
+                            try:
+                                metadata = child.stat(follow_symlinks=False)
+                            except OSError as error:
+                                raise ReportInputSafetyError(
+                                    "report input entry is unreadable"
+                                ) from error
+                            if stat.S_ISLNK(metadata.st_mode):
+                                raise ReportInputSafetyError(
+                                    "report input tree contains a symbolic link"
+                                )
+                            if not (
+                                stat.S_ISREG(metadata.st_mode)
+                                or stat.S_ISDIR(metadata.st_mode)
+                            ):
+                                raise ReportInputSafetyError(
+                                    "report input tree contains a special file"
+                                )
+                            if (
+                                stat.S_ISDIR(metadata.st_mode)
+                                and child.name in excluded_directories
+                            ):
+                                continue
+                            path = directory / child.name
+                            entry = _ReportInputEntry(path, metadata)
+                            self._record_report_input(entry)
+                            discovered.append(entry)
+                            if (
+                                recursive
+                                and entry.is_dir
+                                and child.name not in excluded_directories
+                            ):
+                                if depth >= self._report_input_limits.max_path_depth:
+                                    raise ReportInputSafetyError(
+                                        "report input path depth limit exceeded"
+                                    )
+                                flags = (
+                                    os.O_RDONLY
+                                    | getattr(os, "O_CLOEXEC", 0)
+                                    | getattr(os, "O_DIRECTORY", 0)
+                                    | getattr(os, "O_NOFOLLOW", 0)
+                                )
+                                child_descriptor = os.open(
+                                    child.name,
+                                    flags,
+                                    dir_fd=descriptor,
+                                )
+                                try:
+                                    opened = os.fstat(child_descriptor)
+                                    if not _same_report_input(metadata, opened):
+                                        raise ReportInputSafetyError(
+                                            "report input directory identity changed"
+                                        )
+                                    visit(child_descriptor, path, depth + 1)
+                                    current = os.stat(
+                                        child.name,
+                                        dir_fd=descriptor,
+                                        follow_symlinks=False,
+                                    )
+                                    if not _same_report_input(metadata, current):
+                                        raise ReportInputSafetyError(
+                                            "report input directory path changed"
+                                        )
+                                finally:
+                                    os.close(child_descriptor)
+                except ReportInputSafetyError:
+                    raise
+                except OSError as error:
+                    raise ReportInputSafetyError(
+                        "report input directory is unreadable"
+                    ) from error
+                if not _same_report_input(before, os.fstat(descriptor)):
+                    raise ReportInputSafetyError(
+                        "report input directory changed during discovery"
+                    )
+
+            visit(root_descriptor, root_path, 0)
+        return sorted(discovered, key=lambda entry: os.fspath(entry.path))
+
+    def _inspect_report_input(self, path: Path) -> Optional[_ReportInputEntry]:
+        """
+        Inspect one no-follow descendant and bind its current identity.
+
+        The implementation uses ``path`` to inspect one no-follow descendant and
+        bind its current identity. Filesystem effects remain confined to the
+        caller-selected paths and the owning resource lifecycle. If the function
+        cannot inspect one no-follow descendant and bind its current identity,
+        its exception reaches the caller instead of being converted into a
+        successful result.
+
+        Args:
+            path: filesystem location used as the path for this operation.
+
+        Returns:
+            A ``_ReportInputEntry`` representing inspect report input, or
+            ``None`` when the requested value is unavailable.
+
+        Raises:
+            ReportInputSafetyError: If report input is a symbolic link; or
+                report input is a special file.
+        """
+
+        candidate = Path(os.path.abspath(os.fspath(path)))
+        anchor, parts = self._report_input_anchor(candidate)
+        if not parts:
+            try:
+                with self._open_report_input_directory(candidate) as descriptor:
+                    entry = _ReportInputEntry(candidate, os.fstat(descriptor))
+                    self._record_report_input(entry)
+                    return entry
+            except ReportInputSafetyError:
+                raise
+        parent = anchor.joinpath(*parts[:-1])
+        try:
+            with self._open_report_input_directory(parent) as descriptor:
+                metadata = os.stat(
+                    parts[-1],
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+                if stat.S_ISLNK(metadata.st_mode):
+                    raise ReportInputSafetyError("report input is a symbolic link")
+                if not (
+                    stat.S_ISREG(metadata.st_mode) or stat.S_ISDIR(metadata.st_mode)
+                ):
+                    raise ReportInputSafetyError("report input is a special file")
+                entry = _ReportInputEntry(candidate, metadata)
+                self._record_report_input(entry)
+                return entry
+        except FileNotFoundError:
+            return None
+
+    def _read_report_input(self, path: Path, *, maximum_bytes: int) -> bytes:
+        """
+        Read one exact, stable regular file beneath an authorized input root.
+
+        After applying local validation, the function forwards ``path`` and
+        ``maximum_bytes`` to ``join`` and preserves its return and exception
+        contract. Parsing or I/O must finish before the validated representation
+        is made available to the caller. Cleanup in the ``finally`` path runs
+        for successful, failed, and cancelled execution.
+
+        Args:
+            path: filesystem location used as the path for this operation.
+            maximum_bytes: Upper bound enforced for bytes; the consuming
+                boundary rejects or truncates values that exceed it.
+
+        Returns:
+            The bounded report input bytes.
+
+        Raises:
+            FileNotFoundError: If the function cannot read one exact, stable
+                regular file beneath an authorized input root safely.
+            ReportInputSafetyError: If report input is not a regular file;
+                report input parse byte limit exceeded; report input identity
+                changed before read; or report input identity changed while
+                opening; or another input invariant is violated.
+        """
+
+        entry = self._inspect_report_input(path)
+        if entry is None:
+            raise FileNotFoundError(path)
+        if not entry.is_file:
+            raise ReportInputSafetyError("report input is not a regular file")
+        if entry.metadata.st_size > maximum_bytes:
+            raise ReportInputSafetyError("report input parse byte limit exceeded")
+
+        candidate = Path(os.path.abspath(os.fspath(path)))
+        anchor, parts = self._report_input_anchor(candidate)
+        parent = anchor.joinpath(*parts[:-1])
+        with self._open_report_input_directory(parent) as parent_descriptor:
+            before = os.stat(
+                parts[-1],
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if not _same_report_input(entry.metadata, before):
+                raise ReportInputSafetyError(
+                    "report input identity changed before read"
+                )
+            descriptor = os.open(
+                parts[-1],
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_descriptor,
+            )
+            try:
+                opened = os.fstat(descriptor)
+                if not stat.S_ISREG(opened.st_mode) or not _same_report_input(
+                    before, opened
+                ):
+                    raise ReportInputSafetyError(
+                        "report input identity changed while opening"
+                    )
+                chunks: List[bytes] = []
+                observed = 0
+                while True:
+                    chunk = os.read(
+                        descriptor,
+                        min(
+                            _REPORT_INPUT_READ_CHUNK_BYTES,
+                            entry.metadata.st_size - observed + 1,
+                        ),
+                    )
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    observed += len(chunk)
+                    if observed > entry.metadata.st_size or observed > maximum_bytes:
+                        raise ReportInputSafetyError(
+                            "report input changed size while being read"
+                        )
+                after = os.fstat(descriptor)
+                current = os.stat(
+                    parts[-1],
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    observed != entry.metadata.st_size
+                    or not _same_report_input(entry.metadata, after)
+                    or not _same_report_input(entry.metadata, current)
+                ):
+                    raise ReportInputSafetyError(
+                        "report input changed while being read"
+                    )
+                return b"".join(chunks)
+            finally:
+                os.close(descriptor)
+
+    def _read_report_text(self, path: Path) -> str:
+        """
+        Read report text.
+
+        After applying local validation, the function forwards ``path`` to
+        ``decode`` and preserves its return and exception contract. Parsing or
+        I/O must finish before the validated representation is made available to
+        the caller.
+
+        Args:
+            path: filesystem location used as the path for this operation.
+
+        Returns:
+            The canonical report text.
+        """
+        return self._read_report_input(
+            path,
+            maximum_bytes=self.max_parseable_file_size,
+        ).decode("utf-8", errors="strict")
+
+    def _read_report_json(self, path: Path) -> Any:
+        """
+        Read report JSON.
+
+        After applying local validation, the function forwards ``path`` to
+        ``json.loads`` and preserves its return and exception contract. Parsing
+        or I/O must finish before the validated representation is made available
+        to the caller.
+
+        Args:
+            path: filesystem location used as the path for this operation.
+
+        Returns:
+            The report JSON value selected by the operation.
+        """
+        return json.loads(self._read_report_text(path))
+
+    def _report_input_is_file(self, path: Path) -> bool:
+        """
+        Return the report input is file.
+
+        After applying local validation, the function forwards ``path`` to
+        ``bool`` and preserves its return and exception contract.
+
+        Args:
+            path: filesystem location used as the path for this operation.
+
+        Returns:
+            Whether the report input is file operation succeeds.
+        """
+        entry = self._inspect_report_input(path)
+        return bool(entry and entry.is_file)
+
+    def _report_input_is_dir(self, path: Path) -> bool:
+        """
+        Return the report input is dir.
+
+        After applying local validation, the function forwards ``path`` to
+        ``bool`` and preserves its return and exception contract.
+
+        Args:
+            path: filesystem location used as the path for this operation.
+
+        Returns:
+            Whether the report input is dir operation succeeds.
+        """
+        entry = self._inspect_report_input(path)
+        return bool(entry and entry.is_dir)
+
+    def _safe_node_input_path(self, node_path: Path, value: Any) -> Optional[Path]:
+        """
+        Resolve metadata-provided POSIX paths without crossing the DUT root.
+
+        The implementation uses ``node_path`` and ``value`` to resolve
+        metadata-provided POSIX paths without crossing the DUT root. Filesystem
+        effects remain confined to the caller-selected paths and the owning
+        resource lifecycle.
+
+        Args:
+            node_path: filesystem location used as the node path for this
+                operation.
+            value: Value evaluated while performing metadata-provided POSIX
+                paths without crossing the DUT root.
+
+        Returns:
+            The validated ``candidate``, or ``None`` when no value qualifies.
+        """
+
+        raw = str(value).strip().replace("\\", "/").lstrip("/")
+        if not raw or "\x00" in raw:
+            return None
+        parts = Path(raw).parts
+        if any(part in {"", ".", ".."} for part in parts):
+            return None
+        candidate = Path(os.path.abspath(os.fspath(node_path.joinpath(*parts))))
+        node_root = Path(os.path.abspath(os.fspath(node_path)))
+        try:
+            candidate.relative_to(node_root)
+        except ValueError:
+            return None
+        self._report_input_anchor(candidate)
+        return candidate
 
     async def _initialize(self):
         """
@@ -116,18 +1911,24 @@ class HTMLReportService:
 
         Sets up logging, directories, and initializes data structures.
         """
-        # These are already set in __init__, just need to set up logging
-        self.root_dir = self.root_dir.resolve()
+        # Normalize lexically only. Root and every ancestor are authorized with
+        # no-follow descriptors before the reports subtree can be removed.
+        self.root_dir = Path(os.path.abspath(os.fspath(self.root_dir)))
 
         # Helper method for async logging
         async def log_message(level: str, message: str, dut_id: str = None):
             """
             Helper to log messages using async logger if available.
 
+            Use system-level logging instead of DUT-specific logging.
+
             Args:
-                level: Log level.
-                message: Log message.
-                dut_id: DUT ID (ignored, kept for compatibility).
+                level: Text supplied as level in the format accepted by this
+                    function.
+                message: Operator-facing text carried by the reported event or
+                    failure.
+                dut_id: Stable DUT identifier used to correlate configuration,
+                    logs, and results.
             """
             # dut_id parameter is kept for compatibility but ignored since we use system-level logging
             if self.logger:
@@ -167,104 +1968,14 @@ class HTMLReportService:
             },
         ]
 
-        # Remove existing reports directory if it exists
-        if self.report_dir.exists() and self.report_dir.is_dir():
-            try:
-                shutil.rmtree(self.report_dir)
-                await self._log(
-                    "DEBUG",
-                    f"Removed existing reports directory at {self.report_dir}",
-                )
-            except Exception as e:
-                await self._log(
-                    "ERROR", f"Error removing existing reports directory: {e}"
-                )
-                raise
-
-        # Recreate the reports directory
         try:
-            self.report_dir.mkdir(exist_ok=True)
+            self._prepare_report_output_root()
             await self._log(
                 "DEBUG",
-                f"Created or found existing reports directory at {self.report_dir}",
+                f"Privately recreated reports directory at {self.report_dir}",
             )
-        except FileNotFoundError as e:
-            await self._log("ERROR", f"Error creating reports directory: {e}")
-            raise
-
-        self.json_collapsible = json_collapsible
-        self.theme_toggle = theme_toggle
-        self.hide_na_status = hide_na_status
-        self.na_string = na_string
-        # total_runtime is already set in __init__
-        self.common_navbar = self._get_common_navbar()
-        self.html_header_template = self._get_html_header()
-        self.html_footer = "</body></html>"
-
-        # Data structures for final statuses
-        self.node_statuses: Dict[str, str] = {}
-        self.node_statuses_all: Dict[str, List[str]] = {}
-        self.node_execution_times: Dict[str, float] = {}
-
-        # For building file map
-        self.global_file_map_data: List[dict] = []
-
-        # System info for each node
-        self.node_system_details: Dict[str, Dict[str, str]] = {}
-
-        # Threshold for log paths to show inline vs. modal
-        self.log_path_threshold = log_path_threshold
-
-        self.node_collector_json: Dict[str, Dict[str, Dict[str, dict]]] = {}
-
-        # Known collector groups (lowercase => Capitalized) - includes both legacy and new naming schemes
-        self.known_collector_groups = {
-            "healthcheck": "HealthCheck",
-            "health_check": "HealthCheck",
-            "host": "Host",
-            "ipmi": "IPMI",
-            "redfish": "Redfish",
-            "ssh": "SSH",
-            "bmc_ssh": "SSH",
-        }
-
-        # Set default parameters for nvdebug
-        log_path_threshold = 5
-        json_collapsible = True
-        theme_toggle = False
-        hide_na_status = True
-        na_string = "N/A"
-
-        # Define root-level files to display in the top-level report
-        self.root_level_files = [
-            {
-                "path": ".nvdebug_stdout.log",
-                "display_name": "Runtime Output Log",
-            },
-            {"path": ".log_signature.txt", "display_name": "Log Signature"},
-            {
-                "path": "log_signature.txt",
-                "display_name": "Log Signature (Legacy)",
-            },
-            {"path": "config.json", "display_name": "Tool Configuration"},
-            {"path": "dut_config.json", "display_name": "DUT Configuration"},
-            {
-                "path": "nvdebug_runtime_output_structured.txt",
-                "display_name": "Structured Runtime Output",
-            },
-        ]
-
-        # Remove existing reports directory if it exists
-        if self.report_dir.exists() and self.report_dir.is_dir():
-            try:
-                shutil.rmtree(self.report_dir)
-            except Exception:
-                raise
-
-        # Recreate the reports directory
-        try:
-            self.report_dir.mkdir(exist_ok=True)
-        except FileNotFoundError:
+        except Exception as e:
+            await self._log("ERROR", f"Error preparing reports directory: {e}")
             raise
 
         self.json_collapsible = json_collapsible
@@ -365,11 +2076,17 @@ class HTMLReportService:
         """
         Convert new group name to legacy group name for metadata file lookup.
 
+        After applying local validation, the function forwards ``group_name`` to
+        ``group_name_mapping.get`` and preserves its return and exception
+        contract. The source value keeps its ownership while the normalized
+        representation is returned separately.
+
         Args:
-            group_name: Group name in new format.
+            group_name: Stable group name used for lookup and operator-facing
+                diagnostics.
 
         Returns:
-            Group name in legacy format.
+            The canonical legacy group name.
         """
         # Mapping from new naming scheme to legacy naming scheme for metadata files
         group_name_mapping = {"health_check": "healthcheck", "bmc_ssh": "ssh"}
@@ -379,50 +2096,60 @@ class HTMLReportService:
         """
         Convert URLs in text to clickable HTML links.
 
+        After applying local validation, the function forwards ``text`` to
+        ``_HTML_RENDERER.make_links_clickable`` and preserves its return and
+        exception contract. The source value keeps its ownership while the
+        normalized representation is returned separately.
+
         Args:
-            text: Text that may contain URLs
+            text: Text supplied as text in the format accepted by this function.
 
         Returns:
-            Text with URLs converted to clickable links
+            The canonical make links clickable text.
         """
 
-        # Pattern to match URLs (http/https)
-        url_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+'
-
-        def replace_url(match):
-            url = match.group(0)
-            # Escape the URL for HTML attributes
-            escaped_url = escape(url)
-            return f'<a href="{escaped_url}" target="_blank" rel="noopener noreferrer">{escape(url)}</a>'
-
-        return re.sub(url_pattern, replace_url, text)
+        return _HTML_RENDERER.make_links_clickable(text)
 
     def _get_total_log_size(self, node_path: Path) -> int:
         """
-        Recursively sums the sizes of all files in node_path excluding the 'report' directory.
+        Return total log size.
+
+        After applying local validation, the function forwards ``node_path`` to
+        ``sum`` and preserves its return and exception contract.
+
+        Args:
+            node_path: filesystem location used as the node path for this
+                operation.
+
+        Returns:
+            The numeric total log size.
         """
-        total = 0
-        for root, dirs, files in os.walk(node_path):
-            # Exclude the report directory from size calculation
-            if "report" in dirs:
-                dirs.remove("report")
-            for f in files:
-                try:
-                    fp = os.path.join(root, f)
-                    total += os.path.getsize(fp)
-                except Exception:
-                    pass
-        return total
+        return sum(
+            entry.metadata.st_size
+            for entry in self._walk_report_inputs(
+                node_path,
+                recursive=True,
+                excluded_directories=frozenset({"report", "reports"}),
+            )
+            if entry.is_file and "reports" not in entry.path.parts
+        )
 
     def _format_bytes(self, size: float) -> str:
         """
         Convert a byte count into a human-readable string.
+
+        After applying local validation, the function forwards ``size`` to
+        ``_HTML_RENDERER.format_bytes`` and preserves its return and exception
+        contract. The source value keeps its ownership while the normalized
+        representation is returned separately.
+
+        Args:
+            size: Numeric size used by the operation's bounded accounting.
+
+        Returns:
+            The canonical bytes text.
         """
-        for unit in ["B", "KB", "MB", "GB", "TB"]:
-            if size < 1024:
-                return f"{size:.2f} {unit}"
-            size /= 1024
-        return f"{size:.2f} PB"
+        return _HTML_RENDERER.format_bytes(size)
 
     def _finalize_page(
         self,
@@ -434,8 +2161,25 @@ class HTMLReportService:
         modals: Optional[List[str]] = None,
     ) -> None:
         """
-        Renders a page by optionally building breadcrumbs, appending main_content,
-        appending modals, and then writing the final HTML via _write_html_report().
+        Finalize page.
+
+        The implementation uses ``target_file``, ``page_title``,
+        ``main_content``, ``breadcrumb_links``, and ``breadcrumb_active_text``
+        to finalize page.
+
+        Args:
+            target_file: filesystem location used as the target file for this
+                operation.
+            page_title: Text supplied as page title in the format accepted by
+                this function.
+            main_content: Text supplied as main content in the format accepted
+                by this function.
+            breadcrumb_links: Optional breadcrumb links; ``None`` selects the
+                function's default behavior.
+            breadcrumb_active_text: Text supplied as breadcrumb active text in
+                the format accepted by this function.
+            modals: Optional modals; ``None`` selects the function's default
+                behavior.
         """
         if breadcrumb_links is None:
             breadcrumb_links = []
@@ -459,21 +2203,29 @@ class HTMLReportService:
 
     def _build_system_details_html(self, node_name: str) -> str:
         """
-        Returns an HTML snippet showing the system details (Model, Partno, Serialno)
-        for the given node.
+        Build system details HTML.
+
+        After applying local validation, the function forwards ``node_name`` to
+        ``_HTML_RENDERER.build_system_details`` and preserves its return and
+        exception contract.
+
+        Args:
+            node_name: Stable node name used for lookup and operator-facing
+                diagnostics.
+
+        Returns:
+            The canonical system details HTML text.
         """
         details = self.node_system_details.get(
             node_name,
             {"Model": "Unknown", "Partno": "Unknown", "Serialno": "Unknown"},
         )
-        return f"""
-        <h5>System Details</h5>
-        <ul>
-            <li><strong>Model:</strong> {escape(details['Model'])}</li>
-            <li><strong>Partno:</strong> {escape(details['Partno'])}</li>
-            <li><strong>Serialno:</strong> {escape(details['Serialno'])}</li>
-        </ul>
-        """
+        model = SystemDetailsRenderModel(
+            model=details["Model"],
+            part_number=details["Partno"],
+            serial_number=details["Serialno"],
+        )
+        return _HTML_RENDERER.build_system_details(model)
 
     def _build_modal_html(
         self, modal_id: str, modal_title: str, body_content: str
@@ -481,32 +2233,22 @@ class HTMLReportService:
         """
         Returns the standard Bootstrap modal HTML snippet.
 
+        After applying local validation, the function forwards ``modal_id``,
+        ``modal_title``, and ``body_content`` to ``_HTML_RENDERER.build_modal``
+        and preserves its return and exception contract.
+
         Args:
-            modal_id (str): The unique ID for the modal.
-            modal_title (str): The title text for the modal.
-            body_content (str): The HTML content to be displayed inside the modal body.
+            modal_id: Stable modal identifier used to correlate configuration,
+                logs, and results.
+            modal_title: Text supplied as modal title in the format accepted by
+                this function.
+            body_content: Text supplied as body content in the format accepted
+                by this function.
 
         Returns:
-            str: The complete Bootstrap modal HTML markup.
+            The canonical modal HTML text.
         """
-        return f"""
-        <div class="modal fade" id="{modal_id}" tabindex="-1" aria-labelledby="{modal_id}Label" aria-hidden="true">
-            <div class="modal-dialog modal-xl">
-                <div class="modal-content">
-                    <div class="modal-header">
-                        <h5 class="modal-title" id="{modal_id}Label">{escape(modal_title)}</h5>
-                        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
-                    </div>
-                    <div class="modal-body">
-                        {body_content}
-                    </div>
-                    <div class="modal-footer">
-                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
-                    </div>
-                </div>
-            </div>
-        </div>
-        """
+        return _HTML_RENDERER.build_modal(modal_id, modal_title, body_content)
 
     def _render_link_list_with_modal(
         self,
@@ -517,56 +2259,55 @@ class HTMLReportService:
         modal_store_list: Optional[List[str]] = None,
     ) -> str:
         """
-        Renders the given link objects, and if they exceed the threshold, creates a Bootstrap
-        modal and returns a partial list plus a button to open the modal.
+        Render link list with modal.
+
+        The implementation uses ``link_objs``, ``threshold``, ``modal_id``,
+        ``modal_title``, and ``modal_store_list`` to render link list with
+        modal. The source value keeps its ownership while the normalized
+        representation is returned separately. The operation mutates
+        ``modal_store_list`` in place; ownership of those objects remains with
+        the caller.
 
         Args:
-            link_objs (List[str]): The list of links or text items to display.
-            threshold (int): The threshold after which a modal should be used.
-            modal_id (str): Unique ID for the modal.
-            modal_title (str): Title to display on the modal.
-            modal_store_list (List[str], optional): A list to which we can append the modal HTML.
-                                                    Defaults to None if not needed.
+            link_objs: Entries supplied as ``link_objs`` without transferring
+                container ownership.
+            threshold: Numeric threshold used while the operation performs
+                bounded accounting.
+            modal_id: Stable modal identifier used to correlate configuration,
+                logs, and results.
+            modal_title: Text supplied as modal title in the format accepted by
+                this function.
+            modal_store_list: Optional modal store list; ``None`` selects the
+                function's default behavior.
 
         Returns:
-            str: HTML string that shows either all links inline or partial links with "Show remaining" button.
+            The canonical link list with modal text.
         """
-        # De-duplicate identical rendered link strings while preserving order.
-        # This prevents repeated links in the Execution Summary "Log Paths" column
-        # when the same output file is recorded multiple times upstream.
-        if link_objs:
-            seen = set()
-            deduped: List[str] = []
-            for item in link_objs:
-                if item in seen:
-                    continue
-                seen.add(item)
-                deduped.append(item)
-            link_objs = sorted(deduped)
-
-        total_links = len(link_objs)
-        if total_links <= threshold:
-            return "<br>".join(link_objs) if link_objs else "N/A"
-
-        displayed_links = "<br>".join(link_objs[:threshold])
-        remainder_links = link_objs[threshold:]
-        modal_body = "<br>".join(remainder_links)
-        modal_html = self._build_modal_html(modal_id, modal_title, modal_body)
-
-        if modal_store_list is not None:
-            modal_store_list.append(modal_html)
-
-        return (
-            f"{displayed_links}"
-            f'<br><a href="#" class="btn btn-secondary" data-bs-toggle="modal" '
-            f'data-bs-target="#{modal_id}">'
-            f"Show remaining {total_links - threshold} file(s)</a>"
+        rendered = _HTML_RENDERER.render_link_list_with_modal(
+            tuple(link_objs),
+            threshold,
+            modal_id,
+            modal_title,
         )
+        if modal_store_list is not None and rendered.modal_html is not None:
+            modal_store_list.append(rendered.modal_html)
+        return rendered.html
 
     def _parse_from_collection_name(self, coll_name: str) -> Tuple[str, str, str]:
         """
-        Tries to parse the collector group, ID, and name from the "collection name" field.
-        If not possible, return ("N/A", "N/A", coll_name).
+        Parse from collection name.
+
+        The implementation uses ``coll_name`` to parse from collection name.
+        Parsing or I/O must finish before the validated representation is made
+        available to the caller.
+
+        Args:
+            coll_name: Stable coll name used for lookup and operator-facing
+                diagnostics.
+
+        Returns:
+            A tuple containing the collector group, collector identifier, and
+            display name.
         """
         parts = coll_name.split("_")
         if len(parts) == 1:
@@ -578,8 +2319,18 @@ class HTMLReportService:
 
     def _parse_human_time_to_seconds(self, time_str) -> float:
         """
-        Convert strings like "2m 59.59s", "1h 3m 10s", "30.0s", "30.0", "Log collection took 11.92 seconds" -> float seconds.
-        Also handles numeric values directly.
+        Parse human time to seconds.
+
+        The implementation uses ``time_str`` to parse human time to seconds.
+        Parsing or I/O must finish before the validated representation is made
+        available to the caller.
+
+        Args:
+            time_str: Time str object whose ``lower`` and ``strip`` state is
+                read while performing human time to seconds.
+
+        Returns:
+            The numeric human time to seconds.
         """
         # If it's already a number, return it directly
         if isinstance(time_str, (int, float)):
@@ -634,6 +2385,17 @@ class HTMLReportService:
     def _natural_sort_key_for_id(self, cid: str) -> tuple:
         """
         Splits a collector ID like 'I10' into (alpha_part, numeric_part, suffix).
+
+        The implementation uses ``cid`` to splits a collector ID like 'I10' into
+        (alpha_part, numeric_part, suffix).
+
+        Args:
+            cid: Text supplied as cid in the format accepted by this function.
+
+        Returns:
+            A tuple containing ``natural sort key for identifier value 1``,
+            ``natural sort key for identifier value 2``, and ``natural sort key
+            for identifier value 3`` in that order.
         """
         cid = cid.strip().upper()
         match = re.match(r"^([A-Z]+)(\d+)(.*)$", cid)
@@ -645,6 +2407,17 @@ class HTMLReportService:
     def _format_time(self, seconds: float) -> str:
         """
         Convert float seconds to a human-readable time like 'Xh Ym Z.zzs'.
+
+        The implementation uses ``seconds`` to convert float seconds to a
+        human-readable time like 'Xh Ym Z.zzs'. The source value keeps its
+        ownership while the normalized representation is returned separately.
+
+        Args:
+            seconds: Numeric seconds used while the operation performs bounded
+                accounting.
+
+        Returns:
+            The canonical time text.
         """
         if seconds <= 0:
             return "0.00s"
@@ -661,14 +2434,33 @@ class HTMLReportService:
     def _normalize_group_name(self, g: str) -> str:
         """
         Maps known collector groups to a capitalized form if recognized.
+
         Otherwise returns the given name as-is.
+
+        After applying local validation, the function forwards ``g`` to
+        ``self.known_collector_groups.get`` and preserves its return and
+        exception contract.
+
+        Args:
+            g: Text supplied as g in the format accepted by this function.
+
+        Returns:
+            The canonical group name.
         """
         return self.known_collector_groups.get(g.lower(), g)
 
     def _get_group_from_collector_id(self, collector_id: str) -> str:
         """
         Get the correct group name based on collector ID prefix.
+
         This ensures proper classification regardless of directory structure.
+
+        Args:
+            collector_id: Stable collector identifier used to correlate
+                configuration, logs, and results.
+
+        Returns:
+            The canonical group from collector identifier text.
         """
         if not collector_id:
             return "N/A"
@@ -686,6 +2478,15 @@ class HTMLReportService:
     def _get_status_class(self, status: str) -> str:
         """
         Returns a CSS class name based on the status string.
+
+        Handle legacy status format (Passed, Failed, Skipped, NotRan).
+
+        Args:
+            status: Text supplied as status in the format accepted by this
+                function.
+
+        Returns:
+            The canonical status class text.
         """
         s = status.lower()
         # Handle legacy status format (Passed, Failed, Skipped, NotRan)
@@ -702,574 +2503,102 @@ class HTMLReportService:
             return "status-complete"
         elif s == "error":
             return "status-error"
+        elif s == "degraded":
+            return "status-degraded"
         elif s == "partial":
             return "status-partial"
         elif s == "n/a":
             return "status-na"
         return ""
 
-    def _get_common_navbar(self) -> str:
+    def _render_run_identity_navbar(self, run_result: Optional[RunResult]) -> str:
         """
-        Returns a shared navbar snippet that will appear on all pages.
+        Render canonical identity facts without consulting another authority.
+
+        After applying local validation, the function forwards ``run_result`` to
+        ``HTML_REPORT_PAGE_ASSETS.render_run_identity_navbar`` and preserves its
+        return and exception contract. The source value keeps its ownership
+        while the normalized representation is returned separately.
+
+        Args:
+            run_result: Run result consumed while the function attempts to
+                render canonical identity facts without consulting another
+                authority.
+
+        Returns:
+            The canonical run identity navbar text.
         """
-        theme_toggle_html = (
-            """
-        <div class="form-check form-switch">
-            <input class="form-check-input" type="checkbox" id="themeToggle">
-            <label class="form-check-label" for="themeToggle">Dark Mode</label>
-        </div>"""
-            if self.theme_toggle
-            else ""
+
+        return HTML_REPORT_PAGE_ASSETS.render_run_identity_navbar(
+            run_result,
+            escape_html_text=self._escape_html_text,
         )
 
-        return f"""
-        <header class="py-3 mb-3 border-bottom navbar-fixed-top bg-white">
-            <div class="container-fluid d-grid gap-3 align-items-center" style="grid-template-columns: 1fr 2fr;">
-                <div class="d-flex">
-                    <div class="nv-logo">
-                        <svg viewBox="0 0 164 30"><defs><path id="a" d="M157.725 29.99H.01V.048h157.715z"></path></defs><g fill="none" fill-rule="evenodd"><path d="M160.352 24.069v-.449h.288c.157 0 .371.012.371.204 0 .208-.11.245-.296.245h-.363m0 .315h.192l.447.784h.49l-.494-.816c.255-.019.465-.14.465-.484 0-.427-.295-.565-.793-.565h-.721v1.865h.414v-.784m2.098-.146c0-1.095-.851-1.73-1.8-1.73-.955 0-1.805.635-1.805 1.73s.85 1.733 1.805 1.733c.948 0 1.8-.638 1.8-1.733m-.52 0c0 .798-.587 1.334-1.28 1.334v-.006c-.713.006-1.289-.53-1.289-1.328 0-.797.577-1.331 1.289-1.331.694 0 1.28.534 1.28 1.331" fill="#1A1919"></path><mask id="b" fill="#fff"><use href="#a"></use></mask><path d="m96.374 5.707.002 19.66h5.552V5.707h-5.554zm-43.677-.026v19.686H58.3V10.086l4.37.014c1.437 0 2.43.345 3.123 1.084.879.936 1.237 2.444 1.237 5.205v8.978h5.427V14.49c0-7.763-4.948-8.81-9.789-8.81h-9.97zm52.617.027v19.659h9.006c4.798 0 6.364-.798 8.057-2.587 1.198-1.256 1.971-4.014 1.971-7.027 0-2.763-.655-5.228-1.797-6.763-2.057-2.745-5.02-3.282-9.445-3.282h-7.792zm5.508 4.28h2.387c3.463 0 5.703 1.556 5.703 5.591 0 4.037-2.24 5.592-5.703 5.592h-2.387V9.989zm-22.453-4.28-4.634 15.58-4.44-15.579-5.993-.001 6.34 19.659h8.003l6.391-19.659H88.37zm38.563 19.659h5.553V5.709l-5.555-.001.002 19.659zm15.564-19.652-7.753 19.645h5.475l1.227-3.472h9.175l1.161 3.472h5.944l-7.812-19.646-7.417.001zM146.1 9.3l3.364 9.204h-6.833l3.47-9.204z" fill="#000" mask="url(#b)"></path><path d="M16.889 8.985V6.28c.262-.02.528-.033.798-.042 7.4-.232 12.255 6.359 12.255 6.359s-5.244 7.282-10.866 7.282a6.82 6.82 0 0 1-2.187-.35v-8.204c2.88.348 3.46 1.62 5.192 4.508l3.852-3.248s-2.812-3.688-7.552-3.688c-.515 0-1.008.036-1.492.088zm0-8.938V4.09c.265-.021.531-.038.798-.048 10.29-.346 16.995 8.44 16.995 8.44s-7.7 9.364-15.723 9.364c-.735 0-1.424-.068-2.07-.183v2.498c.553.07 1.126.112 1.724.112 7.465 0 12.864-3.812 18.092-8.325.867.694 4.416 2.383 5.145 3.123-4.971 4.16-16.555 7.515-23.123 7.515a18.89 18.89 0 0 1-1.838-.096V30h28.375V.047H16.89zm0 19.482v2.133c-6.905-1.23-8.822-8.408-8.822-8.408s3.316-3.674 8.822-4.269v2.34l-.011-.001c-2.89-.347-5.147 2.353-5.147 2.353s1.265 4.544 5.158 5.852zM4.625 12.943s4.092-6.04 12.264-6.663V4.088C7.838 4.815 0 12.48 0 12.48s4.439 12.833 16.889 14.008V24.16C7.753 23.011 4.625 12.943 4.625 12.943z" fill="#76B900" mask="url(#b)"></path></g></svg>
-                    </div>
-                    <a class="navbar-brand" href="#">NVDebug Reports</a>
-                    {theme_toggle_html}
-                </div>
-                <div class="d-flex justify-content-end">
-                    <form class="row me-3" role="search" onsubmit="return false;">
-                        <div class="col-auto">
-                            <input id="globalSearchBox" type="search" class="form-control" placeholder="Search..." aria-label="Search" onkeyup="globalSearchHandler(this.value)">
-                        </div>
-                        <div class="col-auto">
-                            <button class="btn btn-outline-success my-2 my-sm-0" type="button" onclick="clearSearch()">Clear</button>
-                        </div>
-                    </form>
-                </div>
-            </div>
-        </header>
+    def _get_common_navbar(self, run_result: Optional[RunResult] = None) -> str:
         """
+        Returns a shared navbar snippet that will appear on all pages.
+
+        After applying local validation, the function forwards ``run_result`` to
+        ``HTML_REPORT_PAGE_ASSETS.render_common_navbar`` and preserves its
+        return and exception contract.
+
+        Args:
+            run_result: Optional run result; ``None`` selects the function's
+                default behavior.
+
+        Returns:
+            The canonical common navbar text.
+        """
+
+        return HTML_REPORT_PAGE_ASSETS.render_common_navbar(
+            NavbarRenderModel(
+                theme_toggle=self.theme_toggle,
+                identity_html=self._render_run_identity_navbar(run_result),
+            )
+        )
+
+    def _refresh_common_navbar_from_bound_result(self) -> None:
+        """
+        Refresh the header from the strictly reconstructed bound result.
+
+        The implementation uses current instance state to refresh the header
+        from the strictly reconstructed bound result. It updates
+        ``common_navbar`` on the instance as part of that state transition.
+        """
+
+        self.common_navbar = self._get_common_navbar(self._read_run_result())
 
     def _get_html_header(self) -> str:
         """
         Returns the HTML header template with placeholders for title and content.
+
+        The implementation uses current instance state to returns the HTML
+        header template with placeholders for title and content.
+
+        Returns:
+            The canonical HTML header text.
         """
-        return """
-        <!DOCTYPE html>
-        <html lang="en">
-        <head>
-            <meta charset="UTF-8">
-            <title>{title}</title>
-            <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
-            <style>
-                /* Base styles with modern polish */
-                body {{
-                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-                    margin: 0;
-                    padding: 0 1rem;
-                    padding-top: 80px;
-                    background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
-                    min-height: 100vh;
-                }}
 
-                /* Container with card style */
-                .container {{
-                    background: white;
-                    border-radius: 12px;
-                    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.07);
-                    padding: 2rem;
-                    margin-top: 1rem !important;
-                    margin-bottom: 2rem !important;
-                    margin-left: auto !important;
-                    margin-right: auto !important;
-                }}
-
-                .navbar-fixed-top {{
-                    position: fixed;
-                    top: 0;
-                    left: 0;
-                    right: 0;
-                    z-index: 1030;
-                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-                }}
-
-                /* Enhanced table styling */
-                table {{
-                    border-collapse: collapse;
-                    width: 100%;
-                    margin-bottom: 20px;
-                    background: white;
-                }}
-                th, td {{
-                    border: 1px solid #e0e0e0;
-                    padding: 12px;
-                    text-align: left;
-                }}
-                th {{
-                    font-weight: 600;
-                }}
-                thead:not(.table-dark) th {{
-                    background: linear-gradient(180deg, #f8f9fa 0%, #e9ecef 100%);
-                    color: #495057;
-                }}
-                thead.table-dark th {{
-                    background: linear-gradient(180deg, #343a40 0%, #23272b 100%) !important;
-                    color: #fff !important;
-                    border-color: #454d55 !important;
-                }}
-                .table-dark tbody tr {{
-                    background-color: transparent;
-                }}
-                .table-striped.table-dark tbody tr:nth-of-type(odd) {{
-                    background-color: rgba(255, 255, 255, 0.05);
-                }}
-                tbody tr:hover {{ background-color: #f8f9fa; }}
-                .table-dark tbody tr:hover {{ background-color: rgba(255, 255, 255, 0.075); }}
-                a {{
-                    text-decoration: none;
-                    color: #0066cc;
-                    transition: color 0.2s ease;
-                }}
-                a:hover {{ color: #0052a3; }}
-
-                /* Status badges with modern colors */
-                .status-complete {{ background-color: #d4edda !important; color: #155724 !important; }}
-                .status-error {{ background-color: #f8d7da !important; color: #721c24 !important; }}
-                .status-partial {{ background-color: #fff3cd !important; color: #856404 !important; }}
-                .status-skipped {{ background-color: #ffc107 !important; color: #212529 !important; }}
-                .status-na {{ background-color: #e9ecef !important; color: #6c757d !important; }}
-                .status-notran {{ background-color: #e9ecef !important; color: #6c757d !important; }}
-
-                /* Cards and sections */
-                .card {{
-                    border: none;
-                    border-radius: 8px;
-                    box-shadow: 0 2px 4px rgba(0,0,0,0.08);
-                    transition: transform 0.2s ease, box-shadow 0.2s ease;
-                }}
-                .card:hover {{
-                    transform: translateY(-2px);
-                    box-shadow: 0 4px 8px rgba(0,0,0,0.12);
-                }}
-                /* Only gradient cards should be equal height */
-                .card.bg-primary, .card.bg-success, .card.bg-danger, .card.bg-info, .card.bg-warning {{
-                    height: 100%;
-                }}
-                .card.bg-primary .card-body,
-                .card.bg-success .card-body,
-                .card.bg-danger .card-body,
-                .card.bg-info .card-body,
-                .card.bg-warning .card-body {{
-                    display: flex;
-                    flex-direction: column;
-                    height: 100%;
-                }}
-
-                .section {{
-                    background: white;
-                    border-radius: 8px;
-                    padding: 1.5rem;
-                    margin-bottom: 1.5rem;
-                    box-shadow: 0 2px 4px rgba(0,0,0,0.06);
-                }}
-
-                /* Enhanced buttons */
-                .btn {{
-                    border-radius: 6px;
-                    font-weight: 500;
-                    transition: all 0.2s ease;
-                }}
-                .btn:hover {{
-                    transform: translateY(-1px);
-                    box-shadow: 0 4px 8px rgba(0,0,0,0.15);
-                }}
-
-                /* Breadcrumb */
-                .breadcrumb {{
-                    background: #f8f9fa;
-                    padding: 0.75rem;
-                    border-radius: 6px;
-                    margin-bottom: 1rem;
-                }}
-
-                /* Accordion */
-                .accordion {{
-                    background-color: #f8f9fa;
-                    cursor: pointer;
-                    padding: 12px;
-                    width: 100%;
-                    border: none;
-                    border-radius: 6px;
-                    text-align: left;
-                    outline: none;
-                    transition: all 0.3s ease;
-                    font-weight: 500;
-                }}
-                .accordion.active, .accordion:hover {{
-                    background-color: #e9ecef;
-                }}
-                .panel {{
-                    padding: 0 15px;
-                    display: none;
-                    background-color: white;
-                    overflow: auto;
-                    max-height: 600px;
-                    border-radius: 0 0 6px 6px;
-                }}
-
-                /* Tree view */
-                ul {{ list-style-type: none; }}
-                li.folder > span {{
-                    font-weight: bold;
-                    cursor: pointer;
-                    color: #0066cc;
-                }}
-                #treeview ul {{ margin-left: 20px; }}
-
-                .highlight {{
-                    background-color: #fff3cd;
-                    padding: 2px 4px;
-                    border-radius: 3px;
-                }}
-
-                .nv-logo {{
-                    display: inline-flex;
-                    height: 25px;
-                    padding-right: 20px;
-                }}
-
-                .table-shadow {{
-                    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
-                    border-radius: 8px;
-                    overflow: hidden;
-                }}
-
-                /* Progress bars */
-                .progress {{
-                    border-radius: 8px;
-                    overflow: hidden;
-                }}
-
-                /* Headings */
-                h1, h2, h3, h4, h5, h6 {{
-                    color: #2c3e50;
-                    font-weight: 600;
-                }}
-
-                /* Badge improvements */
-                .badge {{
-                    padding: 0.35em 0.65em;
-                    border-radius: 6px;
-                    font-weight: 500;
-                }}
-
-                /* Service color scheme - consistent across all reports */
-                .service-redfish,
-                span.badge.service-redfish,
-                span.badge.service-badge.service-redfish {{
-                    background-color: #f8d7da !important;
-                    color: #721c24 !important;
-                    border: 1px solid #f5c2c7 !important;
-                }}
-                .service-ssh,
-                span.badge.service-ssh,
-                span.badge.service-badge.service-ssh {{
-                    background-color: #fff3cd !important;
-                    color: #856404 !important;
-                    border: 1px solid #ffecb5 !important;
-                }}
-                .service-ipmi,
-                span.badge.service-ipmi,
-                span.badge.service-badge.service-ipmi {{
-                    background-color: #d4edda !important;
-                    color: #155724 !important;
-                    border: 1px solid #c3e6cb !important;
-                }}
-                .service-host,
-                span.badge.service-host,
-                span.badge.service-badge.service-host {{
-                    background-color: #cfe2ff !important;
-                    color: #084298 !important;
-                    border: 1px solid #b6d4fe !important;
-                }}
-                .service-health_check,
-                span.badge.service-health_check,
-                span.badge.service-badge.service-health_check {{
-                    background-color: #e2d9f3 !important;
-                    color: #4a148c !important;
-                    border: 1px solid #d4c4e8 !important;
-                }}
-                .service-preflight,
-                span.badge.service-preflight,
-                span.badge.service-badge.service-preflight {{
-                    background-color: #e9ecef !important;
-                    color: #495057 !important;
-                    border: 1px solid #dee2e6 !important;
-                }}
-
-                /* Service badges (inline display) */
-                .service-badge {{
-                    display: inline-block !important;
-                    padding: 6px 12px !important;
-                    border-radius: 12px !important;
-                    font-size: 0.8rem !important;
-                    font-weight: 600 !important;
-                    margin-right: 8px !important;
-                }}
-
-                /* Gradient cards for summary boxes */
-                .card.bg-primary {{
-                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%) !important;
-                }}
-                .card.bg-success {{
-                    background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%) !important;
-                }}
-                .card.bg-danger {{
-                    background: linear-gradient(135deg, #ee0979 0%, #ff6a00 100%) !important;
-                }}
-                .card.bg-info {{
-                    background: linear-gradient(135deg, #3a7bd5 0%, #00d2ff 100%) !important;
-                }}
-                .card.bg-warning {{
-                    background: linear-gradient(135deg, #f2994a 0%, #f2c94c 100%) !important;
-                }}
-
-                /* Chart containers */
-                .chart-container {{
-                    background: white;
-                    padding: 20px;
-                    border-radius: 8px;
-                    box-shadow: none !important;
-                    margin-bottom: 20px;
-                }}
-
-                /* Sortable table headers */
-                th.sortable {{
-                    cursor: pointer;
-                    user-select: none;
-                    position: relative;
-                }}
-                thead:not(.table-dark) th.sortable:hover {{
-                    background: linear-gradient(180deg, #e9ecef 0%, #d3d7da 100%) !important;
-                }}
-                thead.table-dark th.sortable:hover {{
-                    background: linear-gradient(180deg, #454d55 0%, #343a40 100%) !important;
-                }}
-                th.sortable:after {{
-                    content: '⇅';
-                    position: absolute;
-                    right: 8px;
-                    opacity: 0.5;
-                }}
-                #logView {{
-                    background: #1e1e1e !important;
-                }}
-            </style>
-            <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.23.0/themes/prism.min.css" rel="stylesheet" />
-            <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
-            <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.23.0/prism.min.js"></script>
-            <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-            <script>
-                // Initialize all modals when the document is ready
-                document.addEventListener('DOMContentLoaded', function() {{
-                    // Initialize all modals
-                    var modalElements = document.querySelectorAll('.modal');
-                    modalElements.forEach(function(modalElement) {{
-                        new bootstrap.Modal(modalElement);
-                    }});
-
-                    // Initialize all tooltips
-                    var tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]'));
-                    tooltipTriggerList.map(function (tooltipTriggerEl) {{
-                        return new bootstrap.Tooltip(tooltipTriggerEl);
-                    }});
-
-                    // Initialize all popovers
-                    var popoverTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="popover"]'));
-                    popoverTriggerList.map(function (popoverTriggerEl) {{
-                        return new bootstrap.Popover(popoverTriggerEl);
-                    }});
-                }});
-
-                // Function to open a modal by ID
-                function openModal(modalId) {{
-                    var modalElement = document.getElementById(modalId);
-                    if (modalElement) {{
-                        var modal = bootstrap.Modal.getInstance(modalElement) || new bootstrap.Modal(modalElement);
-                        modal.show();
-                    }}
-                }}
-
-                function filterTable(query) {{
-                    query = query.toLowerCase();
-                    var tables = document.getElementsByTagName('table');
-                    for (var t = 0; t < tables.length; t++) {{
-                        var rows = tables[t].getElementsByTagName('tr');
-                        for (var i = 1; i < rows.length; i++) {{
-                            var cells = rows[i].getElementsByTagName('td');
-                            var match = false;
-                            for (var c = 0; c < cells.length; c++) {{
-                                var cellText = cells[c].innerText.toLowerCase();
-                                if (cellText.indexOf(query) > -1) {{
-                                    match = true;
-                                    break;
-                                }}
-                            }}
-                            rows[i].style.display = (match || query === '') ? '' : 'none';
-                        }}
-                    }}
-                }}
-
-                function clearSearch() {{
-                    var input = document.getElementById("globalSearchBox");
-                    if (input) {{
-                        input.value = '';
-                        globalSearchHandler('');
-                    }}
-                }}
-
-                function globalSearchHandler(value) {{
-                    var tables = document.getElementsByTagName('table');
-                    if (tables.length > 0) {{
-                        filterTable(value);
-                    }} else if (document.getElementById("jsonTree")) {{
-                        jsonGlobalSearch(value);
-                    }} else if (document.getElementById("textView")) {{
-                        textGlobalSearch(value);
-                    }} else if (document.getElementById("stdoutView")) {{
-                        stdoutGlobalSearch(value);
-                    }}
-                }}
-
-                // Universal table sorting with unique state per table
-                var tableSortStates = {{}};
-
-                function makeTableSortable(tableId) {{
-                    var table = document.getElementById(tableId);
-                    if (!table) return;
-
-                    // Initialize sort state for this table
-                    tableSortStates[tableId] = {{}};
-
-                    var headers = table.getElementsByTagName('th');
-
-                    for (var i = 0; i < headers.length; i++) {{
-                        (function(index, tId) {{
-                            headers[index].classList.add('sortable');
-                            headers[index].addEventListener('click', function() {{
-                                sortTableByColumn(tId, index);
-                            }});
-                        }})(i, tableId);
-                    }}
-                }}
-
-                function sortTableByColumn(tableId, columnIndex) {{
-                    var table = document.getElementById(tableId);
-                    if (!table) return;
-
-                    var tbody = table.getElementsByTagName('tbody')[0];
-                    if (!tbody) return;
-
-                    var rows = Array.from(tbody.getElementsByTagName('tr'));
-                    if (rows.length === 0) return;
-
-                    // Toggle sort direction
-                    var sortStates = tableSortStates[tableId];
-                    sortStates[columnIndex] = !sortStates[columnIndex];
-                    var isAscending = sortStates[columnIndex];
-
-                    rows.sort(function(a, b) {{
-                        var aCell = a.getElementsByTagName('td')[columnIndex];
-                        var bCell = b.getElementsByTagName('td')[columnIndex];
-                        if (!aCell || !bCell) return 0;
-
-                        var aValue = aCell.textContent.trim();
-                        var bValue = bCell.textContent.trim();
-
-                        // Prefer data-sort attribute for unit-aware numeric sorting
-                        var aNum = aCell.hasAttribute('data-sort') ? parseFloat(aCell.getAttribute('data-sort')) : parseFloat(aValue.replace(/[^0-9.-]/g, ''));
-                        var bNum = bCell.hasAttribute('data-sort') ? parseFloat(bCell.getAttribute('data-sort')) : parseFloat(bValue.replace(/[^0-9.-]/g, ''));
-                        if (!isNaN(aNum) && !isNaN(bNum)) {{
-                            return isAscending ? aNum - bNum : bNum - aNum;
-                        }}
-
-                        // Fall back to string comparison
-                        if (aValue < bValue) return isAscending ? -1 : 1;
-                        if (aValue > bValue) return isAscending ? 1 : -1;
-                        return 0;
-                    }});
-
-                    tbody.innerHTML = '';
-                    rows.forEach(function(row) {{ tbody.appendChild(row); }});
-                }}
-
-                document.addEventListener('DOMContentLoaded', function() {{
-                    // Initialize all modals
-                    const modalElements = document.querySelectorAll('.modal');
-                    modalElements.forEach(function(modalElement) {{
-                        new bootstrap.Modal(modalElement);
-                    }});
-
-                    // Make all tables with class 'table' sortable
-                    const allTables = document.querySelectorAll('table.table');
-                    allTables.forEach(function(table) {{
-                        if (table.id) {{
-                            makeTableSortable(table.id);
-                        }} else {{
-                            // Assign an ID if it doesn't have one
-                            table.id = 'table_' + Math.random().toString(36).substr(2, 9);
-                            makeTableSortable(table.id);
-                        }}
-                    }});
-
-                    /*/
-                    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-                        document.documentElement.setAttribute('data-bs-theme', prefersDark ? 'dark' : 'light');
-                        themeToggle.checked = prefersDark;
-                        themeToggle.addEventListener('change', function() {{
-                            document.documentElement.setAttribute('data-bs-theme', this.checked ? 'dark' : 'light');
-                    }});
-                    /**/
-
-                    var acc = document.getElementsByClassName("accordion");
-                    for (var i = 0; i < acc.length; i++) {{
-                        acc[i].addEventListener("click", function() {{
-                            this.classList.toggle("active");
-                            var panel = this.nextElementSibling;
-                            if (panel.style.display === "block") {{
-                                panel.style.display = "none";
-                            }} else {{
-                                panel.style.display = "block";
-                            }}
-                        }});
-                    }}
-                }});
-            </script>
-        </head>
-        <body>
-        {navbar}
-        {content}
-        </body>
-        </html>
-        """
+        return HTML_REPORT_PAGE_ASSETS.html_header_template
 
     def _build_breadcrumbs(self, links: List[Tuple[str, str]], active_text: str) -> str:
         """
-        Builds a breadcrumb navigation block with zero or more links and a final active item.
+        Build breadcrumbs.
+
+        After applying local validation, the function forwards ``links`` and
+        ``active_text`` to ``_HTML_RENDERER.build_breadcrumbs`` and preserves
+        its return and exception contract.
 
         Args:
-            links (List[Tuple[str,str]]): Each tuple is (Link Text, Link Href).
-            active_text (str): The text for the active breadcrumb item (no link).
+            links: Entries supplied as ``links`` without transferring container
+                ownership.
+            active_text: Text supplied as active text in the format accepted by
+                this function.
 
         Returns:
-            str: HTML for the breadcrumbs.
+            The canonical breadcrumbs text.
         """
-        out = ['<nav aria-label="breadcrumb"><ol class="breadcrumb">']
-        for link_text, link_href in links:
-            out.append(
-                f'<li class="breadcrumb-item"><a href="{escape(link_href)}">{escape(link_text)}</a></li>'
-            )
-        out.append(
-            f'<li class="breadcrumb-item active" aria-current="page">{escape(active_text)}</li>'
-        )
-        out.append("</ol></nav>")
-        return "".join(out)
+        return _HTML_RENDERER.build_breadcrumbs(tuple(links), active_text)
 
     def _write_html_report(
         self,
@@ -1281,66 +2610,60 @@ class HTMLReportService:
         subtitle: str = None,
     ) -> str:
         """
-        Writes a complete HTML page to 'html_file_path' using the shared template,
-        and returns its relative path from self.report_dir.
+        Write HTML report.
+
+        After applying local validation, the function forwards
+        ``html_file_path``, ``page_title``, ``content``, ``page_icon``, and
+        ``back_button`` to ``replace`` and preserves its return and exception
+        contract. Success is reported only after the owning output boundary has
+        completed its required write or publication step.
 
         Args:
-            html_file_path (Path): The destination HTML path.
-            page_title (str): Title of the HTML page.
-            content (str): The body content for the page.
-            page_icon (str, optional): SVG icon HTML to display before the title.
-            back_button (dict, optional): Dict with 'url' and 'text' for back button.
-            subtitle (str, optional): Subtitle text to display under the title.
+            html_file_path: filesystem location used as the HTML file path for
+                this operation.
+            page_title: Text supplied as page title in the format accepted by
+                this function.
+            content: Text supplied as content in the format accepted by this
+                function.
+            page_icon: Optional page icon; ``None`` selects the function's
+                default behavior.
+            back_button: Optional back button; ``None`` selects the function's
+                default behavior.
+            subtitle: Optional subtitle; ``None`` selects the function's default
+                behavior.
 
         Returns:
-            str: The relative path from self.report_dir to the newly written HTML file.
+            The canonical write HTML report text.
         """
-        # Build page header - always include H1, optionally with icon and back button
-        page_header = ""
-
-        # If we have a back button, wrap in flex layout
+        back_button_model = None
         if back_button:
-            page_header = (
-                '<div class="d-flex justify-content-between align-items-center mb-4">'
+            back_button_model = BackButtonRenderModel(
+                url=back_button.get("url", "index.html"),
+                text=back_button.get("text", "← Back"),
             )
-            page_header += "<div>"
-
-        # Always add H1 with optional icon
-        page_header += "<h1>"
-        if page_icon:
-            page_header += page_icon
-        page_header += page_title
-        page_header += "</h1>"
-
-        # Add subtitle if provided
-        if subtitle:
-            page_header += f'<p class="text-muted mb-0">{subtitle}</p>'
-
-        # Close wrapper div and add back button if needed
-        if back_button:
-            page_header += "</div>"
-            back_url = back_button.get("url", "index.html")
-            back_text = back_button.get("text", "← Back")
-            page_header += (
-                f'<a href="{back_url}" class="btn btn-outline-primary">{back_text}</a>'
+        final_html = _HTML_RENDERER.render_page(
+            HTMLPageRenderModel(
+                template=self.html_header_template,
+                navbar=self.common_navbar,
+                page_title=page_title,
+                content=content,
+                page_icon=page_icon,
+                back_button=back_button_model,
+                subtitle=subtitle,
             )
-            page_header += "</div>"
-
-        # Combine page header with content
-        full_content = page_header + content
-
-        final_html = self.html_header_template.format(
-            title=page_title, navbar=self.common_navbar, content=full_content
         )
-        html_file_path.parent.mkdir(parents=True, exist_ok=True)
-        with html_file_path.open("w", encoding="utf-8") as f:
-            f.write(final_html)
+        self._publish_report_text(html_file_path, final_html)
         return os.path.relpath(html_file_path, self.report_dir).replace("\\", "/")
 
     async def _parse_collector_json_metadata(self, node_path: Path) -> None:
         """
-        For each <group>.json in node_path/metadata or node_path/.metadata, parse the collector "execution_time"
-        and store it in self.node_collector_json[node_name][group_name][collector_id].
+        Parse collector JSON metadata.
+
+        Check for both metadata and .metadata directories.
+
+        Args:
+            node_path: filesystem location used as the node path for this
+                operation.
         """
         await self._log(
             "DEBUG", f"Starting _parse_collector_json_metadata for {node_path}"
@@ -1351,7 +2674,7 @@ class HTMLReportService:
         metadata_dirs = []
         for metadata_dir_name in ["metadata", ".metadata"]:
             metadata_dir = node_path / metadata_dir_name
-            if metadata_dir.is_dir():
+            if self._report_input_is_dir(metadata_dir):
                 metadata_dirs.append(metadata_dir)
 
         if not metadata_dirs:
@@ -1363,8 +2686,16 @@ class HTMLReportService:
         # Process all metadata directories found
         # Prioritize group-specific metadata files (redfish.json, ipmi.json, etc.) over general files
         for metadata_dir in metadata_dirs:
+            metadata_files = [
+                entry.path
+                for entry in self._walk_report_inputs(
+                    metadata_dir,
+                    recursive=False,
+                )
+                if entry.is_file and entry.path.suffix == ".json"
+            ]
             # First pass: process group-specific metadata files
-            for meta_json in metadata_dir.glob("*.json"):
+            for meta_json in metadata_files:
                 group_name = meta_json.stem
                 if group_name.lower() == "metadata":
                     continue
@@ -1384,8 +2715,7 @@ class HTMLReportService:
                     self.node_collector_json[node_name][group_name] = {}
 
                 try:
-                    with meta_json.open("r", encoding="utf-8") as f:
-                        data = json.load(f)
+                    data = self._read_report_json(meta_json)
                     collectors_data = data.get("collectors", {})
                     for collector_id, cinfo in collectors_data.items():
                         raw_time = cinfo.get("execution_time", 0.0)
@@ -1397,6 +2727,9 @@ class HTMLReportService:
                         status_val = cinfo.get("status", "NotRan")
                         reason_val = cinfo.get("reason", "")
                         files_val = cinfo.get("files", [])
+                        failure_category = self._normalize_failure_category(
+                            status_val, cinfo.get("failure_category")
+                        )
                         collector_data = {
                             "execution_time_seconds": exec_seconds,
                             "status": status_val,
@@ -1406,9 +2739,13 @@ class HTMLReportService:
                             "name": cinfo.get("name", ""),
                             "files": files_val,
                         }
+                        if failure_category is not None:
+                            collector_data["failure_category"] = failure_category
                         self.node_collector_json[node_name][group_name][
                             collector_id
                         ] = collector_data
+                except ReportInputSafetyError:
+                    raise
                 except Exception as ex:
                     await self._log(
                         "ERROR",
@@ -1416,7 +2753,7 @@ class HTMLReportService:
                     )
 
             # Second pass: process general metadata files (only if collector not already processed)
-            for meta_json in metadata_dir.glob("*.json"):
+            for meta_json in metadata_files:
                 group_name = meta_json.stem
                 if group_name.lower() == "metadata":
                     continue
@@ -1435,8 +2772,7 @@ class HTMLReportService:
                     self.node_collector_json[node_name][group_name] = {}
 
                 try:
-                    with meta_json.open("r", encoding="utf-8") as f:
-                        data = json.load(f)
+                    data = self._read_report_json(meta_json)
                     collectors_data = data.get("collectors", {})
                     await self._log(
                         "DEBUG",
@@ -1460,6 +2796,9 @@ class HTMLReportService:
                         status_val = cinfo.get("status", "NotRan")
                         reason_val = cinfo.get("reason", "")
                         files_val = cinfo.get("files", [])
+                        failure_category = self._normalize_failure_category(
+                            status_val, cinfo.get("failure_category")
+                        )
                         collector_data = {
                             "execution_time_seconds": exec_seconds,
                             "status": status_val,
@@ -1469,9 +2808,13 @@ class HTMLReportService:
                             "name": cinfo.get("name", ""),
                             "files": files_val,
                         }
+                        if failure_category is not None:
+                            collector_data["failure_category"] = failure_category
                         self.node_collector_json[node_name][group_name][
                             collector_id
                         ] = collector_data
+                except ReportInputSafetyError:
+                    raise
                 except Exception as ex:
                     await self._log(
                         "ERROR",
@@ -1481,6 +2824,16 @@ class HTMLReportService:
     async def generate_reports(self) -> bool:
         """
         Main method to generate all HTML reports.
+
+        The implementation uses current instance state to main method to
+        generate all HTML reports. Owned asynchronous work is awaited before
+        return, so completion does not leave an unobserved task behind. Cleanup
+        in the ``finally`` path runs for successful, failed, and cancelled
+        execution.
+
+        Returns:
+            Whether the main method to generate all HTML reports operation
+            succeeds.
         """
         try:
             await self._log("INFO", "Generating HTML reports...")
@@ -1494,14 +2847,17 @@ class HTMLReportService:
                 ".metadata",
             }
 
-            if not self.root_dir.is_dir():
+            if not self._report_input_is_dir(self.root_dir):
                 await self._log(
                     "ERROR",
                     f"Root directory {self.root_dir} is not a directory.",
                 )
                 return False
 
-            for node in self.root_dir.iterdir():
+            self._bind_terminal_snapshot()
+            self._refresh_common_navbar_from_bound_result()
+
+            for node in self._iter_node_directories():
                 if node.is_dir() and node.name not in excluded_dirs:
                     await self._parse_collector_json_metadata(node)
                     node_report = await self._generate_node_report(node)
@@ -1514,196 +2870,142 @@ class HTMLReportService:
             await self._log("INFO", f"HTML reports generated in {self.report_dir}")
             return True
 
+        except SnapshotConsistencyError:
+            raise
+        except ReportInputSafetyError:
+            raise
         except Exception as e:
             await self._log("ERROR", f"Error generating HTML reports: {e}")
             return False
+        finally:
+            self._release_terminal_snapshot()
 
     async def _parse_execution_summary(self, file_path: Path) -> Dict:
         """
         Parses the Execution_Summary_Report.txt file.
 
+        The implementation uses ``file_path`` to parses the
+        Execution_Summary_Report.txt file. Owned asynchronous work is awaited
+        before return, so completion does not leave an unobserved task behind.
+        Filesystem effects remain confined to the caller-selected paths and the
+        owning resource lifecycle.
+
         Args:
-            file_path (Path): Path to the Execution_Summary_Report.txt file.
+            file_path: filesystem location used as the file path for this
+                operation.
 
         Returns:
-            Dict: Dictionary containing execution summary entries and log collection time.
+            The validated ``summary``.
         """
-        summary = []
-        log_collection_time = ""
-        seen_entries = set()
-
         with file_path.open("r", encoding="utf-8") as f:
             lines = f.readlines()
-            if not lines:
+
+        parsed_summary, parsed_diagnostics = parse_execution_summary_lines(lines)
+        summary = execution_summary_to_legacy_dict(parsed_summary)
+        diagnostics = summary_diagnostics_to_legacy_list(parsed_diagnostics)
+        for diagnostic in diagnostics:
+            code = diagnostic["code"]
+            if code == "empty":
                 await self._log("DEBUG", f"{file_path} is empty.")
-                return {
-                    "entries": summary,
-                    "log_collection_time": log_collection_time,
-                }
-
-            header_line = lines[0].strip()
-            headers = re.split(r"\s{2,}|\t+", header_line.lower())
-
-            possible_log_path_headers = {
-                "log path",
-                "log_paths",
-                "log_path",
-                "log paths",
-            }
-            log_path_header = None
-            for possible_header in possible_log_path_headers:
-                if possible_header in headers:
-                    log_path_header = possible_header
-                    break
-
-            if not log_path_header:
+            elif code == "missing_path_columns":
                 await self._log(
                     "ERROR",
-                    f"Log Path column not found in {file_path}. Headers: {headers}",
+                    f"Path columns not found in {file_path}. Headers: {diagnostic['headers']}",
                 )
-                return {
-                    "entries": summary,
-                    "log_collection_time": log_collection_time,
-                }
-
-            # Handle case-insensitive header matching
-            collection_name_idx = None
-            collector_id_idx = None
-            execution_status_idx = None
-
-            for i, header in enumerate(headers):
-                if "collection name" in header.lower():
-                    collection_name_idx = i
-                elif header.lower() in ["id", "collector id"]:
-                    collector_id_idx = i
-                elif "execution status" in header.lower():
-                    execution_status_idx = i
-            log_path_idx = headers.index(log_path_header)
-
-            if collection_name_idx is None or execution_status_idx is None:
+            elif code == "missing_required_columns":
                 await self._log(
                     "ERROR",
-                    f"Required columns missing in {file_path}. Headers: {headers}",
+                    f"Required columns missing in {file_path}. Headers: {diagnostic['headers']}",
                 )
-                return {
-                    "entries": summary,
-                    "log_collection_time": log_collection_time,
-                }
-
-            if collection_name_idx is None or execution_status_idx is None:
-                await self._log("ERROR", f"Required columns missing in {file_path}")
-                return {
-                    "entries": summary,
-                    "log_collection_time": log_collection_time,
-                }
-
-            for line_num, line_str in enumerate(lines[1:], start=2):
-                line_str = line_str.strip()
-                if not line_str:
-                    continue
-                if "log collection took" in line_str.lower():
-                    log_collection_time = line_str
-                    continue
-                elif "total execution time:" in line_str.lower():
-                    log_collection_time = line_str
-                    continue
-
-                parts = re.split(r"\s{2,}|\t+", line_str)
-                if len(parts) < len(headers):
-                    await self._log(
-                        "DEBUG",
-                        f"Line {line_num} in {file_path} missing columns.",
-                    )
-                    parts += [""] * (len(headers) - len(parts))
-
-                collection_name_val = parts[collection_name_idx]
-                execution_status_val = parts[execution_status_idx]
-                log_path_val = [
-                    p.strip() for p in parts[log_path_idx].split(",") if p.strip()
-                ]
-
-                # Get collector ID if available
-                collector_id_val = None
-                if collector_id_idx is not None and collector_id_idx < len(parts):
-                    collector_id_val = parts[collector_id_idx].strip()
-                    if collector_id_val == "N/A":
-                        collector_id_val = None
-
-                entry = {
-                    "collection name": collection_name_val,
-                    "execution status": execution_status_val,
-                    "log path": log_path_val,
-                    "collector_id": collector_id_val,
-                }
-                entry_tuple = (
-                    collection_name_val,
-                    execution_status_val,
-                    tuple(log_path_val),
+            elif code == "missing_columns":
+                await self._log(
+                    "DEBUG",
+                    f"Line {diagnostic['line_number']} in {file_path} missing columns.",
                 )
-                if entry_tuple not in seen_entries:
-                    summary.append(entry)
-                    seen_entries.add(entry_tuple)
-
-        return {"entries": summary, "log_collection_time": log_collection_time}
+        return summary
 
     def _combine_statuses(self, summary_status: str, json_status: str) -> str:
         """
-        Combines two status strings with priority: Error > Partial > Complete > Skipped > NotRan > Unknown.
-        If either status is "Skipped", return "Skipped" to prevent it from being counted as an error.
+        Return the combine statuses.
+
+        After applying local validation, the function forwards
+        ``summary_status`` and ``json_status`` to ``combine_execution_statuses``
+        and preserves its return and exception contract.
+
+        Args:
+            summary_status: Text supplied as summary status in the format
+                accepted by this function.
+            json_status: Text supplied as JSON status in the format accepted by
+                this function.
+
+        Returns:
+            The canonical combine statuses text.
         """
-        priority = [
-            "Error",
-            "Partial",
-            "Complete",
-            "Skipped",
-            "NotRan",
-            "Unknown",
-        ]
-        if not summary_status:
-            summary_status = "Unknown"
-        if not json_status:
-            json_status = "Unknown"
+        return combine_execution_statuses(summary_status, json_status)
 
-        s_list = summary_status.split()[0]
-        j_list = json_status.split()[0]
+    def _merge_status_and_failure_category(
+        self,
+        current_status: str,
+        current_category: Optional[str],
+        incoming_status: str,
+        incoming_category: Optional[str],
+    ) -> Tuple[str, Optional[str]]:
+        """
+        Merge an outcome while keeping the category from its worst status.
 
-        # Convert "Passed" => "Complete", "Failed" => "Error", etc.
-        j_lower = j_list.lower()
-        if j_lower == "passed":
-            j_list = "Complete"
-        elif j_lower == "failed":
-            j_list = "Error"
-        elif j_lower == "partial":
-            j_list = "Partial"
-        elif j_lower == "skipped":
-            j_list = "Skipped"
-        elif j_lower == "notran":
-            j_list = "NotRan"
+        The implementation uses ``current_status``, ``current_category``,
+        ``incoming_status``, and ``incoming_category`` to merge an outcome while
+        keeping the category from its worst status.
 
-        if s_list not in priority:
-            s_list = "Unknown"
-        if j_list not in priority:
-            j_list = "Unknown"
+        Args:
+            current_status: Text supplied as current status in the format
+                accepted by this function.
+            current_category: Text supplied as current category in the format
+                accepted by this function.
+            incoming_status: Text supplied as incoming status in the format
+                accepted by this function.
+            incoming_category: Text supplied as incoming category in the format
+                accepted by this function.
 
-        # If either status is "Skipped", return "Skipped"
-        if s_list == "Skipped" or j_list == "Skipped":
-            return "Skipped"
-
-        s_idx = priority.index(s_list)
-        j_idx = priority.index(j_list)
-        final_idx = min(s_idx, j_idx)
-        final_status = priority[final_idx]
-        if final_status.lower() == "notran":
-            final_status = "N/A"
-        return final_status
+        Returns:
+            A tuple containing ``merged status`` and ``normalize failure
+            category`` in that order.
+        """
+        merged_status = self._combine_statuses(current_status, incoming_status)
+        current_category = self._normalize_failure_category(
+            current_status, current_category
+        )
+        incoming_category = self._normalize_failure_category(
+            incoming_status, incoming_category
+        )
+        current_normalized_status = self._combine_statuses("Unknown", current_status)
+        incoming_normalized_status = self._combine_statuses("Unknown", incoming_status)
+        if current_normalized_status == incoming_normalized_status:
+            winning_category = current_category or incoming_category
+        elif merged_status == current_normalized_status:
+            winning_category = current_category
+        elif merged_status == incoming_normalized_status:
+            winning_category = incoming_category
+        else:
+            winning_category = None
+        return merged_status, self._normalize_failure_category(
+            merged_status, winning_category
+        )
 
     def _merge_error_entries_into_node_json(
         self, node_name: str, grouped_entries: Dict
     ) -> None:
         """
-        Locate ('error','logs','N/A') in grouped_entries, unify its log paths with
-        the correct collector in self.node_collector_json[node_name].
-        Skip merging error logs for collectors marked as Skipped.
+        Merge error entries into node JSON.
+
+        The implementation uses ``node_name`` and ``grouped_entries`` to merge
+        error entries into node JSON.
+
+        Args:
+            node_name: Stable node name used for lookup and operator-facing
+                diagnostics.
+            grouped_entries: Mapping supplying fields for merge error entries
+                into node JSON.
         """
         error_key = ("error", "logs", "N/A")
         error_entries = grouped_entries.get(error_key, [])
@@ -1740,10 +3042,12 @@ class HTMLReportService:
 
     def _merge_error_entries(self, grouped_entries: Dict) -> None:
         """
-        Looks for a grouped entry with key ('error', 'logs', 'N/A') and merges
-        its log paths into any collectors whose name field matches the same collection name.
-        If a match cannot be found in a real collector group, do NOT create a synthetic group (like 'dependency_check').
-        If a collector is skipped and there is an error log, append the error log path to the 'log path' for that entry.
+        Merge error entries.
+
+        Only allow real collector groups (not 'dependency_check').
+
+        Args:
+            grouped_entries: Mapping supplying fields for merge error entries.
         """
         error_key = ("error", "logs", "N/A")
         error_entry = grouped_entries.get(error_key, [])
@@ -1782,15 +3086,56 @@ class HTMLReportService:
     ) -> List[str]:
         """
         A helper that converts a single path_str into one or more HTML <a> links.
+
         Handles placeholders, directories, etc.
 
+        The implementation uses ``node_path``, ``path_str``, and
+        ``from_status_page`` to a helper that converts a single path_str into
+        one or more HTML <a> links. Owned asynchronous work is awaited before
+        return, so completion does not leave an unobserved task behind.
+
         Args:
-            node_path (Path): Path to the node directory
-            path_str (str): The path string to process
-            from_status_page (bool): If True, prepend node name to links as they're viewed from status pages
+            node_path: filesystem location used as the node path for this
+                operation.
+            path_str: Text supplied as path str in the format accepted by this
+                function.
+            from_status_page: Whether from status page is enabled or required
+                for this operation.
+
+        Returns:
+            The file links returned in operation-defined order.
         """
         results = []
         node_name = node_path.name  # Get the node name from the path
+
+        def render_file_link(file_view: str, display_text: str) -> str:
+            """
+            Render file link.
+
+            The implementation uses ``file_view`` and ``display_text`` to render
+            file link. The source value keeps its ownership while the normalized
+            representation is returned separately.
+
+            Args:
+                file_view: Text supplied as file view in the format accepted by
+                    this function.
+                display_text: Text supplied as display text in the format
+                    accepted by this function.
+
+            Returns:
+                The canonical file link text.
+            """
+            link = (
+                self._encoded_relative_report_link(node_name, file_view)
+                if from_status_page
+                else self._encoded_report_relative_path(file_view)
+            )
+            if link is None:
+                return self._escape_html_text(display_text)
+            return (
+                f'<a href="{self._escape_html_text(link)}">'
+                f"{self._escape_html_text(display_text)}</a>"
+            )
 
         # Skip strings that are clearly not file paths (e.g., error reason messages)
         # These are typically long messages containing colons and spaces, or starting with "Collector"
@@ -1813,44 +3158,50 @@ class HTMLReportService:
         # Check for placeholder pattern (e.g., "{some_dir}")
         if "{" in path_str and "}" in path_str:
             relative_path = Path(path_str.lstrip("/\\"))
-            search_dir = node_path / relative_path.parent
-            if search_dir.exists() and search_dir.is_dir():
-                for file_path in search_dir.iterdir():
-                    if file_path.is_file():
-                        relp = str(file_path.relative_to(node_path))
-                        fv = await self._generate_file_view(file_path)
-                        # Only prepend node name if viewing from status page
-                        link = (
-                            f"{escape(node_name)}/{escape(fv)}"
-                            if from_status_page
-                            else escape(fv)
-                        )
-                        results.append(f'<a href="{link}">{escape(relp)}</a>')
+            search_dir = (
+                node_path
+                if relative_path.parent == Path(".")
+                else self._safe_node_input_path(node_path, relative_path.parent)
+            )
+            if search_dir is not None and self._report_input_is_dir(search_dir):
+                for entry in self._walk_report_inputs(
+                    search_dir,
+                    recursive=False,
+                ):
+                    if entry.is_file:
+                        relp = str(entry.path.relative_to(node_path))
+                        fv = await self._generate_file_view(entry.path)
+                        results.append(render_file_link(fv, relp))
             else:
                 results.append(f"{escape(path_str)} (directory not found)")
         else:
             try:
-                abs_path = node_path / path_str.lstrip("/\\")
+                abs_path = self._safe_node_input_path(node_path, path_str)
+                if abs_path is None:
+                    results.append(
+                        f"<span class='text-muted'>{escape(path_str)}</span>"
+                    )
+                    return results
+                abs_entry = self._inspect_report_input(abs_path)
 
                 # Check if this is a tar.xz file that was auto-parsed and removed
-                if path_str.endswith(".tar.xz") and not abs_path.exists():
+                if path_str.endswith(".tar.xz") and abs_entry is None:
                     # Look for extracted directory with same base name
                     base_name = path_str[:-7]  # Remove .tar.xz
-                    extracted_dir = node_path / base_name
+                    extracted_dir = self._safe_node_input_path(node_path, base_name)
 
-                    if extracted_dir.exists() and extracted_dir.is_dir():
+                    if extracted_dir is not None and self._report_input_is_dir(
+                        extracted_dir
+                    ):
                         # List all files in the extracted directory
-                        for subfile in extracted_dir.rglob("*"):
-                            if subfile.is_file():
-                                fv = await self._generate_file_view(subfile)
-                                relp = str(subfile.relative_to(node_path))
-                                # Only prepend node name if viewing from status page
-                                link = (
-                                    f"{escape(node_name)}/{escape(fv)}"
-                                    if from_status_page
-                                    else escape(fv)
-                                )
-                                results.append(f'<a href="{link}">{escape(relp)}</a>')
+                        for entry in self._walk_report_inputs(
+                            extracted_dir,
+                            recursive=True,
+                        ):
+                            if entry.is_file:
+                                fv = await self._generate_file_view(entry.path)
+                                relp = str(entry.path.relative_to(node_path))
+                                results.append(render_file_link(fv, relp))
 
                         # If no files found, show the directory itself
                         if not results:
@@ -1858,28 +3209,19 @@ class HTMLReportService:
                     else:
                         # Original tar.xz file not found and no extracted directory
                         results.append(f"{escape(path_str)} (file not found)")
-                elif abs_path.exists():
-                    if abs_path.is_dir():
-                        for subfile in abs_path.rglob("*"):
-                            if subfile.is_file():
-                                fv = await self._generate_file_view(subfile)
-                                relp = str(subfile.relative_to(node_path))
-                                # Only prepend node name if viewing from status page
-                                link = (
-                                    f"{escape(node_name)}/{escape(fv)}"
-                                    if from_status_page
-                                    else escape(fv)
-                                )
-                                results.append(f'<a href="{link}">{escape(relp)}</a>')
-                    else:
+                elif abs_entry is not None:
+                    if abs_entry.is_dir:
+                        for entry in self._walk_report_inputs(
+                            abs_path,
+                            recursive=True,
+                        ):
+                            if entry.is_file:
+                                fv = await self._generate_file_view(entry.path)
+                                relp = str(entry.path.relative_to(node_path))
+                                results.append(render_file_link(fv, relp))
+                    elif abs_entry.is_file:
                         fv = await self._generate_file_view(abs_path)
-                        # Only prepend node name if viewing from status page
-                        link = (
-                            f"{escape(node_name)}/{escape(fv)}"
-                            if from_status_page
-                            else escape(fv)
-                        )
-                        results.append(f'<a href="{link}">{escape(path_str)}</a>')
+                        results.append(render_file_link(fv, path_str))
                 else:
                     # not found
                     results.append(f"{escape(path_str)}")
@@ -1898,239 +3240,190 @@ class HTMLReportService:
         node_execution_seconds: float = None,
     ) -> str:
         """
-        Renders Node name, log collection time, system details, collector groups, and categorized file listings.
-        """
-        # Node Info Card
-        left_html = f"""
-        <div class="card mb-3">
-            <div class="card-body">
-                <h4>Node: {escape(node_name)}</h4>
-        """
+        Build left column for node.
 
-        # Use corrected execution time if available, otherwise fall back to log_collection_time
-        if node_execution_seconds is not None and node_execution_seconds > 0:
-            left_html += f"<p><strong>Total execution time: {node_execution_seconds:.3f}s</strong></p>"
-        elif log_collection_time:
-            left_html += f"<p><strong>{escape(log_collection_time)}</strong></p>"
+        After applying local validation, the function forwards ``node_name``,
+        ``node_path``, ``log_collection_time``, and ``node_execution_seconds``
+        to ``_HTML_NODE_SIDEBAR.render`` and preserves its return and exception
+        contract. Owned asynchronous work is awaited before return, so
+        completion does not leave an unobserved task behind. Filesystem effects
+        remain confined to the caller-selected paths and the owning resource
+        lifecycle.
 
-        # Insert system details snippet
-        left_html += self._build_system_details_html(node_name)
-        left_html += """
-            </div>
-        </div>
+        Args:
+            node_name: Stable node name used for lookup and operator-facing
+                diagnostics.
+            node_path: filesystem location used as the node path for this
+                operation.
+            log_collection_time: Text supplied as log collection time in the
+                format accepted by this function.
+            node_execution_seconds: Maximum duration in seconds allowed for node
+                execution seconds.
+
+        Returns:
+            The canonical left column for node text.
         """
-
-        # --- Collector Groups Links ---
+        system_details_html = self._build_system_details_html(node_name)
         collector_groups = self._get_collector_groups(node_path)
-        if collector_groups:
-            left_html += """
-            <div class="card mb-3">
-                <div class="card-body">
-                    <h5>Collector Groups</h5>
-                    <ul class="list-unstyled">
-            """
-            node_report_dir = self.report_dir / node_name
-            for group_folder in collector_groups:
-                # Only generate link if the directory actually exists
-                if group_folder.is_dir():
-                    group_name = group_folder.name
-                    group_report_filename = f"{group_name}_report.html"
-                    group_report_path = node_report_dir / group_report_filename
-                    # Generate that group page if not already done (might be redundant but safe)
-                    await self._generate_collector_group_report(
-                        group_folder, node_path, group_report_path
-                    )
-                    rel_group_rep = os.path.relpath(
-                        group_report_path, node_report_dir
-                    ).replace("\\", "/")
-                    left_html += f'<li><a href="{escape(rel_group_rep)}" class="d-block py-1"><i class="bi bi-folder"></i> {escape(group_name)}</a></li>'
-            left_html += """
-                    </ul>
-                </div>
-            </div>
-            """
+        collector_links: List[NodeSidebarLink] = []
+        node_report_dir = self.report_dir / node_name
+        for group_folder in collector_groups:
+            if not group_folder.is_dir():
+                continue
+            group_name = group_folder.name
+            group_report_path = node_report_dir / f"{group_name}_report.html"
+            await self._generate_collector_group_report(
+                group_folder, node_path, group_report_path
+            )
+            relative_report = os.path.relpath(
+                group_report_path, node_report_dir
+            ).replace("\\", "/")
+            collector_links.append(
+                NodeSidebarLink(
+                    href=relative_report,
+                    display_text=group_name,
+                    icon="bi-folder",
+                )
+            )
 
-        # --- Categorize all files within the node directory recursively ---
         all_files = [
             f for f in node_path.rglob("*") if f.is_file() and "reports" not in f.parts
         ]
-
-        metadata_files_found = []
-        config_files_found = []
-        runtime_logs_found = []
-        error_logs_found = []
-        misc_files_found = []
         collector_group_dirs = {gp.name for gp in collector_groups if gp.is_dir()}
+        inventory = _HTML_NODE_SIDEBAR.classify_files(
+            node_path=node_path,
+            files=all_files,
+            collector_group_names=frozenset(collector_group_dirs),
+            node_config_names=frozenset(self.node_config_files),
+            runtime_log_names=frozenset(self.runtime_log_files),
+        )
 
-        for f in all_files:
-            relative_parts = f.relative_to(node_path).parts
-            # Check parent directories first
-            if len(relative_parts) > 1:
-                parent_dir_name = relative_parts[0]
-                if parent_dir_name in ["metadata", ".metadata"]:
-                    metadata_files_found.append(f)
-                    continue
-                if parent_dir_name == "error-logs" or parent_dir_name == "error_logs":
-                    error_logs_found.append(f)
-                    continue
-                # Exclude files within actual collector group directories from file lists
-                # unless they are explicitly runtime/config logs we want to show.
-                if (
-                    parent_dir_name in collector_group_dirs
-                    and f.name not in self.node_config_files
-                    and f.name not in self.runtime_log_files
-                ):
-                    continue
-
-            # Check file names for specific categories
-            if f.name in self.node_config_files:
-                config_files_found.append(f)
-            elif f.name in self.runtime_log_files:
-                runtime_logs_found.append(f)
-            # If not categorized above and not excluded, it's misc
-            elif (
-                len(relative_parts) == 1
-            ):  # Only consider files at the root as potentially misc
-                misc_files_found.append(f)
-
-        # --- Render Node Metadata Files ---
-        if metadata_files_found:
-            left_html += """
-            <div class="card mb-3">
-                <div class="card-body">
-                    <h5>Node Metadata Files</h5>
+        async def file_link(
+            path: Path, display_text: str, icon: str
+        ) -> NodeSidebarLink:
             """
+            Return the file link.
 
-            # Group metadata files by their subdirectory structure
-            metadata_groups = {}
-            standalone_metadata = []
+            After applying local validation, the function forwards ``path``,
+            ``display_text``, and ``icon`` to ``NodeSidebarLink`` and preserves
+            its return and exception contract. Owned asynchronous work is
+            awaited before return, so completion does not leave an unobserved
+            task behind.
 
-            for mf in metadata_files_found:
-                relative_path = mf.relative_to(node_path)
-                relative_parts = relative_path.parts
+            Args:
+                path: filesystem location used as the path for this operation.
+                display_text: Text supplied as display text in the format
+                    accepted by this function.
+                icon: Text supplied as icon in the format accepted by this
+                    function.
 
-                # Replace .metadata with metadata on display
-                display_path = str(relative_path).replace(".metadata", "metadata")
+            Returns:
+                A ``NodeSidebarLink`` representing file link.
+            """
+            return NodeSidebarLink(
+                href=await self._generate_file_view(path),
+                display_text=display_text,
+                icon=icon,
+            )
 
-                if (
-                    len(relative_parts) > 2
-                ):  # Has subdirectory structure like metadata/detection_logs/file.json
-                    group_name = relative_parts[1]  # e.g., "detection_logs"
-                    if group_name not in metadata_groups:
-                        metadata_groups[group_name] = []
-                    metadata_groups[group_name].append((mf, display_path))
-                else:  # Standalone metadata file like metadata/file.json
-                    standalone_metadata.append((mf, display_path))
+        metadata_paths: Dict[str, List[Tuple[Path, str]]] = {}
+        standalone_metadata_paths: List[Tuple[Path, str]] = []
+        for path in inventory.metadata_files:
+            display_path = _HTML_NODE_SIDEBAR.metadata_display_path(node_path, path)
+            group_name = _HTML_NODE_SIDEBAR.metadata_group_name(node_path, path)
+            if group_name is None:
+                standalone_metadata_paths.append((path, display_path))
+            else:
+                metadata_paths.setdefault(group_name, []).append((path, display_path))
 
-            # Render grouped metadata files
-            for group_name in sorted(metadata_groups.keys()):
-                group_files = metadata_groups[group_name]
-                # Use a more readable group name
-                readable_group_name = group_name.replace("_", " ").title()
-                left_html += (
-                    f"<h6>{escape(readable_group_name)}</h6><ul class='list-unstyled'>"
+        metadata_groups: List[NodeSidebarLinkGroup] = []
+        for group_name in sorted(metadata_paths):
+            links = tuple(
+                [
+                    await file_link(path, display_path, "bi-file-earmark")
+                    for path, display_path in sorted(
+                        metadata_paths[group_name], key=lambda item: item[1]
+                    )
+                ]
+            )
+            metadata_groups.append(NodeSidebarLinkGroup(group_name, links))
+
+        standalone_metadata = tuple(
+            [
+                await file_link(path, display_path, "bi-file-earmark")
+                for path, display_path in sorted(
+                    standalone_metadata_paths, key=lambda item: item[1]
                 )
-                for mf, display_path in sorted(group_files, key=lambda x: x[1]):
-                    file_view = await self._generate_file_view(mf)
-                    left_html += f'<li><a href="{escape(file_view)}" class="d-block py-1"><i class="bi bi-file-earmark"></i> {escape(display_path)}</a></li>'
-                left_html += "</ul>"
+            ]
+        )
 
-            # Render standalone metadata files
-            if standalone_metadata:
-                left_html += "<h6>General Metadata</h6><ul class='list-unstyled'>"
-                for mf, display_path in sorted(standalone_metadata, key=lambda x: x[1]):
-                    file_view = await self._generate_file_view(mf)
-                    left_html += f'<li><a href="{escape(file_view)}" class="d-block py-1"><i class="bi bi-file-earmark"></i> {escape(display_path)}</a></li>'
-                left_html += "</ul>"
+        config_links = tuple(
+            [
+                await file_link(
+                    path,
+                    str(path.relative_to(node_path)),
+                    "bi-file-earmark-text",
+                )
+                for path in sorted(inventory.config_files, key=lambda item: item.name)
+            ]
+        )
+        runtime_links = tuple(
+            [
+                await file_link(path, str(path.relative_to(node_path)), "bi-file-text")
+                for path in sorted(inventory.runtime_logs, key=lambda item: item.name)
+            ]
+        )
+        error_links = tuple(
+            [
+                await file_link(
+                    path,
+                    str(path.relative_to(node_path)),
+                    "bi-exclamation-triangle",
+                )
+                for path in sorted(
+                    inventory.error_logs,
+                    key=_HTML_NODE_SIDEBAR.error_log_sort_key,
+                )
+            ]
+        )
+        misc_links = tuple(
+            [
+                await file_link(path, path.name, "bi-file")
+                for path in sorted(inventory.misc_files, key=lambda item: item.name)
+            ]
+        )
 
-            left_html += """
-                </div>
-            </div>
-            """
-
-        # --- Render Node Config Files ---
-        if config_files_found:
-            left_html += """
-            <div class="card mb-3">
-                <div class="card-body">
-                    <h5>Node Config</h5>
-                    <ul class='list-unstyled'>
-            """
-            for cf in sorted(config_files_found, key=lambda x: x.name):
-                file_view = await self._generate_file_view(cf)
-                relative_display = str(cf.relative_to(node_path))
-                left_html += f'<li><a href="{escape(file_view)}" class="d-block py-1"><i class="bi bi-file-earmark-text"></i> {escape(relative_display)}</a></li>'
-            left_html += """
-                    </ul>
-                </div>
-            </div>
-            """
-
-        # --- Render Runtime Logs ---
-        if runtime_logs_found:
-            left_html += """
-            <div class="card mb-3">
-                <div class="card-body">
-                    <h5>Runtime Logs</h5>
-                    <ul class='list-unstyled'>
-            """
-            for rf in sorted(runtime_logs_found, key=lambda x: x.name):
-                file_view = await self._generate_file_view(rf)
-                relative_display = str(rf.relative_to(node_path))
-                left_html += f'<li><a href="{escape(file_view)}" class="d-block py-1"><i class="bi bi-file-text"></i> {escape(relative_display)}</a></li>'
-            left_html += """
-                    </ul>
-                </div>
-            </div>
-            """
-
-        # --- Render Error Logs ---
-        if error_logs_found:
-            left_html += """
-            <div class="card mb-3">
-                <div class="card-body">
-                    <h5>Error Logs</h5>
-                    <ul class='list-unstyled'>
-            """
-
-            # Define sorting key inside here if only used here
-            def alphanumeric_sort_key(filepath):
-                parts = re.split(r"(\d+)", filepath.name)
-                return [int(part) if part.isdigit() else part for part in parts]
-
-            for ef in sorted(error_logs_found, key=alphanumeric_sort_key):
-                fv = await self._generate_file_view(ef)
-                relative_display = str(ef.relative_to(node_path))
-                left_html += f'<li><a href="{escape(fv)}" class="d-block py-1"><i class="bi bi-exclamation-triangle"></i> {escape(relative_display)}</a></li>'
-            left_html += """
-                    </ul>
-                </div>
-            </div>
-            """
-
-        # --- Render Misc Files (only those at the node root) ---
-        if misc_files_found:
-            left_html += """
-            <div class="card mb-3">
-                <div class="card-body">
-                    <h5>Misc Files</h5>
-                    <ul class='list-unstyled'>
-            """
-            for misc_f in sorted(misc_files_found, key=lambda x: x.name):
-                file_view = await self._generate_file_view(misc_f)
-                # For misc files at root, just show the name
-                left_html += f'<li><a href="{escape(file_view)}" class="d-block py-1"><i class="bi bi-file"></i> {escape(misc_f.name)}</a></li>'
-            left_html += """
-                    </ul>
-                </div>
-            </div>
-            """
-
-        return left_html
+        return _HTML_NODE_SIDEBAR.render(
+            NodeSidebarRenderModel(
+                node_name=node_name,
+                log_collection_time=log_collection_time,
+                node_execution_seconds=node_execution_seconds,
+                system_details_html=system_details_html,
+                show_collector_groups=bool(collector_groups),
+                collector_groups=tuple(collector_links),
+                metadata_groups=tuple(metadata_groups),
+                standalone_metadata=standalone_metadata,
+                config_files=config_links,
+                runtime_logs=runtime_links,
+                error_logs=error_links,
+                misc_files=misc_links,
+            )
+        )
 
     async def _generate_node_report(self, node_path: Path) -> Optional[Path]:
         """
         Generates an HTML report for a single node.
+
+        For nvdebug, we'll create a simple execution summary if the file doesn't
+        exist.
+
+        Args:
+            node_path: filesystem location used as the node path for this
+                operation.
+
+        Returns:
+            The validated ``node_report_path``, or ``None`` when no value
+            qualifies.
         """
         node_name = node_path.name
         summary_file = node_path / "Execution_Summary_Report.txt"
@@ -2306,6 +3599,7 @@ class HTMLReportService:
                     # Collector doesn't exist - add it
                     # Get status from JSON if available
                     status = "Unknown"
+                    failure_category = None
                     if (
                         group_name_orig in node_json_data
                         or group_name_orig.lower() in node_json_data
@@ -2315,21 +3609,27 @@ class HTMLReportService:
                             node_json_data.get(group_name_orig.lower(), {}),
                         )
                         if c_id.lower() in group_json:
-                            status = group_json[c_id.lower()].get("status", "Unknown")
+                            collector_info = group_json[c_id.lower()]
+                            status = collector_info.get("status", "Unknown")
+                            failure_category = self._normalize_failure_category(
+                                status,
+                                collector_info.get("failure_category"),
+                            )
 
+                    disk_entry = {
+                        "collection name": f"{group_cap}_{c_id}_{c_name}",
+                        "execution status": status,
+                        "log path": log_paths,
+                        "id": c_id,
+                        "name": c_name,
+                        "group": group_name_orig,
+                    }
+                    if failure_category is not None:
+                        disk_entry["failure_category"] = failure_category
                     grouped_entries.setdefault(
                         (group_cap, c_id, c_name),
                         [],
-                    ).append(
-                        {
-                            "collection name": f"{group_cap}_{c_id}_{c_name}",
-                            "execution status": status,
-                            "log path": log_paths,
-                            "id": c_id,
-                            "name": c_name,
-                            "group": group_name_orig,
-                        }
-                    )
+                    ).append(disk_entry)
 
         # Handle collectors present in JSON but missing from the text summary
         requested_collector_ids = getattr(self, "requested_collector_ids", None)
@@ -2388,6 +3688,20 @@ class HTMLReportService:
                             found_any = True
                             break
                     if not found_any:
+                        json_status = info_dict.get("status", "NotRan")
+                        json_entry = {
+                            "collection name": f"{group_cap}_{collector_id}_{info_dict.get('name', 'N/A')}",
+                            "execution status": json_status,
+                            "log path": info_dict.get("log path", []),
+                            "id": info_dict.get("id", ""),
+                            "name": info_dict.get("name", ""),
+                            "group": info_dict.get("group_name", ""),
+                        }
+                        failure_category = self._normalize_failure_category(
+                            json_status, info_dict.get("failure_category")
+                        )
+                        if failure_category is not None:
+                            json_entry["failure_category"] = failure_category
                         grouped_entries.setdefault(
                             (
                                 group_cap,
@@ -2395,16 +3709,7 @@ class HTMLReportService:
                                 info_dict.get("name", "N/A"),
                             ),
                             [],
-                        ).append(
-                            {
-                                "collection name": f"{group_cap}_{collector_id}_{info_dict.get('name', 'N/A')}",
-                                "execution status": info_dict.get("status", "NotRan"),
-                                "log path": info_dict.get("log path", []),
-                                "id": info_dict.get("id", ""),
-                                "name": info_dict.get("name", ""),
-                                "group": info_dict.get("group_name", ""),
-                            }
-                        )
+                        ).append(json_entry)
         else:
             await self._log(
                 "DEBUG",
@@ -2452,6 +3757,17 @@ class HTMLReportService:
         )
 
         def _group_sort_key(g: str) -> int:
+            """
+            Return the group sort key.
+
+            The implementation uses ``g`` to produce the group sort key.
+
+            Args:
+                g: Text supplied as g in the format accepted by this function.
+
+            Returns:
+                The numeric group sort key value.
+            """
             glower = g.lower()
             if glower in self.known_collector_groups:
                 capital = self.known_collector_groups[glower]
@@ -2478,6 +3794,7 @@ class HTMLReportService:
             <th>Collector Name</th>
             <th>Collector Exec Time</th>
             <th>Execution Status</th>
+            <th>Failure Category</th>
             <th>Log Size</th>
             <th>Log Path(s)</th>
             </tr>
@@ -2506,17 +3823,30 @@ class HTMLReportService:
             if cg == "N/A" and cid == "N/A" and cname == "N/A" and not all_log_paths:
                 continue
             worst_status = "Unknown"
+            failure_category = None
             log_paths_collected = []
+            summary_durations = []
+            summary_reason = ""
             for ent in entries:
-                worst_status = self._combine_statuses(
-                    worst_status, ent["execution status"]
+                worst_status, failure_category = (
+                    self._merge_status_and_failure_category(
+                        worst_status,
+                        failure_category,
+                        ent["execution status"],
+                        ent.get("failure_category"),
+                    )
                 )
                 log_paths_collected.extend(ent["log path"])
+                if ent.get("duration_seconds") is not None:
+                    summary_durations.append(float(ent["duration_seconds"]))
+                if not summary_reason and ent.get("reason"):
+                    summary_reason = str(ent["reason"])
 
             # JSON execution time (if any)
             j_exec_time = 0.0
             j_reason = ""
             j_status = ""
+            j_failure_category = None
             group_json = None
 
             for g_lc, c_map in node_json_data.items():
@@ -2528,18 +3858,41 @@ class HTMLReportService:
                     if c_lc.lower() == cid.lower():
                         j_exec_time = c_info.get("execution_time_seconds", 0.0)
                         j_reason = c_info.get("reason", "")
-                        if c_info.get("status", "").lower() == "skipped":
+                        status_value = str(c_info.get("status", ""))
+                        normalized_status = status_value.lower()
+                        if normalized_status == "skipped":
                             j_status = "Skipped"
+                        elif normalized_status in {"degraded", "partial"}:
+                            # These usable failure-bearing states commonly own an
+                            # error-log artifact. The artifact is evidence for the
+                            # terminal state; it must not upgrade that state to Error.
+                            j_status = status_value
                         elif c_info.get("error_log_paths"):
                             j_status = "Error"
                         else:
-                            j_status = c_info.get("status", "NotRan")
+                            j_status = status_value or "NotRan"
+                        j_failure_category = c_info.get("failure_category")
                         break
 
-            worst_status = self._combine_statuses(worst_status, j_status)
+            worst_status, failure_category = self._merge_status_and_failure_category(
+                worst_status,
+                failure_category,
+                j_status,
+                j_failure_category,
+            )
             if cg.lower() == "error":
+                if self._combine_statuses("Unknown", worst_status) != "Error":
+                    failure_category = None
                 worst_status = "Error"
-            final_exec_time = max(0.0, j_exec_time)
+                failure_category = self._normalize_failure_category(
+                    worst_status, failure_category
+                )
+            final_exec_time = max(
+                0.0,
+                max(summary_durations) if summary_durations else j_exec_time,
+            )
+            if not j_reason:
+                j_reason = summary_reason
             collector_exec_time_str = self._format_time(final_exec_time)
 
             if worst_status.lower() in ("notran", "n/a", "skipped") and j_reason:
@@ -2562,9 +3915,9 @@ class HTMLReportService:
             is_preexecution_filtered = self._is_preexecution_filtered_reason(j_reason)
             if not is_preexecution_filtered:
                 for log_path in log_paths_collected:
-                    if isinstance(log_path, str) and self._is_preexecution_filtered_reason(
-                        log_path
-                    ):
+                    if isinstance(
+                        log_path, str
+                    ) and self._is_preexecution_filtered_reason(log_path):
                         is_preexecution_filtered = True
                         break
 
@@ -2599,7 +3952,7 @@ class HTMLReportService:
             for pstr in log_paths_collected:
                 link_objs.extend(await self._build_file_links(node_path, pstr))
 
-            modal_id = f"logModal_{node_name}_{cid}_{idx}"
+            modal_id = self._generate_safe_id("logModal", f"{node_name}_{cid}_{idx}")
             log_path_display = self._render_link_list_with_modal(
                 link_objs,
                 self.log_path_threshold,
@@ -2619,6 +3972,7 @@ class HTMLReportService:
             <td>{escape(cname)}</td>
             <td data-sort="{final_exec_time}">{escape(collector_exec_time_str)}</td>
             <td class="{status_class}">{escape(worst_status)}</td>
+            <td>{escape(failure_category or "N/A")}</td>
             <td data-sort="{log_size}">{log_size_str}</td>
             <td>{log_path_display}</td>
             </tr>
@@ -2632,6 +3986,7 @@ class HTMLReportService:
                     "Collector Name": cname,
                     "Collector Exec Time": collector_exec_time_str,
                     "Execution Status": worst_status,
+                    "Failure Category": failure_category or "",
                     "Log Size": log_size_str,
                     "NodePath": node_path,
                     "Log Path(s)": log_paths_collected,
@@ -2640,7 +3995,7 @@ class HTMLReportService:
 
         # Check if no rows were shown due to filtering
         if not any_rows_shown_in_node_report and self.hide_na_status:
-            es_table += '<tr><td colspan="7" style="text-align: center;">No collections were found in collector map for this group.</td></tr>'
+            es_table += '<tr><td colspan="8" style="text-align: center;">No collections were found in collector map for this group.</td></tr>'
 
         es_table += "</tbody></table>"
 
@@ -2649,6 +4004,8 @@ class HTMLReportService:
             node_status = "Error"
         elif any(s == "Partial" for s in all_node_statuses):
             node_status = "Partial"
+        elif any(s == "Degraded" for s in all_node_statuses):
+            node_status = "Degraded"
         elif all(s == "Complete" for s in all_node_statuses):
             node_status = "Complete"
         elif any(s == "Skipped" for s in all_node_statuses):
@@ -2674,11 +4031,8 @@ class HTMLReportService:
         # Write dependencies.txt for this DUT (plain-text summary)
         dependencies_text = self._build_dependency_text_table(node_path)
         if dependencies_text:
-            try:
-                dependencies_path = node_path / "dependencies.txt"
-                dependencies_path.write_text(dependencies_text, encoding="utf-8")
-            except Exception:
-                pass
+            dependencies_path = node_report_dir / "dependencies.txt"
+            self._publish_report_text(dependencies_path, dependencies_text)
 
         # Build right column content with all tables
         main_content = f"""
@@ -2709,20 +4063,23 @@ class HTMLReportService:
         """
         Calculate total size of log files for a specific collector.
 
+        Track dirs and files separately to avoid double counting.
+
         Args:
-            node_path (Path): Path to the node directory
-            log_paths (List[str]): List of log file paths relative to node_path
+            node_path: filesystem location used as the node path for this
+                operation.
+            log_paths: Filesystem locations processed in caller-provided order.
 
         Returns:
-            int: Total size in bytes
+            The validated ``total``.
         """
         total = 0
         # Track dirs and files separately to avoid double counting
-        dir_paths: List[str] = []
-        file_paths: List[str] = []
+        dir_paths: List[Path] = []
+        file_paths: List[Path] = []
         for log_path in log_paths:
             # Skip if the path is a reason message (not a valid file path)
-            if not log_path:
+            if not isinstance(log_path, str) or not log_path:
                 continue
             # Skip paths that are too long (likely error messages)
             if len(log_path) > 255:
@@ -2741,45 +4098,63 @@ class HTMLReportService:
             if not clean_path:
                 continue
 
-            full_path = node_path / clean_path
-            if full_path.exists():
-                if full_path.is_file():
-                    file_paths.append(os.path.abspath(str(full_path)))
-                elif full_path.is_dir():
-                    dir_paths.append(os.path.abspath(str(full_path)))
+            try:
+                full_path = self._safe_node_input_path(node_path, clean_path)
+                if full_path is None:
+                    continue
+                entry = self._inspect_report_input(full_path)
+            except (OSError, ReportInputSafetyError):
+                continue
+            if entry is not None and entry.is_file:
+                file_paths.append(full_path)
+            elif entry is not None and entry.is_dir:
+                dir_paths.append(full_path)
 
         # Collect files from directories
-        counted_files = set()
+        counted_files: Dict[Path, int] = {}
         for dir_path in dir_paths:
             try:
-                for root, _, files in os.walk(dir_path):
-                    for f in files:
-                        file_path = os.path.join(root, f)
-                        counted_files.add(os.path.abspath(file_path))
-            except Exception:
-                pass
+                entries = self._walk_report_inputs(dir_path, recursive=True)
+            except (OSError, ReportInputSafetyError):
+                continue
+            for entry in entries:
+                if entry.is_file:
+                    counted_files[entry.path] = entry.metadata.st_size
 
         # Add explicit files that are not already covered by a directory
         for file_path in file_paths:
-            if any(
-                file_path.startswith(dir_path + os.sep) or file_path == dir_path
-                for dir_path in dir_paths
-            ):
+            if any(file_path.is_relative_to(dir_path) for dir_path in dir_paths):
                 continue
-            counted_files.add(file_path)
+            try:
+                entry = self._inspect_report_input(file_path)
+            except (OSError, ReportInputSafetyError):
+                continue
+            if entry is not None and entry.is_file:
+                counted_files[file_path] = entry.metadata.st_size
 
         # Sum sizes (one pass, unique files only)
-        for file_path in counted_files:
-            try:
-                total += os.path.getsize(file_path)
-            except Exception:
-                pass
+        for size in counted_files.values():
+            total += size
         return total
 
     def _build_preflight_status_cell(self, check_type: str, check_info: dict) -> tuple:
         """
         Build a single preflight check cell with icon and modal.
+
         Returns (cell_html, modal_html)
+
+        The implementation uses ``check_type`` and ``check_info`` to build a
+        single preflight check cell with icon and modal.
+
+        Args:
+            check_type: Text supplied as check type in the format accepted by
+                this function.
+            check_info: Mapping supplying fields for single preflight check cell
+                with icon and modal.
+
+        Returns:
+            A tuple containing ``cell HTML`` and ``modal content`` in that
+            order.
         """
         status = check_info.get("status", "Unknown")
         reason = check_info.get("reason", "")
@@ -2825,6 +4200,18 @@ class HTMLReportService:
     def _build_dependency_row(self, collector_id: str, collector_info: dict) -> str:
         """
         Build a single dependency check row.
+
+        The implementation uses ``collector_id`` and ``collector_info`` to build
+        a single dependency check row.
+
+        Args:
+            collector_id: Stable collector identifier used to correlate
+                configuration, logs, and results.
+            collector_info: Mapping supplying fields for single dependency check
+                row.
+
+        Returns:
+            The canonical dependency row text.
         """
         collector_name = collector_info.get("name", "")
         dependencies = collector_info.get("dependencies", [])
@@ -2868,7 +4255,18 @@ class HTMLReportService:
         self, node_path: Path, group_name: str = None
     ) -> str:
         """
-        Build HTML table for preflight checks. If group_name is provided, only show that group's check.
+        Build HTML table for preflight checks.
+
+        If group_name is provided, only show that group's check.
+
+        Args:
+            node_path: filesystem location used as the node path for this
+                operation.
+            group_name: Stable group name used for lookup and operator-facing
+                diagnostics.
+
+        Returns:
+            The canonical preflight table text.
         """
         # Check for preflight.json in both metadata and .metadata directories
         preflight_json = None
@@ -2897,9 +4295,7 @@ class HTMLReportService:
                 "host": "HOST",
             }
 
-            # Add Bootstrap Icons CSS
             table = """
-            <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
             <h3>Preflight Checks</h3>
             <table class='table table-striped table-bordered table-shadow'>
             <thead class='table-dark'>
@@ -2909,7 +4305,7 @@ class HTMLReportService:
             node_name = node_path.name
 
             # Create dependency check modal
-            dependency_modal_id = f"dependency_modal_{node_name}"
+            dependency_modal_id = self._generate_safe_id("dependency_modal", node_name)
             dependency_modal = self._build_modal_html(
                 dependency_modal_id,
                 f"Dependency Checks: {node_name}",
@@ -3001,7 +4397,18 @@ class HTMLReportService:
         self, node_path: Path, group_name: str = None
     ) -> str:
         """
-        Build HTML table for dependency checks. If group_name is provided, only show that group's checks.
+        Build HTML table for dependency checks.
+
+        If group_name is provided, only show that group's checks.
+
+        Args:
+            node_path: filesystem location used as the node path for this
+                operation.
+            group_name: Stable group name used for lookup and operator-facing
+                diagnostics.
+
+        Returns:
+            The canonical dependency table text.
         """
         # Check for dependency_check.json in both metadata and .metadata directories
         dependency_json = None
@@ -3101,12 +4508,18 @@ class HTMLReportService:
         """
         Build plain-text table for dependency checks.
 
+        The implementation uses ``node_path`` and ``group_name`` to build
+        plain-text table for dependency checks. Filesystem effects remain
+        confined to the caller-selected paths and the owning resource lifecycle.
+
         Args:
-            node_path: DUT directory path.
-            group_name: Optional group filter (redfish/ipmi/ssh/host/health_check).
+            node_path: filesystem location used as the node path for this
+                operation.
+            group_name: Stable group name used for lookup and operator-facing
+                diagnostics.
 
         Returns:
-            Plain-text table string.
+            The canonical dependency text table text.
         """
         dependency_json = None
         for metadata_dir_name in ["metadata", ".metadata"]:
@@ -3130,10 +4543,27 @@ class HTMLReportService:
             node_execution_data = self.node_collector_json.get(node_name, {})
 
             def _was_executed(collector_id: str) -> bool:
+                """
+                Return the was executed.
+
+                The implementation uses ``collector_id`` to produce the was
+                executed.
+
+                Args:
+                    collector_id: Stable collector identifier used to correlate
+                        configuration, logs, and results.
+
+                Returns:
+                    Whether the was executed operation succeeds.
+                """
                 for group_data in node_execution_data.values():
                     if collector_id in group_data:
                         status = group_data[collector_id].get("status", "")
-                        if status and status.lower() not in ["notran", "n/a", ""]:
+                        if status and status.lower() not in [
+                            "notran",
+                            "n/a",
+                            "",
+                        ]:
                             return True
                 return False
 
@@ -3157,6 +4587,19 @@ class HTMLReportService:
                 )
 
             def _status_text(status: str) -> str:
+                """
+                Map one dependency status to its report-table label.
+
+                The implementation uses ``status`` to map one dependency status
+                to its report-table label.
+
+                Args:
+                    status: Text supplied as status in the format accepted by
+                        this function.
+
+                Returns:
+                    The canonical status text.
+                """
                 if status.lower() == "passed":
                     return "OK"
                 if status.lower() == "skipped":
@@ -3192,10 +4635,33 @@ class HTMLReportService:
                     widths[idx] = max(widths[idx], len(value))
 
             def _separator() -> str:
+                """
+                Return the separator.
+
+                The implementation uses current instance state to produce the
+                separator.
+
+                Returns:
+                    The canonical separator text.
+                """
                 parts = ["-" * (width + 2) for width in widths]
                 return f"+{'+'.join(parts)}+"
 
             def _format_row(values: List[str]) -> str:
+                """
+                Format row.
+
+                The implementation uses ``values`` to format row. The source
+                value keeps its ownership while the normalized representation is
+                returned separately.
+
+                Args:
+                    values: Entries supplied as ``values`` without transferring
+                        container ownership.
+
+                Returns:
+                    The canonical row text.
+                """
                 padded = [values[i].ljust(widths[i]) for i in range(len(values))]
                 return f"| {' | '.join(padded)} |"
 
@@ -3211,7 +4677,22 @@ class HTMLReportService:
         self, node_path: Path, group_name: str
     ) -> str:
         """
-        Build HTML table for a specific group's preflight check
+        Build HTML table for a specific group's preflight check.
+
+        The implementation uses ``node_path`` and ``group_name`` to build HTML
+        table for a specific group's preflight check. Owned asynchronous work is
+        awaited before return, so completion does not leave an unobserved task
+        behind. Filesystem effects remain confined to the caller-selected paths
+        and the owning resource lifecycle.
+
+        Args:
+            node_path: filesystem location used as the node path for this
+                operation.
+            group_name: Stable group name used for lookup and operator-facing
+                diagnostics.
+
+        Returns:
+            The canonical group preflight table text.
         """
         # Check for preflight.json in both metadata and .metadata directories
         preflight_json = None
@@ -3248,9 +4729,7 @@ class HTMLReportService:
             status = check_info.get("status", "Unknown")
             reason = check_info.get("reason", "")
 
-            # Add Bootstrap Icons CSS
             table = """
-            <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
             <h3>Preflight Check</h3>
             <table class='table table-striped table-bordered table-shadow'>
             <thead class='table-dark'>
@@ -3316,7 +4795,18 @@ class HTMLReportService:
         self, node_path: Path, group_name: str
     ) -> str:
         """
-        Build HTML table for dependency checks specific to a collector group
+        Build HTML table for dependency checks specific to a collector group.
+
+        Filter collectors by group and those that have dependencies.
+
+        Args:
+            node_path: filesystem location used as the node path for this
+                operation.
+            group_name: Stable group name used for lookup and operator-facing
+                diagnostics.
+
+        Returns:
+            The canonical group dependency table text.
         """
         # Check for dependency_check.json in both metadata and .metadata directories
         dependency_json = None
@@ -3408,26 +4898,29 @@ class HTMLReportService:
         self, group_path: Path, node_path: Path, include_files: bool = True
     ) -> Dict[str, Dict[str, Any]]:
         """
-        Scans a collector group directory and returns information about collectors found on disk.
+        Scan collectors from disk.
+
+        The implementation uses ``group_path``, ``node_path``, and
+        ``include_files`` to scan collectors from disk. Owned asynchronous work
+        is awaited before return, so completion does not leave an unobserved
+        task behind.
 
         Args:
-            group_path: Path to the collector group directory
-            node_path: Path to the node/DUT directory
-            include_files: Whether to include file paths and generate file views
+            group_path: filesystem location used as the group path for this
+                operation.
+            node_path: filesystem location used as the node path for this
+                operation.
+            include_files: Whether include files is enabled or required for this
+                operation.
 
         Returns:
-            Dictionary mapping collector_id (lowercase) to collector info:
-            {
-                "collector_id_orig": str,  # Original case collector ID
-                "collector_name_orig": str,  # Original collector name
-                "paths": List[Tuple[str, str]] or List[str],  # File paths (with or without views)
-            }
+            A mapping containing scan collectors from disk.
         """
-        if not group_path.is_dir():
+        if not self._report_input_is_dir(group_path):
             return {}
 
         try:
-            items = list(group_path.iterdir())
+            items = self._walk_report_inputs(group_path, recursive=False)
         except (PermissionError, OSError) as e:
             await self._log(
                 "WARNING",
@@ -3435,16 +4928,18 @@ class HTMLReportService:
             )
             return {}
         collectors = [
-            x
-            for x in items
-            if (x.is_dir() or x.is_file())
-            and not any(pattern.match(x.name) for pattern in self.log_ignore_patterns)
+            entry
+            for entry in items
+            if not any(
+                pattern.match(entry.path.name) for pattern in self.log_ignore_patterns
+            )
         ]
 
         requested_collector_ids = getattr(self, "requested_collector_ids", None)
         disk_dict = {}
 
-        for it in collectors:
+        for collector_entry in collectors:
+            it = collector_entry.path
             name_parts = it.name.split("_")
             c_id = "N/A"
             c_name = "N/A"
@@ -3477,9 +4972,10 @@ class HTMLReportService:
             # Collect file paths
             files_list = []
             try:
-                if it.is_dir():
-                    for subf in it.rglob("*"):
-                        if subf.is_file():
+                if collector_entry.is_dir:
+                    for entry in self._walk_report_inputs(it, recursive=True):
+                        if entry.is_file:
+                            subf = entry.path
                             try:
                                 relp = str(subf.relative_to(node_path))
                                 if include_files:
@@ -3520,6 +5016,20 @@ class HTMLReportService:
     ) -> None:
         """
         Generates an HTML report for a collector group folder.
+
+        The implementation uses ``group_path``, ``node_path``, and
+        ``group_report_path`` to generates an HTML report for a collector group
+        folder. Owned asynchronous work is awaited before return, so completion
+        does not leave an unobserved task behind. Filesystem effects remain
+        confined to the caller-selected paths and the owning resource lifecycle.
+
+        Args:
+            group_path: filesystem location used as the group path for this
+                operation.
+            node_path: filesystem location used as the node path for this
+                operation.
+            group_report_path: filesystem location used as the group report path
+                for this operation.
         """
         node_name = node_path.name
         group_name_orig = group_path.name
@@ -3555,7 +5065,19 @@ class HTMLReportService:
                     rel_sibling = os.path.relpath(
                         sibling_rep, group_report_path.parent
                     ).replace("\\", "/")
-                    left_content += f'<li><a href="{escape(rel_sibling)}" class="d-block py-1"><i class="bi bi-folder"></i> {escape(gname)}</a></li>'
+                    encoded_sibling = self._encoded_report_relative_path(rel_sibling)
+                    if encoded_sibling is None:
+                        left_content += (
+                            '<li><span class="d-block py-1">'
+                            f'<i class="bi bi-folder"></i> {escape(gname)}'
+                            "</span></li>"
+                        )
+                    else:
+                        left_content += (
+                            f'<li><a href="{self._escape_html_text(encoded_sibling)}" '
+                            'class="d-block py-1"><i class="bi bi-folder"></i> '
+                            f"{escape(gname)}</a></li>"
+                        )
             left_content += """
                     </ul>
                 </div>
@@ -3604,13 +5126,14 @@ class HTMLReportService:
         execution_summary_path = node_path / "Execution_Summary_Report.txt"
         if execution_summary_path.exists():
             try:
-                with open(execution_summary_path, "r") as f:
-                    for line in f:
-                        if line.strip() and not line.startswith("Collection Name"):
-                            parts = line.split()
-                            if len(parts) >= 3:
-                                collector_id = parts[1]  # ID is the second column
-                                executed_collector_ids.add(collector_id.upper())
+                parsed_summary = await self._parse_execution_summary(
+                    execution_summary_path
+                )
+                executed_collector_ids.update(
+                    str(entry["collector_id"]).upper()
+                    for entry in parsed_summary["entries"]
+                    if entry.get("collector_id")
+                )
             except Exception as e:
                 await self._log("WARNING", f"Error reading execution summary: {e}")
 
@@ -3767,7 +5290,14 @@ class HTMLReportService:
 
                 link_objs = []
                 for fp, link in rowdata["files"]:
-                    link_objs.append(f'<a href="{escape(link)}">{escape(fp)}</a>')
+                    encoded_link = self._encoded_report_relative_path(link)
+                    if encoded_link is None:
+                        link_objs.append(self._escape_html_text(fp))
+                    else:
+                        link_objs.append(
+                            f'<a href="{self._escape_html_text(encoded_link)}">'
+                            f"{self._escape_html_text(fp)}</a>"
+                        )
                     self.global_file_map_data.append(
                         {
                             "Node Name": node_name,
@@ -3783,9 +5313,11 @@ class HTMLReportService:
                     )
 
                 if cstatus.lower() in ("notran", "n/a", "skipped") and creason:
-                    link_objs.insert(0, f"{creason}")
+                    link_objs.insert(0, self._make_links_clickable(str(creason)))
 
-                modal_id = f"modal_{node_name}_{group_name_orig}_{cid_real}_{idx}"
+                modal_id = self._generate_safe_id(
+                    "modal", f"{node_name}_{group_name_orig}_{cid_real}_{idx}"
+                )
                 log_path_display = self._render_link_list_with_modal(
                     link_objs,
                     self.log_path_threshold,
@@ -3842,17 +5374,20 @@ class HTMLReportService:
         """
         Generate a comprehensive timing breakdown table from all DUT metadata files.
 
+        Scan all DUT directories for metadata.json files.
+
         Args:
-            total_runtime: Optional total runtime in seconds.
+            total_runtime: Optional total runtime; ``None`` selects the
+                function's default behavior.
 
         Returns:
-            HTML string containing timing breakdown table.
+            The canonical generate timing breakdown table text.
         """
         try:
             timing_data = {}
 
             # Scan all DUT directories for metadata.json files
-            for node in self.root_dir.iterdir():
+            for node in self._iter_node_directories():
                 if (
                     node.is_dir()
                     and not node.name.startswith(".")
@@ -4109,10 +5644,22 @@ class HTMLReportService:
     def _generate_safe_id(self, prefix: str, node_name: str) -> str:
         """
         Generate a safe, unique ID for modals and other HTML elements.
+
         Replaces spaces and special characters with underscores.
+
+        Args:
+            prefix: Text supplied as prefix in the format accepted by this
+                function.
+            node_name: Stable node name used for lookup and operator-facing
+                diagnostics.
+
+        Returns:
+            The canonical generate safe identifier text.
         """
         # Replace spaces and special characters with underscores
         safe_name = re.sub(r"[^a-zA-Z0-9]", "_", node_name)
+        if not safe_name:
+            safe_name = "node"
         # Ensure the ID starts with a letter
         safe_name = "n" + safe_name if not safe_name[0].isalpha() else safe_name
         return f"{prefix}_{safe_name}"
@@ -4120,6 +5667,17 @@ class HTMLReportService:
     def _is_baseboard_filtered_reason(self, reason: Optional[str]) -> bool:
         """
         Determine whether a reason string indicates baseboard-based filtering.
+
+        The implementation uses ``reason`` to determine whether a reason string
+        indicates baseboard-based filtering.
+
+        Args:
+            reason: Text supplied as reason in the format accepted by this
+                function.
+
+        Returns:
+            Whether the reason string indicates baseboard-based filtering
+            operation succeeds.
         """
         if not reason:
             return False
@@ -4132,16 +5690,23 @@ class HTMLReportService:
 
     def _is_preexecution_filtered_reason(self, reason: Optional[str]) -> bool:
         """
-        Determine whether a reason string indicates the collector was filtered
-        out before execution (e.g., due to preflight failures or collection
-        level filtering).
+        Return whether ``reason`` is preexecution filtered reason.
+
+        The implementation uses ``reason`` to determine whether ``reason`` is
+        preexecution filtered reason.
+
+        Args:
+            reason: Text supplied as reason in the format accepted by this
+                function.
+
+        Returns:
+            Whether ``reason`` is preexecution filtered reason.
         """
         if not reason:
             return False
         reason_lower = reason.lower()
         if "filtered out" in reason_lower and (
-            "before execution" in reason_lower
-            or "not executed" in reason_lower
+            "before execution" in reason_lower or "not executed" in reason_lower
         ):
             return True
         return False
@@ -4149,43 +5714,30 @@ class HTMLReportService:
     def _create_execution_summary_from_metadata(self, node_name: str) -> List[Dict]:
         """
         Create execution summary entries from metadata for nvdebug.
+
         Only includes collectors that were requested to run.
+
+        Args:
+            node_name: Stable node name used for lookup and operator-facing
+                diagnostics.
+
+        Returns:
+            The execution summary from metadata returned in operation-defined
+            order.
         """
-        execution_summary = []
-
-        # Get collector data from metadata
         node_data = self.node_collector_json.get(node_name, {})
-
-        # Get the list of requested collector IDs to filter entries
         requested_collector_ids = getattr(self, "requested_collector_ids", None)
-
-        for group_name, collectors in node_data.items():
-            for collector_id, collector_info in collectors.items():
-                # Skip collectors that weren't requested to run
-                if requested_collector_ids and collector_id.upper() not in [
-                    cid.upper() for cid in requested_collector_ids
-                ]:
-                    continue
-
-                # Create execution summary entry
-                entry = {
-                    "collection name": f"{group_name}_{collector_id}_{collector_info.get('name', 'N/A')}",
-                    "execution status": collector_info.get("status", "NotRan"),
-                    "log path": [
-                        f"{group_name.lower()}/{collector_id}_{collector_info.get('name', 'N/A')}"
-                    ],
-                    "collector_id": collector_id,  # Use "collector_id" to match what other code expects
-                    "name": collector_info.get("name", "N/A"),
-                    "group_name": group_name,
-                }
-                execution_summary.append(entry)
-
-        return execution_summary
+        records = create_execution_summary_from_metadata(
+            node_data,
+            requested_collector_ids,
+        )
+        return metadata_execution_summary_to_legacy_list(records)
 
     async def _generate_timing_analysis_page(self) -> None:
         """
-        Generate a comprehensive timing analysis page with interactive visualizations,
-        timelines, and granular performance insights.
+        Generate timing analysis page.
+
+        Collect timing data from both metadata.json and timing.json files.
         """
         try:
             await self._log("INFO", "Generating timing analysis page...")
@@ -4194,7 +5746,7 @@ class HTMLReportService:
             metadata_timing_data = {}
             timing_data_by_dut = {}
 
-            for node in self.root_dir.iterdir():
+            for node in self._iter_node_directories():
                 if (
                     node.is_dir()
                     and not node.name.startswith(".")
@@ -4202,17 +5754,21 @@ class HTMLReportService:
                 ):
                     # Load timing.json for DUT/collector details
                     timing_json_path = node / ".metadata" / "timing.json"
-                    if timing_json_path.exists():
-                        try:
-                            with open(timing_json_path, "r") as f:
-                                timing_data = json.load(f)
-                                dut_id = timing_data.get("dut_id", node.name)
-                                timing_data_by_dut[dut_id] = timing_data
-                        except Exception as e:
-                            await self._log(
-                                "WARN",
-                                f"Error reading timing data from {timing_json_path}: {e}",
-                            )
+                    try:
+                        timing_data = self._read_terminal_timing(node.name)
+                        if timing_data is not None:
+                            dut_id = timing_data.get("dut_id", node.name)
+                            timing_data_by_dut[dut_id] = timing_data
+                    except SnapshotArtifactFormatError:
+                        if self._terminal_snapshot_generation is not None:
+                            raise
+                    except SnapshotConsistencyError:
+                        raise
+                    except Exception as e:
+                        await self._log(
+                            "WARN",
+                            f"Error reading timing data from {timing_json_path}: {e}",
+                        )
 
                     # Load metadata.json for stage-level timing
                     metadata_file = node / ".metadata" / "metadata.json"
@@ -4285,6 +5841,7 @@ class HTMLReportService:
                         service_stats[service] = {
                             "total_collectors": 0,
                             "completed": 0,
+                            "degraded": 0,
                             "failed": 0,
                             "partial": 0,
                             "skipped": 0,
@@ -4295,6 +5852,9 @@ class HTMLReportService:
                     )
                     service_stats[service]["completed"] += service_data.get(
                         "completed", 0
+                    )
+                    service_stats[service]["degraded"] += service_data.get(
+                        "degraded", 0
                     )
                     service_stats[service]["failed"] += service_data.get("failed", 0)
                     service_stats[service]["partial"] += service_data.get("partial", 0)
@@ -4401,6 +5961,7 @@ class HTMLReportService:
             # Aggregate overall collector statuses for cards
             total_collectors_overall = 0
             total_success = 0
+            total_degraded = 0
             total_failed = 0
             total_partial = 0
             total_skipped = 0
@@ -4411,6 +5972,8 @@ class HTMLReportService:
                     status = str(c.get("status", "")).lower()
                     if status in ("complete", "success", "completed"):
                         total_success += 1
+                    elif status == "degraded":
+                        total_degraded += 1
                     elif status in ("error", "failed", "fail"):
                         total_failed += 1
                     elif status == "partial":
@@ -4437,7 +6000,7 @@ class HTMLReportService:
 
             # Generate page content with custom styles for timing analysis
             content = f"""
-    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js" integrity="sha384-cVMg8E3QFwTvGCDuK+ET4PD341jF3W8nO1auiXfuZNQkzbUUiBGLsIQUE+b1mxws" crossorigin="anonymous"></script> <!-- pragma: allowlist secret -->
     <style>
         /* Custom styles for timing analysis page */
         body {{
@@ -4516,6 +6079,7 @@ class HTMLReportService:
             align-items: center;
         }}
         .status-success {{ background-color: #d4edda; border-left: 4px solid #28a745; }}
+        .status-degraded {{ background-color: #ffe8a1; border-left: 4px solid #f59e0b; }}
         .status-error {{ background-color: #f8d7da; border-left: 4px solid #dc3545; }}
         .status-skipped {{ background-color: #fff3cd; border-left: 4px solid #ffc107; }}
         .status-partial {{ background-color: #cce5ff; border-left: 4px solid #0056b3; }}
@@ -4613,28 +6177,35 @@ class HTMLReportService:
                 </div>
             </div>
             <div class="row mb-4">
-                <div class="col-md-3">
+                <div class="col">
                     <div class="stat-card" style="background: linear-gradient(135deg, #28a745 0%, #43e97b 100%);">
                         <div class="stat-number">{total_success}</div>
                         <div class="stat-label">Passed Collectors</div>
                         <div class="stat-label">of {total_collectors_overall} total</div>
                     </div>
                 </div>
-                <div class="col-md-3">
+                <div class="col">
+                    <div class="stat-card" style="background: linear-gradient(135deg, #f59e0b 0%, #fbbf24 100%); color: #ffffff;">
+                        <div class="stat-number">{total_degraded}</div>
+                        <div class="stat-label">Degraded Collectors</div>
+                        <div class="stat-label">of {total_collectors_overall} total</div>
+                    </div>
+                </div>
+                <div class="col">
                     <div class="stat-card" style="background: linear-gradient(135deg, #f5576c 0%, #ff4b2b 100%);">
                         <div class="stat-number">{total_failed}</div>
                         <div class="stat-label">Failed Collectors</div>
                         <div class="stat-label">of {total_collectors_overall} total</div>
                     </div>
                 </div>
-                <div class="col-md-3">
+                <div class="col">
                     <div class="stat-card" style="background: linear-gradient(315deg, #ffd54f 0%, #fff176 100%); color: #ffffff;">
                         <div class="stat-number">{total_partial}</div>
                         <div class="stat-label">Partial Collectors</div>
                         <div class="stat-label">of {total_collectors_overall} total</div>
                     </div>
                 </div>
-                <div class="col-md-3">
+                <div class="col">
                     <div class="stat-card" style="background: linear-gradient(135deg, #ff9800 0%, #ffc107 100%); color: #ffffff;">
                         <div class="stat-number">{total_skipped}</div>
                         <div class="stat-label">Skipped Collectors</div>
@@ -4686,6 +6257,7 @@ class HTMLReportService:
                     <p class="text-muted mb-0">Shows when each collector executed. Use zoom buttons or scroll wheel to zoom. Hover over bars for details.</p>
                     <div class="mt-2">
                         <span class="badge" style="background-color: rgba(75, 192, 192, 0.7);">SUCCESS</span>
+                        <span class="badge" style="background-color: rgba(245, 158, 11, 0.7);">DEGRADED</span>
                         <span class="badge" style="background-color: rgba(255, 99, 132, 0.7);">ERROR</span>
                         <span class="badge" style="background-color: rgba(255, 206, 86, 0.7);">SKIPPED</span>
                         <span class="badge" style="background-color: rgba(54, 162, 235, 0.7);">PARTIAL</span>
@@ -4803,6 +6375,54 @@ class HTMLReportService:
         const serviceStats = {service_stats_json};
         const stageTiming = {stage_timing_json};
         const componentTiming = {component_timing_json};
+
+        // Timing documents are untrusted JSON. Escape values before placing them
+        // into HTML templates, and use text nodes for tooltip content.
+        function escapeHTML(value) {{
+            return String(value === null || value === undefined ? '' : value)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#x27;');
+        }}
+
+        function appendTimingTooltipRow(container, label, value, color = null) {{
+            const row = document.createElement('div');
+            const heading = document.createElement('strong');
+            heading.textContent = `${{label}}:`;
+            row.appendChild(heading);
+            row.appendChild(document.createTextNode(' '));
+            if (color) {{
+                const coloredValue = document.createElement('span');
+                coloredValue.style.color = color;
+                coloredValue.textContent = String(value ?? '');
+                row.appendChild(coloredValue);
+            }} else {{
+                row.appendChild(document.createTextNode(String(value ?? '')));
+            }}
+            container.appendChild(row);
+        }}
+
+        function renderTimingTooltip(
+            tooltip,
+            info,
+            statusColor,
+            startTime,
+            endTime
+        ) {{
+            tooltip.replaceChildren();
+            const title = document.createElement('div');
+            title.style.cssText = 'font-weight: bold; margin-bottom: 6px; color: #4fc3f7; font-size: 13px;';
+            title.textContent = `DUT: ${{String(info.dut_id ?? '')}}`;
+            tooltip.appendChild(title);
+            appendTimingTooltipRow(tooltip, 'Collector', info.collector_name);
+            appendTimingTooltipRow(tooltip, 'Service', info.group);
+            appendTimingTooltipRow(tooltip, 'Status', info.status, statusColor);
+            appendTimingTooltipRow(tooltip, 'Duration', `${{Number(info.duration).toFixed(2)}}s`);
+            appendTimingTooltipRow(tooltip, 'Start', startTime);
+            appendTimingTooltipRow(tooltip, 'End', endTime);
+        }}
 
         // Consistent service color mapping
         function getServiceColor(serviceName) {{
@@ -5025,6 +6645,7 @@ class HTMLReportService:
             const statusUpper = status.toUpperCase();
             switch(statusUpper) {{
                 case 'SUCCESS': return '#4db8a8';
+                case 'DEGRADED': return '#f59e0b';
                 case 'ERROR': return '#ff6384';
                 case 'SKIPPED': return '#ffce56';
                 case 'PARTIAL': return '#36a2eb';
@@ -5168,7 +6789,7 @@ class HTMLReportService:
                 dutList.forEach(dutId => {{
                     chartHTML += `
                         <div style="height: ${{dutRowHeights[dutId]}}px; padding: 15px 10px; border-bottom: 1px solid #dee2e6; font-weight: 600; color: #2c3e50; display: flex; align-items: center; font-size: 13px;">
-                            ${{dutId}}
+                            ${{escapeHTML(dutId)}}
                         </div>
                     `;
                 }});
@@ -5298,20 +6919,20 @@ class HTMLReportService:
                         // Build bar content
                         let barContent = '';
                         if (canFitName) {{
-                            barContent = `${{info.collector_name}} <span style="opacity: 0.7; margin-left: 6px;">(${{durationText}})</span>`;
+                            barContent = `${{escapeHTML(info.collector_name)}} <span style="opacity: 0.7; margin-left: 6px;">(${{durationText}})</span>`;
                         }} else if (canFitDuration) {{
                             barContent = durationText;
                         }}
 
                         chartHTML += `
                             <div class="gantt-bar"
-                                 data-dut="${{info.dut_id}}"
-                                 data-collector="${{info.collector_name}}"
-                                 data-service="${{info.group}}"
-                                 data-status="${{info.status}}"
+                                 data-dut="${{escapeHTML(info.dut_id)}}"
+                                 data-collector="${{escapeHTML(info.collector_name)}}"
+                                 data-service="${{escapeHTML(info.group)}}"
+                                 data-status="${{escapeHTML(info.status)}}"
                                  data-duration="${{info.duration.toFixed(2)}}"
-                                 data-start="${{startTime}}"
-                                 data-end="${{endTime}}"
+                                 data-start="${{escapeHTML(startTime)}}"
+                                 data-end="${{escapeHTML(endTime)}}"
                                  style="position: absolute;
                                         left: ${{xStart}}px;
                                         top: ${{yPos}}px;
@@ -5394,15 +7015,19 @@ class HTMLReportService:
                             line-height: 1.6;
                         `;
 
-                        tooltip.innerHTML = `
-                            <div style="font-weight: bold; margin-bottom: 6px; color: #4fc3f7; font-size: 13px;">DUT: ${{this.dataset.dut}}</div>
-                            <div><strong>Collector:</strong> ${{this.dataset.collector}}</div>
-                            <div><strong>Service:</strong> ${{this.dataset.service}}</div>
-                            <div><strong>Status:</strong> <span style="color: ${{getStatusColor(this.dataset.status)}}">${{this.dataset.status}}</span></div>
-                            <div><strong>Duration:</strong> ${{this.dataset.duration}}s</div>
-                            <div><strong>Start:</strong> ${{this.dataset.start}}</div>
-                            <div><strong>End:</strong> ${{this.dataset.end}}</div>
-                        `;
+                        renderTimingTooltip(
+                            tooltip,
+                            {{
+                                dut_id: this.dataset.dut,
+                                collector_name: this.dataset.collector,
+                                group: this.dataset.service,
+                                status: this.dataset.status,
+                                duration: Number(this.dataset.duration)
+                            }},
+                            getStatusColor(this.dataset.status),
+                            this.dataset.start,
+                            this.dataset.end
+                        );
 
                         document.body.appendChild(tooltip);
                         this._tooltip = tooltip;
@@ -5573,7 +7198,7 @@ class HTMLReportService:
             `;
 
             dutList.forEach(dutId => {{
-                chartHTML += `<div style="height: ${{dutRowHeights[dutId]}}px; padding: 15px 10px; border-bottom: 1px solid #dee2e6; font-weight: 600; color: #2c3e50; display: flex; align-items: center; font-size: 13px;">${{dutId}}</div>`;
+                chartHTML += `<div style="height: ${{dutRowHeights[dutId]}}px; padding: 15px 10px; border-bottom: 1px solid #dee2e6; font-weight: 600; color: #2c3e50; display: flex; align-items: center; font-size: 13px;">${{escapeHTML(dutId)}}</div>`;
             }});
 
             chartHTML += `
@@ -5663,17 +7288,17 @@ class HTMLReportService:
                     const canFitName = width > 120;
                     const canFitDuration = width > 40;
                     let barContent = '';
-                    if (canFitName) barContent = `${{info.collector_name}} <span style="opacity: 0.7; margin-left: 6px;">(${{durationText}})</span>`;
+                    if (canFitName) barContent = `${{escapeHTML(info.collector_name)}} <span style="opacity: 0.7; margin-left: 6px;">(${{durationText}})</span>`;
                     else if (canFitDuration) barContent = durationText;
                     chartHTML += `
                         <div class="gantt-bar"
-                             data-dut="${{info.dut_id}}"
-                             data-collector="${{info.collector_name}}"
-                             data-service="${{info.group}}"
-                             data-status="${{info.status}}"
+                             data-dut="${{escapeHTML(info.dut_id)}}"
+                             data-collector="${{escapeHTML(info.collector_name)}}"
+                             data-service="${{escapeHTML(info.group)}}"
+                             data-status="${{escapeHTML(info.status)}}"
                              data-duration="${{info.duration.toFixed(2)}}"
-                             data-start="${{startTime}}"
-                             data-end="${{endTime}}"
+                             data-start="${{escapeHTML(startTime)}}"
+                             data-end="${{escapeHTML(endTime)}}"
                              style="position: absolute; left: ${{xStart}}px; top: ${{yPos}}px; width: ${{width}}px; height: ${{baseLaneHeight}}px; background: ${{color}}; border: 1px solid ${{color}}dd; border-radius: 4px; cursor: pointer; transition: all 0.2s; overflow: visible; display: flex; align-items: center; padding: 0 6px; font-size: 10px; font-weight: 500; color: #000;">
                             <span style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${{barContent}}</span>
                         </div>
@@ -5702,15 +7327,19 @@ class HTMLReportService:
                     const tooltip = document.createElement('div');
                     tooltip.className = 'gantt-tooltip';
                     tooltip.style.cssText = `position: fixed; background: rgba(0, 0, 0, 0.9); color: white; padding: 12px; border-radius: 6px; font-size: 12px; z-index: 10000; pointer-events: none; max-width: 300px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); line-height: 1.6;`;
-                    tooltip.innerHTML = `
-                        <div style="font-weight: bold; margin-bottom: 6px; color: #4fc3f7; font-size: 13px;">DUT: ${{this.dataset.dut}}</div>
-                        <div><strong>Collector:</strong> ${{this.dataset.collector}}</div>
-                        <div><strong>Service:</strong> ${{this.dataset.service}}</div>
-                        <div><strong>Status:</strong> <span style="color: ${{getStatusColor(this.dataset.status)}}">${{this.dataset.status}}</span></div>
-                        <div><strong>Duration:</strong> ${{this.dataset.duration}}s</div>
-                        <div><strong>Start:</strong> ${{this.dataset.start}}</div>
-                        <div><strong>End:</strong> ${{this.dataset.end}}</div>
-                    `;
+                    renderTimingTooltip(
+                        tooltip,
+                        {{
+                            dut_id: this.dataset.dut,
+                            collector_name: this.dataset.collector,
+                            group: this.dataset.service,
+                            status: this.dataset.status,
+                            duration: Number(this.dataset.duration)
+                        }},
+                        getStatusColor(this.dataset.status),
+                        this.dataset.start,
+                        this.dataset.end
+                    );
                     document.body.appendChild(tooltip);
                     this._tooltip = tooltip;
                 }});
@@ -5817,15 +7446,13 @@ class HTMLReportService:
                                     const startTime = new Date(info.start_time).toLocaleTimeString();
                                     const endTime = new Date(info.end_time).toLocaleTimeString();
 
-                                    tooltipEl.innerHTML = `
-                                        <div style="font-weight: bold; margin-bottom: 5px; color: #4fc3f7;">DUT: ${{info.dut_id}}</div>
-                                        <div><strong>Collector:</strong> ${{info.collector_name}}</div>
-                                        <div><strong>Service:</strong> ${{info.group}}</div>
-                                        <div><strong>Status:</strong> <span style="color: ${{dataPoint.color.replace('0.8', '1')}}">${{info.status}}</span></div>
-                                        <div><strong>Duration:</strong> ${{info.duration.toFixed(2)}}s</div>
-                                        <div><strong>Start:</strong> ${{startTime}}</div>
-                                        <div><strong>End:</strong> ${{endTime}}</div>
-                                    `;
+                                    renderTimingTooltip(
+                                        tooltipEl,
+                                        info,
+                                        dataPoint.color.replace('0.8', '1'),
+                                        startTime,
+                                        endTime
+                                    );
 
                                     const position = context.chart.canvas.getBoundingClientRect();
                                     tooltipEl.style.left = position.left + window.pageXOffset + context.tooltip.caretX + 'px';
@@ -5985,6 +7612,7 @@ class HTMLReportService:
                             <th>End Time</th>
                             <th>Total Collectors</th>
                             <th class="text-success">Completed</th>
+                            <th class="text-warning">Degraded</th>
                             <th class="text-danger">Failed</th>
                             <th class="text-info">Partial</th>
                             <th class="text-warning">Skipped</th>
@@ -5997,18 +7625,20 @@ class HTMLReportService:
                 const dutCollectors = timelineData.filter(c => c.dut_id === dutId);
                 // Match status strings from timing.json
                 const successCount = dutCollectors.filter(c => c.status.toUpperCase() === 'SUCCESS').length;
+                const degradedCount = dutCollectors.filter(c => c.status.toUpperCase() === 'DEGRADED').length;
                 const errorCount = dutCollectors.filter(c => c.status.toUpperCase() === 'ERROR').length;
                 const partialCount = dutCollectors.filter(c => c.status.toUpperCase() === 'PARTIAL').length;
                 const skippedCount = dutCollectors.filter(c => c.status.toUpperCase() === 'SKIPPED').length;
 
                 tableHTML += `
                     <tr>
-                        <td><strong>${{dutId}}</strong></td>
+                        <td><strong>${{escapeHTML(dutId)}}</strong></td>
                         <td>${{summary.duration.toFixed(2)}}s</td>
                         <td>${{new Date(summary.start_time).toLocaleString()}}</td>
                         <td>${{new Date(summary.end_time).toLocaleString()}}</td>
-                        <td>${{summary.total_collectors}}</td>
+                        <td>${{escapeHTML(summary.total_collectors)}}</td>
                         <td class="text-success"><strong>${{successCount}}</strong></td>
+                        <td class="text-warning"><strong>${{degradedCount}}</strong></td>
                         <td class="text-danger"><strong>${{errorCount}}</strong></td>
                         <td class="text-info"><strong>${{partialCount}}</strong></td>
                         <td class="text-warning"><strong>${{skippedCount}}</strong></td>
@@ -6030,18 +7660,20 @@ class HTMLReportService:
             timelineData.forEach(item => {{
                 const statusUpper = item.status.toUpperCase();
                 const statusClass = statusUpper === 'SUCCESS' ? 'table-success' :
+                                  statusUpper === 'DEGRADED' ? 'table-warning' :
                                   statusUpper === 'ERROR' ? 'table-danger' :
-                                  statusUpper === 'SKIPPED' ? 'table-warning' : '';
+                                  statusUpper === 'PARTIAL' ? 'table-info' :
+                                  statusUpper === 'SKIPPED' ? 'table-secondary' : '';
 
                 // Map service to color class
                 const serviceClass = 'badge service-badge service-' + item.group.toLowerCase().replace(/[^a-z0-9]/g, '_');
 
                 tableHTML += `
                     <tr class="${{statusClass}}">
-                        <td>${{item.dut_id}}</td>
-                        <td>${{item.collector_name}}</td>
-                        <td><span class="${{serviceClass}}">${{item.group}}</span></td>
-                        <td>${{item.status}}</td>
+                        <td>${{escapeHTML(item.dut_id)}}</td>
+                        <td>${{escapeHTML(item.collector_name)}}</td>
+                        <td><span class="${{serviceClass}}">${{escapeHTML(item.group)}}</span></td>
+                        <td>${{escapeHTML(item.status)}}</td>
                         <td>${{item.duration.toFixed(2)}}</td>
                         <td>${{new Date(item.start_time).toLocaleTimeString()}}</td>
                         <td>${{new Date(item.end_time).toLocaleTimeString()}}</td>
@@ -6098,6 +7730,7 @@ class HTMLReportService:
             collectorList.innerHTML = filteredData.map(item => {{
                 const statusUpper = item.status.toUpperCase();
                 const statusClass = statusUpper === 'SUCCESS' ? 'status-success' :
+                                  statusUpper === 'DEGRADED' ? 'status-degraded' :
                                   statusUpper === 'ERROR' ? 'status-error' :
                                   statusUpper === 'SKIPPED' ? 'status-skipped' :
                                   'status-partial';
@@ -6108,9 +7741,9 @@ class HTMLReportService:
 
                 return `
                     <div class="collector-row ${{statusClass}}">
-                        <span class="${{serviceClass}}">${{item.group}}</span>
-                        <strong>${{item.collector_name}}</strong>
-                        <span class="text-muted ms-2">[${{item.dut_id}}]</span>
+                        <span class="${{serviceClass}}">${{escapeHTML(item.group)}}</span>
+                        <strong>${{escapeHTML(item.collector_name)}}</strong>
+                        <span class="text-muted ms-2">[${{escapeHTML(item.dut_id)}}]</span>
                         <span class="ms-auto">
                             ${{startTime.toLocaleTimeString()}} - ${{endTime.toLocaleTimeString()}}
                             (${{item.duration.toFixed(2)}}s)
@@ -6345,15 +7978,19 @@ class HTMLReportService:
                                 line-height: 1.6;
                             `;
 
-                            tooltip.innerHTML = `
-                                <div style="font-weight: bold; margin-bottom: 6px; color: #4fc3f7; font-size: 13px;">DUT: ${{this.dataset.dut}}</div>
-                                <div><strong>Collector:</strong> ${{this.dataset.collector}}</div>
-                                <div><strong>Service:</strong> ${{this.dataset.service}}</div>
-                                <div><strong>Status:</strong> <span style="color: ${{getStatusColor(this.dataset.status)}}">${{this.dataset.status}}</span></div>
-                                <div><strong>Duration:</strong> ${{this.dataset.duration}}s</div>
-                                <div><strong>Start:</strong> ${{this.dataset.start}}</div>
-                                <div><strong>End:</strong> ${{this.dataset.end}}</div>
-                            `;
+                            renderTimingTooltip(
+                                tooltip,
+                                {{
+                                    dut_id: this.dataset.dut,
+                                    collector_name: this.dataset.collector,
+                                    group: this.dataset.service,
+                                    status: this.dataset.status,
+                                    duration: Number(this.dataset.duration)
+                                }},
+                                getStatusColor(this.dataset.status),
+                                this.dataset.start,
+                                this.dataset.end
+                            );
 
                             document.body.appendChild(tooltip);
                             this._tooltip = tooltip;
@@ -6460,15 +8097,13 @@ class HTMLReportService:
                                         const startTime = new Date(info.start_time).toLocaleTimeString();
                                         const endTime = new Date(info.end_time).toLocaleTimeString();
 
-                                        tooltipEl.innerHTML = `
-                                            <div style="font-weight: bold; margin-bottom: 5px; color: #4fc3f7;">DUT: ${{info.dut_id}}</div>
-                                            <div><strong>Collector:</strong> ${{info.collector_name}}</div>
-                                            <div><strong>Service:</strong> ${{info.group}}</div>
-                                            <div><strong>Status:</strong> <span style="color: ${{dataPoint.color.replace('0.8', '1')}}">${{info.status}}</span></div>
-                                            <div><strong>Duration:</strong> ${{info.duration.toFixed(2)}}s</div>
-                                            <div><strong>Start:</strong> ${{startTime}}</div>
-                                            <div><strong>End:</strong> ${{endTime}}</div>
-                                        `;
+                                        renderTimingTooltip(
+                                            tooltipEl,
+                                            info,
+                                            dataPoint.color.replace('0.8', '1'),
+                                            startTime,
+                                            endTime
+                                        );
 
                                         const position = context.chart.canvas.getBoundingClientRect();
                                         tooltipEl.style.left = position.left + window.pageXOffset + context.tooltip.caretX + 'px';
@@ -6682,6 +8317,8 @@ class HTMLReportService:
 
             await self._log("INFO", f"Timing analysis page created: {timing_page_path}")
 
+        except SnapshotConsistencyError:
+            raise
         except Exception as e:
             await self._log("ERROR", f"Error generating timing analysis page: {e}")
             import traceback
@@ -6690,19 +8327,52 @@ class HTMLReportService:
 
     async def _generate_top_level_report(self, node_reports: List[Path]) -> None:
         """
-        Generates the top-level HTML report linking to individual node reports and the file map.
+        Generate top level report.
+
+        The implementation uses ``node_reports`` to generate top level report.
+        Owned asynchronous work is awaited before return, so completion does not
+        leave an unobserved task behind. Filesystem effects remain confined to
+        the caller-selected paths and the owning resource lifecycle. If the
+        function cannot generate top level report, its exception reaches the
+        caller instead of being converted into a successful result.
+
+        Args:
+            node_reports: filesystem location used as the node reports for this
+                operation.
+
+        Raises:
+            FileNotFoundError: If the function cannot generate top level report
+                safely.
         """
-        status_counts = {"Complete": 0, "Error": 0, "Skipped": 0, "N/A": 0}
+        status_counts = {
+            "Complete": 0,
+            "Degraded": 0,
+            "Error": 0,
+            "Skipped": 0,
+            "N/A": 0,
+        }
         execution_times: List[(str, float)] = []
         modals: List[str] = []  # Initialize modals list
 
         # Sort node_reports by node name
         node_reports_sorted = sorted(node_reports, key=lambda p: p.parent.name.lower())
+        node_input_paths = {
+            node_path.name: node_path for node_path in self._iter_node_directories()
+        }
+        missing_node_inputs = {
+            report_path.parent.name for report_path in node_reports_sorted
+        } - set(node_input_paths)
+        if missing_node_inputs:
+            raise FileNotFoundError(
+                "Node report source is unavailable: "
+                + ", ".join(sorted(missing_node_inputs))
+            )
 
         # Calculate executive summary stats (prefer collection_status.json for alignment)
         total_duts = len(node_reports)
         total_log_size = 0
         total_collectors_pass = 0
+        total_collectors_degraded = 0
         total_collectors_fail = 0
         total_collectors_partial = 0
         total_collectors_skipped = 0  # runtime-skipped only
@@ -6712,6 +8382,7 @@ class HTMLReportService:
         # Collect per-status details for executive-summary modals
         status_collectors = {
             "pass": defaultdict(list),
+            "degraded": defaultdict(list),
             "fail": defaultdict(list),
             "partial": defaultdict(list),
             "skipped": defaultdict(list),
@@ -6721,7 +8392,7 @@ class HTMLReportService:
         node_group_report_map: Dict[str, Dict[str, str]] = {}
         for rep in node_reports_sorted:
             _dut_name = rep.parent.name
-            _dut_path = self.root_dir / _dut_name
+            _dut_path = node_input_paths[_dut_name]
             alias_map: Dict[str, str] = {}
             try:
                 for group_folder in self._get_collector_groups(_dut_path):
@@ -6750,16 +8421,17 @@ class HTMLReportService:
         # Aggregate log sizes and compute counts from per-DUT collection_status.json when present
         for report_html in node_reports_sorted:
             node_name = report_html.parent.name
-            node_path = self.root_dir / node_name
+            node_path = node_input_paths[node_name]
             log_size = self._get_total_log_size(node_path)
             total_log_size += log_size
 
             # Prefer per-DUT JSON if available
             dut_json = node_path / ".metadata" / "collection_status.json"
-            if dut_json.exists():
+            if dut_json.exists() or self._terminal_snapshot_generation is not None:
                 try:
-                    with open(dut_json, "r", encoding="utf-8") as f:
-                        dut_status = json.load(f)
+                    dut_status = self._read_terminal_status(node_name)
+                    if dut_status is None:
+                        raise FileNotFoundError(dut_json)
                     collectors = dut_status.get("collectors", {})
                     total_collectors_all += len(collectors)
                     for _key, entry in collectors.items():
@@ -6816,6 +8488,17 @@ class HTMLReportService:
                                         anchor_id,
                                     )
                                 )
+                        elif status_text == "degraded":
+                            total_collectors_degraded += 1
+                            if report_file:
+                                status_collectors["degraded"][node_name].append(
+                                    (
+                                        collector_id,
+                                        collector_name,
+                                        report_file,
+                                        anchor_id,
+                                    )
+                                )
                         elif status_text == "error":
                             total_collectors_fail += 1
                             if report_file:
@@ -6852,6 +8535,25 @@ class HTMLReportService:
                                             anchor_id,
                                         )
                                     )
+                except SnapshotArtifactFormatError:
+                    if self._terminal_snapshot_generation is not None:
+                        raise
+                    statuses_for_node = self.node_statuses_all.get(node_name, [])
+                    for status in statuses_for_node:
+                        status_text = status.split()[0].lower()
+                        total_collectors_all += 1
+                        if status_text in ["complete", "success"]:
+                            total_collectors_pass += 1
+                        elif status_text == "degraded":
+                            total_collectors_degraded += 1
+                        elif status_text == "error":
+                            total_collectors_fail += 1
+                        elif status_text == "partial":
+                            total_collectors_partial += 1
+                        elif status_text == "skipped":
+                            total_collectors_skipped += 1
+                except SnapshotConsistencyError:
+                    raise
                 except Exception:
                     # Fallback to node_statuses_all if JSON parsing fails
                     statuses_for_node = self.node_statuses_all.get(node_name, [])
@@ -6860,6 +8562,8 @@ class HTMLReportService:
                         total_collectors_all += 1
                         if status_text in ["complete", "success"]:
                             total_collectors_pass += 1
+                        elif status_text == "degraded":
+                            total_collectors_degraded += 1
                         elif status_text == "error":
                             total_collectors_fail += 1
                         elif status_text == "partial":
@@ -6874,6 +8578,8 @@ class HTMLReportService:
                     total_collectors_all += 1
                     if status_text in ["complete", "success"]:
                         total_collectors_pass += 1
+                    elif status_text == "degraded":
+                        total_collectors_degraded += 1
                     elif status_text == "error":
                         total_collectors_fail += 1
                     elif status_text == "partial":
@@ -6882,7 +8588,20 @@ class HTMLReportService:
                         total_collectors_skipped += 1
 
         # Helper to build status tables for modal bodies
-        def build_status_table(data: Dict[str, List[Tuple[str, str, str, str]]]) -> str:
+        def build_status_table(
+            data: Dict[str, List[Tuple[str, str, str, str]]],
+        ) -> str:
+            """
+            Build status table.
+
+            The implementation uses ``data`` to build status table.
+
+            Args:
+                data: Mapping supplying fields for status table.
+
+            Returns:
+                The canonical status table text.
+            """
             if not data or not any(data.values()):
                 return '<p class="text-muted mb-0">No collectors found.</p>'
             rows = []
@@ -6895,11 +8614,27 @@ class HTMLReportService:
                 collectors_for_dut_sorted = sorted(
                     collectors_for_dut, key=lambda t: (t[0] or "").lower()
                 )
-                links = "<br>".join(
-                    f'<a href="{escape(dut)}/{escape(report_file)}#{escape(anchor_id)}">{escape(collector_id)} - {escape(collector_name)}</a>'
-                    for collector_id, collector_name, report_file, anchor_id in collectors_for_dut_sorted
+                collector_links = []
+                for (
+                    collector_id,
+                    collector_name,
+                    report_file,
+                    anchor_id,
+                ) in collectors_for_dut_sorted:
+                    label = self._escape_html_text(f"{collector_id} - {collector_name}")
+                    report_link = self._encoded_relative_report_link(dut, report_file)
+                    if report_link is None:
+                        collector_links.append(label)
+                        continue
+                    href = f"{report_link}#" f"{quote(str(anchor_id), safe='-._~')}"
+                    collector_links.append(
+                        f'<a href="{self._escape_html_text(href)}">{label}</a>'
+                    )
+                links = "<br>".join(collector_links)
+                rows.append(
+                    f"<tr><td>{self._escape_html_text(dut)}</td>"
+                    f"<td>{links}</td></tr>"
                 )
-                rows.append(f"<tr><td>{escape(dut)}</td><td>{links}</td></tr>")
             if not rows:
                 return '<p class="text-muted mb-0">No collectors found.</p>'
             return (
@@ -6918,9 +8653,23 @@ class HTMLReportService:
         overall_percent = 0
         if total_collectors_to_run > 0:
             overall_percent = total_collectors_pass / total_collectors_to_run * 100
+        run_result = self._read_run_result()
+        if run_result is None:
+            outcome_projection = ""
+        else:
+            result_document = run_result.to_dict()
+            outcome_projection = f"""
+            <div class="alert alert-secondary" role="status" data-run-result-schema="1.0">
+                <strong>Runtime outcome:</strong> {escape(run_result.runtime_status.value)}
+                <span class="mx-3">|</span>
+                <strong>Collection outcome:</strong> {escape(run_result.collection_status.value)}
+            </div>
+            <script id="nvdebug-run-result" type="application/json">{self._json_for_script(result_document, sort_keys=True)}</script>
+            """
         executive_summary = f"""
         <div class="mb-3">
             <h2 class="mb-4">Executive Summary</h2>
+            {outcome_projection}
             <div class="row mb-3">
                 <div class="col-md-4">
                     <div class="card text-white bg-primary mb-3 h-100" style="cursor: pointer;" data-bs-toggle="modal" data-bs-target="#dutModal">
@@ -6951,7 +8700,7 @@ class HTMLReportService:
                 </div>
             </div>
             <div class="row mb-3">
-                <div class="col-md-3">
+                <div class="col">
                     <div class="card text-white bg-success mb-3 h-100" style="cursor: pointer;" data-bs-toggle="modal" data-bs-target="#passedModal">
                         <div class="card-body text-center">
                             <h5 class="card-title">Passed Collectors</h5>
@@ -6960,7 +8709,16 @@ class HTMLReportService:
                         </div>
                     </div>
                 </div>
-                <div class="col-md-3">
+                <div class="col">
+                    <div class="card mb-3 h-100" style="cursor: pointer; background: linear-gradient(135deg, #f59e0b 0%, #fbbf24 100%); color: #ffffff;" data-bs-toggle="modal" data-bs-target="#degradedModal">
+                        <div class="card-body text-center">
+                            <h5 class="card-title">Degraded Collectors</h5>
+                            <p class="display-4">{total_collectors_degraded}</p>
+                            <small>of {total_collectors_to_run} to run</small>
+                        </div>
+                    </div>
+                </div>
+                <div class="col">
                     <div class="card text-white bg-danger mb-3 h-100" style="cursor: pointer;" data-bs-toggle="modal" data-bs-target="#failedModal">
                         <div class="card-body text-center">
                             <h5 class="card-title">Failed Collectors</h5>
@@ -6969,7 +8727,7 @@ class HTMLReportService:
                         </div>
                     </div>
                 </div>
-                <div class="col-md-3">
+                <div class="col">
                     <div class="card mb-3 h-100" style="cursor: pointer; background: linear-gradient(315deg, #ffd54f 0%, #fff176 100%); color: #ffffff;" data-bs-toggle="modal" data-bs-target="#partialModal">
                         <div class="card-body text-center">
                             <h5 class="card-title">Partial Collectors</h5>
@@ -6978,7 +8736,7 @@ class HTMLReportService:
                         </div>
                     </div>
                 </div>
-                <div class="col-md-3">
+                <div class="col">
                     <div class="card mb-3 h-100" style="cursor: pointer; background: linear-gradient(135deg, #ff9800 0%, #ffc107 100%); color: #ffffff;" data-bs-toggle="modal" data-bs-target="#skippedModal">
                         <div class="card-body text-center">
                             <h5 class="card-title">Skipped Collectors</h5>
@@ -7013,7 +8771,7 @@ class HTMLReportService:
                             <hr>
                             <h6 class="text-muted mb-2">Runtime Logs</h6>
                             <div class="list-group" id="runtimeLogsList">
-                                <!-- Will be populated dynamically -->
+                                __NVDEBUG_RUNTIME_LOG_LINKS__
                             </div>
                         </div>
                     </div>
@@ -7026,6 +8784,10 @@ class HTMLReportService:
                                 <div class="progress-bar bg-success" role="progressbar" style="width: {(total_collectors_pass/total_collectors_to_run*100) if total_collectors_to_run > 0 else 0:.1f}%"
                                      aria-valuenow="{total_collectors_pass}" aria-valuemin="0" aria-valuemax="{total_collectors_to_run}">
                                     {total_collectors_pass} Pass
+                                </div>
+                                <div class="progress-bar" role="progressbar" style="background-color: #f59e0b; color: #fff; width: {(total_collectors_degraded/total_collectors_to_run*100) if total_collectors_to_run > 0 else 0:.1f}%"
+                                     aria-valuenow="{total_collectors_degraded}" aria-valuemin="0" aria-valuemax="{total_collectors_to_run}">
+                                    {total_collectors_degraded} Degraded
                                 </div>
                                 <div class="progress-bar bg-danger" role="progressbar" style="width: {(total_collectors_fail/total_collectors_to_run*100) if total_collectors_to_run > 0 else 0:.1f}%"
                                      aria-valuenow="{total_collectors_fail}" aria-valuemin="0" aria-valuemax="{total_collectors_to_run}">
@@ -7073,12 +8835,22 @@ class HTMLReportService:
             status = self.node_statuses.get(node_name, "Unknown")
             exec_time = self.node_execution_times.get(node_name, 0)
             exec_time_str = self._format_time(exec_time) if exec_time > 0 else "N/A"
-            status_class = f"status-{status.lower()}"
+            status_class = "status-" + re.sub(r"[^a-z0-9_-]", "-", str(status).lower())
+            node_report_link = self._encoded_relative_report_link(
+                node_name, "report.html"
+            )
+            if node_report_link is None:
+                node_link_cell = self._escape_html_text(node_name)
+            else:
+                node_link_cell = (
+                    f'<a href="{self._escape_html_text(node_report_link)}">'
+                    f"{self._escape_html_text(node_name)}</a>"
+                )
             executive_summary += f"""
                                 <tr>
-                                    <td><a href="{node_name}/report.html">{escape(node_name)}</a></td>
-                                    <td><span class="badge {status_class}">{escape(status)}</span></td>
-                                    <td>{escape(exec_time_str)}</td>
+                                    <td>{node_link_cell}</td>
+                                    <td><span class="badge {status_class}">{self._escape_html_text(status)}</span></td>
+                                    <td>{self._escape_html_text(exec_time_str)}</td>
                                 </tr>
             """
 
@@ -7117,6 +8889,22 @@ class HTMLReportService:
                         <p class="lead">{total_collectors_pass} collectors passed out of {total_collectors_to_run} total</p>
                         <p>Success Rate: {success_rate:.1f}%</p>
                         {build_status_table(status_collectors["pass"]) }
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="modal fade" id="degradedModal" tabindex="-1">
+            <div class="modal-dialog modal-lg">
+                <div class="modal-content">
+                    <div class="modal-header" style="background: #f59e0b; color: #ffffff;">
+                        <h5 class="modal-title">Degraded Collectors</h5>
+                        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                    </div>
+                    <div class="modal-body">
+                        <p class="lead">Degraded: {total_collectors_degraded} collectors completed with usable primary evidence and optional failures out of {total_collectors_all} total</p>
+                        <p>Degraded rate: {((total_collectors_degraded/total_collectors_to_run)*100) if total_collectors_to_run > 0 else 0:.1f}%</p>
+                        {build_status_table(status_collectors["degraded"]) }
                     </div>
                 </div>
             </div>
@@ -7187,7 +8975,7 @@ class HTMLReportService:
         # Add per-DUT log sizes
         for report_html in node_reports_sorted:
             node_name = report_html.parent.name
-            node_path = self.root_dir / node_name
+            node_path = node_input_paths[node_name]
             log_size = self._get_total_log_size(node_path)
             executive_summary += f"""
                                 <tr>
@@ -7228,14 +9016,23 @@ class HTMLReportService:
 
         for report_html in node_reports_sorted:
             node_name = report_html.parent.name
-            relative_path = os.path.relpath(report_html, self.report_dir).replace(
-                "\\", "/"
+            node_report_link = self._encoded_relative_report_link(
+                node_name, "report.html"
             )
+            if node_report_link is None:
+                report_link_control = (
+                    '<span class="text-muted">Report unavailable</span>'
+                )
+            else:
+                report_link_control = (
+                    f'<a href="{self._escape_html_text(node_report_link)}" '
+                    'class="btn btn-dark btn-sm d-inline-block">View Report</a>'
+                )
             exec_time = self.node_execution_times.get(node_name, 0.0)
             tdisp = self._format_time(exec_time) if exec_time else "N/A"
 
             # --- Compute total log size for the node (excluding its report directory) ---
-            node_path = self.root_dir / node_name
+            node_path = node_input_paths[node_name]
             log_size = self._get_total_log_size(node_path)
             log_size_str = self._format_bytes(log_size)
 
@@ -7280,7 +9077,7 @@ class HTMLReportService:
                 <div class="modal-dialog modal-xl">
                     <div class="modal-content">
                         <div class="modal-header">
-                            <h5 class="modal-title" id="{firmware_modal_id}Label">Firmware Information - {node_name}</h5>
+                            <h5 class="modal-title" id="{firmware_modal_id}Label">Firmware Information - {self._escape_html_text(node_name)}</h5>
                             <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
                         </div>
                         <div class="modal-body">
@@ -7304,9 +9101,9 @@ class HTMLReportService:
 
             node_table += f"""
             <tr>
-            <td>{escape(node_name)}</td>
-            <td class="text-center"><a href=\"{escape(relative_path)}\" class=\"btn btn-dark btn-sm d-inline-block\">View Report</a></td>
-            <td>{escape(tdisp)}</td>
+            <td>{self._escape_html_text(node_name)}</td>
+            <td class="text-center">{report_link_control}</td>
+            <td>{self._escape_html_text(tdisp)}</td>
             <td>{sys_display}</td>
             <td>{firmware_display}</td>
             <td>{escape(log_size_str)}</td>
@@ -7317,13 +9114,21 @@ class HTMLReportService:
         runtime_logs_list = ""
         for file_info in self.root_level_files:
             file_path = self.root_dir / file_info["path"]
-            if file_path.exists():
+            if self._report_input_is_file(file_path):
                 try:
                     fv = await self._generate_file_view(
                         file_path, file_info["display_name"]
                     )
+                    encoded_fv = self._encoded_report_relative_path(f"reports/{fv}")
+                    if encoded_fv is None:
+                        runtime_logs_list += (
+                            '<span class="list-group-item">'
+                            f"{self._escape_html_text(file_info['display_name'])}"
+                            "</span>"
+                        )
+                        continue
                     runtime_logs_list += f"""
-                    <a href="reports/{escape(fv)}" class="list-group-item list-group-item-action">
+                    <a href="{self._escape_html_text(encoded_fv)}" class="list-group-item list-group-item-action">
                         <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-file-text me-2" viewBox="0 0 16 16">
                             <path d="M5 4a.5.5 0 0 0 0 1h6a.5.5 0 0 0 0-1H5zm-.5 2.5A.5.5 0 0 1 5 6h6a.5.5 0 0 1 0 1H5a.5.5 0 0 1-.5-.5zM5 8a.5.5 0 0 0 0 1h6a.5.5 0 0 0 0-1H5zm0 2a.5.5 0 0 0 0 1h3a.5.5 0 0 0 0-1H5z"/>
                             <path d="M2 2a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V2zm10-1H4a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V2a1 1 0 0 0-1-1z"/>
@@ -7331,24 +9136,19 @@ class HTMLReportService:
                         {escape(file_info['display_name'])}
                     </a>
                     """
+                except ReportInputSafetyError:
+                    raise
                 except Exception as e:
                     await self._log(
                         "ERROR",
                         f"Error generating view for {file_info['path']}: {e}",
                     )
 
-        # Add script to populate runtime logs
-        runtime_logs_script = f"""
-        <script>
-            document.addEventListener('DOMContentLoaded', function() {{
-                const runtimeLogsList = document.getElementById('runtimeLogsList');
-                if (runtimeLogsList) {{
-                    runtimeLogsList.innerHTML = `{runtime_logs_list}`;
-                }}
-            }});
-        </script>
-        """
-        node_table = node_table + runtime_logs_script
+        # Insert authored, escaped markup directly. Re-parsing it through a JavaScript
+        # template literal would create a second and unnecessary injection context.
+        node_table = node_table.replace(
+            "__NVDEBUG_RUNTIME_LOG_LINKS__", runtime_logs_list, 1
+        )
 
         node_table += "</tbody></table>"
 
@@ -7395,6 +9195,7 @@ class HTMLReportService:
             "n/a": "#d3d3d3",
             "notran": "#d3d3d3",
             "skipped": "#ffc107",
+            "degraded": "#f59e0b",
             "partial": "#fffacd",
             "unknown": "#17a2b8",
         }
@@ -7464,6 +9265,23 @@ class HTMLReportService:
             "labels": [escape(n) for (n, _) in execution_times],
             "datasets": datasets,
         }
+        status_labels_json = self._json_for_script(chart_data_status["labels"])
+        status_counts_json = self._json_for_script(chart_data_status["counts"])
+        status_colors_json = self._json_for_script(status_colors)
+        time_tooltip_labels_json = self._json_for_script(tooltip_labels_time)
+        chart_data_time_json = self._json_for_script(chart_data_time)
+        size_labels_json = self._json_for_script(
+            [escape(name) for name, _duration in execution_times]
+        )
+        size_data_json = self._json_for_script(
+            [
+                round(
+                    self._get_total_log_size(node_input_paths[name]) / (1024 * 1024),
+                    2,
+                )
+                for name, _duration in execution_times
+            ]
+        )
 
         charts_script = f"""
         <div class="section">
@@ -7510,12 +9328,6 @@ class HTMLReportService:
         </div>
 
         <script>
-        // Add Bootstrap Icons CSS
-        var link = document.createElement('link');
-        link.rel = 'stylesheet';
-        link.href = 'https://cdn.jsdelivr.net/npm/bootstrap-icons@1.7.2/font/bootstrap-icons.css';
-        document.head.appendChild(link);
-
         // Chart instances storage
         var chartInstances = {{}};
         var fullscreenModal = null;
@@ -7755,10 +9567,10 @@ class HTMLReportService:
         var statusChart = new Chart(ctxStatus,{{
             type:'pie',
             data:{{
-            labels:{json.dumps(chart_data_status['labels'])},
+            labels:{status_labels_json},
             datasets:[{{
-                data:{json.dumps(chart_data_status['counts'])},
-                backgroundColor:{json.dumps(status_colors)},
+                data:{status_counts_json},
+                backgroundColor:{status_colors_json},
                 borderWidth:1
             }}]
             }},
@@ -7797,12 +9609,12 @@ class HTMLReportService:
         chartInstances.statusChart = statusChart;
 
         // Store tooltip labels for time chart
-        var timeTooltipLabels = {json.dumps(tooltip_labels_time)};
+        var timeTooltipLabels = {time_tooltip_labels_json};
 
         var ctxTime = document.getElementById('timeChart').getContext('2d');
         var timeChart = new Chart(ctxTime,{{
             type: 'bar',
-            data: {json.dumps(chart_data_time)},
+            data: {chart_data_time_json},
             options: {{
                 responsive: true,
                 interaction: {{
@@ -7861,10 +9673,10 @@ class HTMLReportService:
         var sizeChart = new Chart(ctxSize,{{
             type:'bar',
             data:{{
-            labels:{json.dumps([escape(n) for n, _ in execution_times])},
+            labels:{size_labels_json},
             datasets:[{{
                 label:'Log Size (MB)',
-                data:{json.dumps([round(self._get_total_log_size(self.root_dir / n) / (1024*1024), 2) for n, _ in execution_times])},
+                data:{size_data_json},
                 backgroundColor:'#28a745',
                 borderColor:'#28a745',
                 borderWidth:1
@@ -7985,11 +9797,21 @@ class HTMLReportService:
 
     async def _generate_status_detail_pages(self) -> None:
         """
-        Generates separate HTML pages for each execution status,
-        using the same file-link logic as _generate_node_report.
+        Generate status detail pages.
+
+        The implementation uses current instance state to generate status detail
+        pages. Owned asynchronous work is awaited before return, so completion
+        does not leave an unobserved task behind.
+
+        Raises:
+            FileNotFoundError: If a status entry names a node outside the
+                authorized report input roster.
         """
         # Get unique statuses and their counts
         status_counts = {}
+        node_input_paths = {
+            node_path.name: node_path for node_path in self._iter_node_directories()
+        }
         for entry in self.global_execution_entries:
             status = entry["Execution Status"]
             status_counts[status] = status_counts.get(status, 0) + 1
@@ -8023,6 +9845,7 @@ class HTMLReportService:
                 <th>Collector ID</th>
                 <th>Collector Name</th>
                 <th>Collector Exec Time</th>
+                <th>Failure Category</th>
                 <th>Log Path(s)</th>
                 </tr>
             </thead>
@@ -8033,7 +9856,11 @@ class HTMLReportService:
             for idx, entry in enumerate(filtered_entries):
                 node_name = entry["Node Name"]
                 log_paths = entry["Log Path(s)"]
-                node_path = self.root_dir / node_name
+                node_path = node_input_paths.get(node_name)
+                if node_path is None:
+                    raise FileNotFoundError(
+                        f"Status detail source is unavailable: {node_name}"
+                    )
 
                 modal_id_prefix = f"logModal_status_{status_normalized}_{idx}"
                 link_objs = []
@@ -8063,10 +9890,11 @@ class HTMLReportService:
                 table_html += f"""
                 <tr>
                 <td>{escape(node_name)}</td>
-                <td>{escape(entry['Collector Group'])}</td>
-                <td>{escape(entry['Collector ID'])}</td>
-                <td>{escape(entry['Collector Name'])}</td>
-                <td>{escape(entry['Collector Exec Time'])}</td>
+                <td>{escape(entry["Collector Group"])}</td>
+                <td>{escape(entry["Collector ID"])}</td>
+                <td>{escape(entry["Collector Name"])}</td>
+                <td>{escape(entry["Collector Exec Time"])}</td>
+                <td>{escape(str(entry.get("Failure Category") or "N/A"))}</td>
                 <td>{log_path_display}</td>
                 </tr>
                 """
@@ -8085,7 +9913,11 @@ class HTMLReportService:
 
     async def _generate_global_file_map(self) -> None:
         """
-        Generates a global File Map page (file_map.html) with both a Table and Tree view.
+        Generate global file map.
+
+        The implementation uses current instance state to generate global file
+        map. Owned asynchronous work is awaited before return, so completion
+        does not leave an unobserved task behind.
         """
         tree_data = {}
         for item in self.global_file_map_data:
@@ -8093,9 +9925,8 @@ class HTMLReportService:
             group_val = item["Collector Group"]
             cid_val = item["Collector ID/Name"]
             file_val = item["File Path"]
-            # link_val = item["Link"]
             base_link = item["Link"]
-            link_val = f"{node_val}/{base_link}"
+            link_val = self._encoded_relative_report_link(node_val, base_link)
 
             parts = []
             if node_val and node_val != "N/A":
@@ -8158,14 +9989,14 @@ class HTMLReportService:
                 <label for="dutFilter" class="form-label">Filter by DUT</label>
                 <select class="form-select" id="dutFilter" onchange="filterFileMap()">
                     <option value="">All DUTs</option>
-                    {"".join(f'<option value="{escape(node)}">{escape(node)}</option>' for node in sorted(nodes_set))}
+                    {"".join(f'<option value="{self._escape_html_text(node)}">{self._escape_html_text(node)}</option>' for node in sorted(nodes_set))}
                 </select>
             </div>
             <div class="col-md-3">
                 <label for="groupFilter" class="form-label">Filter by Group</label>
                 <select class="form-select" id="groupFilter" onchange="filterFileMap()">
                     <option value="">All Groups</option>
-                    {"".join(f'<option value="{escape(group)}">{escape(group)}</option>' for group in sorted(groups_set))}
+                    {"".join(f'<option value="{self._escape_html_text(group)}">{self._escape_html_text(group)}</option>' for group in sorted(groups_set))}
                 </select>
             </div>
         </div>
@@ -8183,6 +10014,7 @@ class HTMLReportService:
         </thead>
         <tbody>
         """
+        file_map_links: List[str] = []
         for row in self.global_file_map_data:
 
             node_val = row["Node Name"]
@@ -8190,38 +10022,67 @@ class HTMLReportService:
             cid_val = row["Collector ID/Name"]
             file_val = row["File Path"]
             base_link = row["Link"]
-            link_val = f"{node_val}/{base_link}"
+            link_val = self._encoded_relative_report_link(node_val, base_link)
+            if link_val is None:
+                file_link_control = (
+                    '<span class="text-muted file-link-disabled">'
+                    f"{self._escape_html_text(file_val)}</span>"
+                )
+            else:
+                link_index = len(file_map_links)
+                file_map_links.append(link_val)
+                file_link_control = f"""
+                  <button type="button" class="btn btn-link p-0 file-link"
+                          data-file-index="{link_index}">
+                    {self._escape_html_text(file_val)}
+                  </button>
+                """
             table_html += f"""
             <tr>
-            <td>{escape(node_val)}</td>
-            <td>{escape(group_val)}</td>
-            <td>{escape(cid_val)}</td>
-            <!--
-              NOTE: This page also includes a Tree View with normal <a> links.
-              Using <a href> here too creates duplicate href targets in the HTML.
-              To keep the Table View navigable while avoiding duplicate hrefs, we render
-              a button that navigates via JS.
-            -->
+            <td>{self._escape_html_text(node_val)}</td>
+            <td>{self._escape_html_text(group_val)}</td>
+            <td>{self._escape_html_text(cid_val)}</td>
             <td>
-              <button type="button" class="btn btn-link p-0 file-link"
-                      onclick='window.location.href={json.dumps(link_val)}'>
-                {escape(row['File Path'])}
-              </button>
+              {file_link_control}
             </td>
             </tr>
             """
         table_html += "</tbody></table>"
 
         def build_tree_html(obj):
+            """
+            Build tree HTML.
+
+            The implementation uses ``obj`` to build tree HTML.
+
+            Args:
+                obj: Object whose ``keys`` state is read while performing
+                    tree HTML.
+
+            Returns:
+                The validated ``html``.
+            """
             html = "<ul>"
             for k in sorted(obj.keys()):
                 val_obj = obj[k]
                 if isinstance(val_obj, dict):
-                    html += f'<li class="folder"><span>{escape(k)}</span>'
+                    html += (
+                        '<li class="folder"><span>'
+                        f"{self._escape_html_text(k)}</span>"
+                    )
                     html += build_tree_html(val_obj)
                     html += "</li>"
+                elif val_obj is None:
+                    html += (
+                        '<li class="file"><span class="text-muted">'
+                        f"{self._escape_html_text(k)}</span></li>"
+                    )
                 else:
-                    html += f'<li class="file"><a href="{escape(val_obj)}">{escape(k)}</a></li>'
+                    html += (
+                        '<li class="file">'
+                        f'<a href="{self._escape_html_text(val_obj)}">'
+                        f"{self._escape_html_text(k)}</a></li>"
+                    )
             html += "</ul>"
             return html
 
@@ -8234,7 +10095,14 @@ class HTMLReportService:
         tree_html += "</div>"
 
         # Add JavaScript for filtering and sorting
-        js_script = """
+        file_map_link_data = (
+            '<script id="fileMapLinks" type="application/json">'
+            f"{self._json_for_script(file_map_links)}"
+            "</script>"
+        )
+        js_script = (
+            file_map_link_data
+            + """
         <script>
         // File map filtering
         function filterFileMap() {
@@ -8297,6 +10165,25 @@ class HTMLReportService:
 
         // Tree view expand/collapse
         document.addEventListener('DOMContentLoaded', function() {
+            const linkDataElement = document.getElementById('fileMapLinks');
+            let fileMapLinks = [];
+            if (linkDataElement) {
+                try {
+                    const parsedLinks = JSON.parse(linkDataElement.textContent);
+                    if (Array.isArray(parsedLinks)) fileMapLinks = parsedLinks;
+                } catch (_error) {
+                    fileMapLinks = [];
+                }
+            }
+            document.querySelectorAll('.file-link[data-file-index]').forEach(function(button) {
+                const index = Number(button.getAttribute('data-file-index'));
+                const target = Number.isSafeInteger(index) ? fileMapLinks[index] : null;
+                if (typeof target !== 'string') return;
+                button.addEventListener('click', function() {
+                    window.location.assign(target);
+                });
+            });
+
             console.log('Setting up tree view...');
 
             // Get the root UL (direct child of #treeview)
@@ -8404,6 +10291,7 @@ class HTMLReportService:
         }
         </style>
         """
+        )
 
         content = table_html + tree_html + js_script
         file_map_html_path = self.report_dir / "file_map.html"
@@ -8411,13 +10299,16 @@ class HTMLReportService:
 
     async def _parse_runtime_output(self, node_path: Path) -> Dict[str, str]:
         """
-        Parses metadata/metadata.json or nvdebug_runtime_output.txt to extract system details.
+        Parse runtime output.
+
+        Check for metadata.json in both metadata and .metadata directories.
 
         Args:
-            node_path (Path): Path to the node directory.
+            node_path: filesystem location used as the node path for this
+                operation.
 
         Returns:
-            Dict[str, str]: Dictionary containing 'Model', 'Partno', and 'Serialno'.
+            A mapping containing runtime output.
         """
         details = {
             "Model": "Unknown",
@@ -8460,23 +10351,26 @@ class HTMLReportService:
                         details["Collectors"] = ", ".join(collector_list)
 
                 return details
+            except ReportInputSafetyError:
+                raise
             except Exception as e:
                 await self._log("ERROR", f"Error reading {meta_json}: {e}")
 
         # fallback runtime
-        if runtime_txt.is_file():
+        if self._report_input_is_file(runtime_txt):
             try:
-                with runtime_txt.open("r", encoding="utf-8") as f:
-                    for line_str in f:
-                        match_line = re.search(
-                            r"Identified system as Model:\s*(?P<model>[^,]+),\s*Partno:\s*(?P<part>[^,]+),\s*Serialno:\s*(?P<ser>\d+)",
-                            line_str,
-                        )
-                        if match_line:
-                            details["Model"] = match_line.group("model").strip()
-                            details["Partno"] = match_line.group("part").strip()
-                            details["Serialno"] = match_line.group("ser").strip()
-                            return details
+                for line_str in self._read_report_text(runtime_txt).splitlines():
+                    match_line = re.search(
+                        r"Identified system as Model:\s*(?P<model>[^,]+),\s*Partno:\s*(?P<part>[^,]+),\s*Serialno:\s*(?P<ser>\d+)",
+                        line_str,
+                    )
+                    if match_line:
+                        details["Model"] = match_line.group("model").strip()
+                        details["Partno"] = match_line.group("part").strip()
+                        details["Serialno"] = match_line.group("ser").strip()
+                        return details
+            except ReportInputSafetyError:
+                raise
             except Exception as e:
                 await self._log("ERROR", f"Error reading {runtime_txt}: {e}")
         await self._log("DEBUG", f"No system details found for {node_path.name}")
@@ -8484,12 +10378,24 @@ class HTMLReportService:
 
     def _get_collector_groups(self, node_path: Path) -> List[Path]:
         """
-        Identifies collector-group directories for a node. Returns groups that have collected data
-        (either from directory contents or JSON metadata) to avoid 404 errors in navigation.
+        Identifies collector-group directories for a node.
+
+        Returns groups that have collected data (either from directory contents
+        or JSON metadata) to avoid 404 errors in navigation.
+
+        Args:
+            node_path: filesystem location used as the node path for this
+                operation.
+
+        Returns:
+            The validated ``result``.
         """
         excluded = self.excluded_collector_groups
+        node_entries = self._walk_report_inputs(node_path, recursive=False)
         found_dirs = [
-            d for d in node_path.iterdir() if d.is_dir() and d.name not in excluded
+            entry.path
+            for entry in node_entries
+            if entry.is_dir and entry.path.name not in excluded
         ]
         result = []
         node_name = node_path.name
@@ -8515,7 +10421,11 @@ class HTMLReportService:
                         break
 
             # Second priority: Check if the directory exists and has files (actual collected data)
-            if not group_has_data and group_path.is_dir() and any(group_path.iterdir()):
+            if (
+                not group_has_data
+                and self._report_input_is_dir(group_path)
+                and bool(self._walk_report_inputs(group_path, recursive=False))
+            ):
                 group_has_data = True
 
             if group_has_data:
@@ -8527,15 +10437,23 @@ class HTMLReportService:
         for d in found_dirs:
             if d.name.lower() not in known_lowers:
                 # Only include directories that actually contain files
-                if any(d.iterdir()):
+                if self._walk_report_inputs(d, recursive=False):
                     result.append(d)
         return result
 
     def _parse_collector_info_from_path(self, lp: str) -> Tuple[str, str, str]:
         """
         Parse collector information from path.
-        Supports both legacy format and new format where service name comes from parent directory.
-        Prioritizes collector ID prefix over directory name for proper group classification.
+
+        Supports both legacy format and new format where service name comes from
+        parent directory. Prioritizes collector ID prefix over directory name
+        for proper group classification.
+
+        Args:
+            lp: Text supplied as lp in the format accepted by this function.
+
+        Returns:
+            A tuple containing ``cg``, ``cid``, and ``cname`` in that order.
         """
         normalized = lp.lstrip("/")
         parts = normalized.split("/")
@@ -8601,7 +10519,17 @@ class HTMLReportService:
     def _parse_from_name(self, base_name: str) -> Tuple[str, str, str]:
         """
         Parse collector information from directory name.
-        Supports both legacy format (Redfish_R8_firmware_inventory) and new format (R8_firmware_inventory).
+
+        Supports both legacy format (Redfish_R8_firmware_inventory) and new
+        format (R8_firmware_inventory).
+
+        Args:
+            base_name: Stable base name used for lookup and operator-facing
+                diagnostics.
+
+        Returns:
+            A tuple containing the collector group, collector identifier, and
+            display name.
         """
         cparts = base_name.split("_")
 
@@ -8634,7 +10562,19 @@ class HTMLReportService:
     ) -> Tuple[str, str, str]:
         """
         Parse collector group, ID, and name from a collection name.
+
         Returns (group, id, name) tuple.
+
+        Use the orchestrator to get collector information from the actual
+        definitions.
+
+        Args:
+            collection_name: Stable collection name used for lookup and
+                operator-facing diagnostics.
+
+        Returns:
+            A tuple containing the collector group, collector identifier, and
+            display name.
         """
         if not collection_name:
             return ("N/A", "N/A", "N/A")
@@ -8680,6 +10620,8 @@ class HTMLReportService:
                         collector_name,
                     )
 
+            except ReportInputSafetyError:
+                raise
             except Exception as e:
                 # Log error but continue with fallback
                 print(f"Warning: Could not get collector info from orchestrator: {e}")
@@ -8693,23 +10635,66 @@ class HTMLReportService:
                 cg = correct_group
         return (cg, cid, cname)
 
+    def _file_view_renderer(self) -> HTMLReportFileView:
+        """
+        Bind the synchronous file-view boundary to current service state.
+
+        After applying local validation, the function forwards current instance
+        state to ``HTMLReportFileView`` and preserves its return and exception
+        contract.
+
+        Returns:
+            A ``HTMLReportFileView`` representing file view renderer.
+        """
+
+        return HTMLReportFileView(
+            root_dir=self.root_dir,
+            report_dir=self.report_dir,
+            max_parseable_file_size=self.max_parseable_file_size,
+            log_files_with_viewer=self.log_files_with_viewer,
+            format_bytes=self._format_bytes,
+            logical_relative_path=self._logical_report_input_relative_path,
+            get_html_output_path=self._get_html_output_path,
+            get_html_output_path_for_file=self._get_html_output_path_for_file,
+            write_html_report=self._write_html_report,
+            json_tree_html=self._json_tree_html,
+            generate_log_viewer=self._generate_log_viewer,
+            inspect_input=self._inspect_report_input,
+            read_json=self._read_report_json,
+            read_text=self._read_report_text,
+            fail_closed_exceptions=(ReportInputSafetyError,),
+        )
+
     async def _generate_file_view(
         self, file_path: Path, display_name: str = None
     ) -> str:
         """
-        Generates an HTML view for a given file (json/text/log) or a direct download page for binary, etc.
+        Generate file view.
+
+        The implementation uses ``file_path`` and ``display_name`` to generate
+        file view. Owned asynchronous work is awaited before return, so
+        completion does not leave an unobserved task behind.
 
         Args:
-            file_path (Path): Path to the file to generate view for
-            display_name (str, optional): Display name to use for the view title. If None, uses file_path.name
+            file_path: filesystem location used as the file path for this
+                operation.
+            display_name: Stable display name used for lookup and
+                operator-facing diagnostics.
+
+        Returns:
+            The canonical generate file view text.
         """
         ext = file_path.suffix.lower()
         if ext == ".json":
-            return self._generate_json_view(file_path, display_name)
+            return await run_managed_filesystem_operation(
+                self._generate_json_view, file_path, display_name
+            )
         elif ext in (".txt", ".log"):
             return await self._generate_text_view(file_path, display_name)
         else:
-            return self._generate_download_view(file_path, display_name)
+            return await run_managed_filesystem_operation(
+                self._generate_download_view, file_path, display_name
+            )
 
     def _generate_download_view(
         self, file_path: Path, display_name: str = None, message: str = None
@@ -8717,823 +10702,335 @@ class HTMLReportService:
         """
         Generates an HTML page that offers a direct download link for files.
 
+        After applying local validation, the function forwards ``file_path``,
+        ``display_name``, and ``message`` to ``generate_download_view`` and
+        preserves its return and exception contract.
+
         Args:
-            file_path: Path to the file
-            display_name: Display name for the file
-            message: Custom message to show (default: generic message)
+            file_path: filesystem location used as the file path for this
+                operation.
+            display_name: Stable display name used for lookup and
+                operator-facing diagnostics.
+            message: Operator-facing text carried by the reported event or
+                failure.
+
+        Returns:
+            The canonical generate download view text.
         """
-        display_name = display_name or file_path.name
-
-        # Default message if none provided
-        if message is None:
-            message = "Unable to parse this file. Please download to view."
-
-        download_html_name = f"{file_path.name}_download.html"
-        html_file_path = self._get_html_output_path(
-            file_path.parent, download_html_name
+        return self._file_view_renderer().generate_download_view(
+            file_path, display_name, message
         )
-        # Compute relative path from the download HTML file's directory to the original file.
-        relative_file = os.path.relpath(
-            file_path, os.path.dirname(html_file_path)
-        ).replace("\\", "/")
-
-        # Get file size for display
-        try:
-            file_size = file_path.stat().st_size
-            file_size_str = self._format_bytes(file_size)
-        except Exception:
-            file_size_str = "Unknown size"
-
-        content = f"""
-        <div class="card">
-            <div class="card-body">
-                <h2>File: {escape(display_name)}</h2>
-                <div class="alert alert-info" role="alert">
-                    <i class="bi bi-info-circle"></i> {escape(message)}
-                </div>
-                <p><strong>File Size:</strong> {file_size_str}</p>
-                <p><a href="{escape(relative_file)}" download class="btn btn-primary btn-lg">
-                    <i class="bi bi-download"></i> Download {escape(display_name)}
-                </a></p>
-            </div>
-        </div>
-        """
-        rel_html_path = self._write_html_report(
-            html_file_path, f"Download: {display_name}", content
-        )
-        node_name = file_path.relative_to(self.root_dir).parts[0]
-        base_dir = self.report_dir / node_name
-        link = os.path.relpath(self.report_dir / rel_html_path, base_dir).replace(
-            "\\", "/"
-        )
-        return link
 
     def _download_view_if_too_large(
         self, file_path: Path, display_name: str
     ) -> Optional[str]:
         """
-        If file exceeds max_parseable_file_size, return a download-only HTML link; otherwise None.
+        Return the download view if too large.
+
+        After applying local validation, the function forwards ``file_path`` and
+        ``display_name`` to ``download_view_if_too_large`` and preserves its
+        return and exception contract.
 
         Args:
-            file_path: Path to the file to check
-            display_name: Label to display in the generated page
+            file_path: filesystem location used as the file path for this
+                operation.
+            display_name: Stable display name used for lookup and
+                operator-facing diagnostics.
 
         Returns:
-            Link to the generated download view, or None if size is acceptable or check fails
+            The canonical download view if too large text, or ``None`` when the
+            requested value is unavailable.
         """
-        try:
-            file_size = file_path.stat().st_size
-            if file_size > self.max_parseable_file_size:
-                file_size_mb = file_size / (1024 * 1024)
-                message = (
-                    f"This file is too large ({file_size_mb:.1f} MB) to parse and display in the browser. "
-                    f"Files larger than {self.max_parseable_file_size / (1024 * 1024):.0f} MB are download-only for performance. "
-                    f"Please download the file to view it locally."
-                )
-                return self._generate_download_view(file_path, display_name, message)
-        except Exception:
-            # If size check fails, just fall through and attempt to parse
-            pass
-        return None
+        return self._file_view_renderer().download_view_if_too_large(
+            file_path, display_name
+        )
 
     def _generate_json_view(self, file_path: Path, display_name: str = None) -> str:
         """
-        Generates an HTML page with JSON syntax highlighting, or fallback to download if unreadable.
-        Large files (>50MB) are automatically set to download-only for performance.
-        """
-        display_name = display_name or file_path.name
+        Generate JSON view.
 
-        # Check file size - if too large, create download view instead
-        maybe = self._download_view_if_too_large(file_path, display_name)
-        if maybe:
-            return maybe
+        After applying local validation, the function forwards ``file_path`` and
+        ``display_name`` to ``generate_json_view`` and preserves its return and
+        exception contract.
 
-        try:
-            with file_path.open("r", encoding="utf-8", errors="strict") as f:
-                data = json.load(f)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            return self._generate_download_view(file_path, display_name)
-        except Exception as e:
-            data = {"error": f"Error reading file: {e}"}
-        tree_html = self._json_tree_html(data)
-        content = f"""
-        <div class="card">
-            <div class="card-body">
-                <h2>File: {escape(display_name)}</h2>
-                <div id="jsonTree" class="json-tree">{tree_html}</div>
-            </div>
-        </div>
+        Args:
+            file_path: filesystem location used as the file path for this
+                operation.
+            display_name: Stable display name used for lookup and
+                operator-facing diagnostics.
+
+        Returns:
+            The canonical generate JSON view text.
         """
-        content += """
-        <script>
-        function toggleChildren(event) {
-          event.stopPropagation();
-          var next = this.nextElementSibling;
-          if (next) {
-             if (next.style.display === "none") {
-                 next.style.display = "block";
-             } else {
-                 next.style.display = "none";
-             }
-          }
-        }
-        document.addEventListener("DOMContentLoaded", function() {
-          var toggles = document.getElementsByClassName("json-toggle");
-          for (var i = 0; i < toggles.length; i++) {
-             toggles[i].addEventListener("click", toggleChildren);
-          }
-        });
-        function jsonGlobalSearch(query) {
-          var tree = document.getElementById("jsonTree");
-          if(!tree) return;
-          var spans = tree.getElementsByTagName("span");
-          for (var i = 0; i < spans.length; i++) {
-             spans[i].style.backgroundColor = "";
-          }
-          if(query === "") return;
-          query = query.toLowerCase();
-          for (var i = 0; i < spans.length; i++) {
-             var txt = spans[i].innerText || spans[i].textContent;
-             if(txt.toLowerCase().indexOf(query) > -1) {
-                spans[i].style.backgroundColor = "yellow";
-                var li = spans[i].closest("li");
-                if(li) li.style.display = "";
-             }
-          }
-        }
-        </script>
-        <style>
-        .json-tree ul { list-style-type: none; margin-left: 20px; padding-left: 10px; border-left: 1px solid #ccc; }
-        .json-toggle { cursor: pointer; font-weight: bold; }
-        .json-value { color: #555; }
-        </style>
-        """
-        html_file_path = self._get_html_output_path_for_file(file_path)
-        node_name = file_path.relative_to(self.root_dir).parts[0]
-        rel_html_path = self._write_html_report(
-            html_file_path, f"View: {display_name}", content
-        )
-        base_dir = self.report_dir / node_name
-        link = os.path.relpath(self.report_dir / rel_html_path, base_dir).replace(
-            "\\", "/"
-        )
-        return link
+        return self._file_view_renderer().generate_json_view(file_path, display_name)
 
     async def _generate_text_view(
         self, file_path: Path, display_name: str = None
     ) -> str:
         """
-        Generates an HTML page with text/log syntax highlighting, or fallback to download if unreadable.
-        Large files (>50MB) are automatically set to download-only for performance.
+        Generate text view.
+
+        The implementation uses ``file_path`` and ``display_name`` to generate
+        text view. Owned asynchronous work is awaited before return, so
+        completion does not leave an unobserved task behind.
+
+        Args:
+            file_path: filesystem location used as the file path for this
+                operation.
+            display_name: Stable display name used for lookup and
+                operator-facing diagnostics.
+
+        Returns:
+            The canonical generate text view text.
         """
-        display_name = display_name or file_path.name
+        renderer = self._file_view_renderer()
+        prepared = await run_managed_filesystem_operation(
+            renderer.prepare_text_view,
+            file_path,
+            display_name,
+        )
+        if prepared.read_error is not None:
+            await self._log(
+                "ERROR", f"Error reading {file_path}: {prepared.read_error}"
+            )
+        if prepared.link is not None:
+            return prepared.link
+        result = await run_managed_filesystem_operation(
+            renderer.render_text_view, file_path, prepared
+        )
+        return result.link
 
-        # Check file size - if too large, create download view instead
-        maybe = self._download_view_if_too_large(file_path, display_name)
-        if maybe:
-            return maybe
+    @staticmethod
+    def _escape_shared_regex_literal(value: str) -> str:
+        """
+        Escape a literal for both Python and JavaScript regular expressions.
 
+        After applying local validation, the function forwards ``value`` to
+        ``escape_shared_regex_literal`` and preserves its return and exception
+        contract.
+
+        Args:
+            value: Text supplied as value in the format accepted by this
+                function.
+
+        Returns:
+            The canonical escape shared regex literal text.
+        """
+        return escape_shared_regex_literal(value)
+
+    @classmethod
+    def _compile_log_format_parser(
+        cls, log_format: Any, parser_name: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Compile a percent-style logging format into shared parser metadata.
+
+        After applying local validation, the function forwards ``log_format``
+        and ``parser_name`` to ``compile_log_format_parser`` and preserves its
+        return and exception contract.
+
+        Args:
+            log_format: Log format consumed while the function attempts to
+                compile a percent-style logging format into shared parser
+                metadata.
+            parser_name: Stable parser name used for lookup and operator-facing
+                diagnostics.
+
+        Returns:
+            A mapping containing compile log format parser, or ``None`` when the
+            requested value is unavailable.
+        """
+        return compile_log_format_parser(log_format, parser_name)
+
+    @classmethod
+    def _canonical_lifecycle_parser(cls) -> Dict[str, Any]:
+        """
+        Return the strict parser for lifecycle lines that stay canonical.
+
+        After applying local validation, the function forwards current instance
+        state to ``canonical_lifecycle_parser`` and preserves its return and
+        exception contract.
+
+        Returns:
+            A mapping containing canonical lifecycle parser.
+        """
+        return canonical_lifecycle_parser()
+
+    def _get_log_parser_specs(self) -> List[Dict[str, Any]]:
+        """
+        Build parsers for the effective diagnostic and lifecycle formats.
+
+        After applying local validation, the function forwards current instance
+        state to ``build_log_parser_specs`` and preserves its return and
+        exception contract.
+
+        Returns:
+            The log parser specs returned in operation-defined order.
+        """
         try:
-            with file_path.open("r", encoding="utf-8") as f:
-                text_data = f.read()
-        except UnicodeDecodeError:
-            return self._generate_download_view(file_path, display_name)
-        except Exception as e:
-            text_data = f"Error reading file: {e}"
-            await self._log("ERROR", f"Error reading {file_path}: {e}")
+            log_format = getattr(self.logger, "log_format", None)
+        except ReportInputSafetyError:
+            raise
+        except Exception:
+            log_format = None
+        return build_log_parser_specs(log_format)
 
-        # Check if this is a runtime/structured log and use interactive viewer
-        if file_path.name in self.log_files_with_viewer or file_path.name.endswith(
-            "_stdout.log"
-        ):
-            content = self._generate_log_viewer(text_data, display_name)
-        else:
-            content = f"""
-            <div class="card">
-                <div class="card-body">
-                    <h2>File: {escape(display_name)}</h2>
-                    <div class="file-view"><pre id="textView"><code class="language-json">{escape(text_data)}</code></pre></div>
-                </div>
-            </div>
-            """
-            content += """
-            <script>
-            function textGlobalSearch(query) {
-               var pre = document.getElementById("textView");
-               if(!pre) return;
-               pre.innerHTML = pre.innerText;
-               if(query === "") return;
-               var regex = new RegExp('('+query+')', 'gi');
-               pre.innerHTML = pre.innerHTML.replace(regex, '<mark>$1</mark>');
-            }
-            </script>
-            """
+    @staticmethod
+    def _parse_log_line(
+        line: str, parsers: List[Dict[str, Any]]
+    ) -> Optional[Dict[str, Optional[str]]]:
+        """
+        Parse one line, preferring the match with the richest structure.
 
-        html_file_path = self._get_html_output_path_for_file(file_path)
-        node_name = file_path.relative_to(self.root_dir).parts[0]
-        rel_html_path = self._write_html_report(
-            html_file_path, f"View: {display_name}", content
-        )
-        base_dir = self.report_dir / node_name
-        link = os.path.relpath(self.report_dir / rel_html_path, base_dir).replace(
-            "\\", "/"
-        )
-        return link
+        After applying local validation, the function forwards ``line`` and
+        ``parsers`` to ``parse_log_line`` and preserves its return and exception
+        contract. Parsing or I/O must finish before the validated representation
+        is made available to the caller.
+
+        Args:
+            line: Text supplied as line in the format accepted by this function.
+            parsers: Mapping supplying fields for one line, preferring the match
+                with the richest structure.
+
+        Returns:
+            A mapping containing log line, or ``None`` when the requested value
+            is unavailable.
+        """
+        return parse_log_line(line, parsers)
+
+    @staticmethod
+    def _browser_log_parser_metadata(
+        parsers: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """
+        Drop Python-only compiled expressions before embedding metadata.
+
+        After applying local validation, the function forwards ``parsers`` to
+        ``browser_log_parser_metadata`` and preserves its return and exception
+        contract.
+
+        Args:
+            parsers: Mapping supplying fields for drop Python-only compiled
+                expressions before embedding metadata.
+
+        Returns:
+            A mapping containing browser log parser metadata.
+        """
+        return browser_log_parser_metadata(parsers)
 
     def _generate_log_viewer(self, text_data: str, display_name: str) -> str:
         """
         Generates an interactive log viewer with filtering and syntax highlighting.
-        """
-        # Parse log to extract unique components and levels
-        import re
 
-        log_pattern = re.compile(r"\[([^\]]+)\]\s+\[([^\]]+)\]\s+\[([^\]]+)\]\s+(.*)")
+        After applying local validation, the function forwards ``text_data`` and
+        ``display_name`` to ``_HTML_LOG_VIEWER.render`` and preserves its return
+        and exception contract.
+
+        Args:
+            text_data: Text supplied as text data in the format accepted by this
+                function.
+            display_name: Stable display name used for lookup and
+                operator-facing diagnostics.
+
+        Returns:
+            The canonical generate log viewer text.
+        """
+        parsers = self._get_log_parser_specs()
+        parser_metadata = self._browser_log_parser_metadata(parsers)
         components = set()
         levels = set()
 
         for line in text_data.split("\n"):
-            match = log_pattern.match(line)
-            if match:
-                level = match.group(2)
-                component = match.group(3)
-                levels.add(level)
-                components.add(component)
+            parsed = self._parse_log_line(line, parsers)
+            if parsed is not None:
+                if parsed["level"]:
+                    levels.add(parsed["level"])
+                if parsed["component"]:
+                    components.add(parsed["component"])
 
         components = sorted(components)
         levels = sorted(levels)
-
-        content = f"""
-        <div class="card mb-3">
-            <div class="card-body">
-                <h2>Runtime Log Viewer: {escape(display_name)}</h2>
-                <p class="text-muted">Interactive log viewer with filtering and syntax highlighting</p>
-
-                <!-- Filter Controls -->
-                <div class="row mb-3">
-                    <div class="col-md-4">
-                        <label class="form-label fw-bold">Search</label>
-                        <input type="text" id="logSearch" class="form-control" placeholder="Search logs...">
-                    </div>
-                    <div class="col-md-4">
-                        <label class="form-label fw-bold">Log Level</label>
-                        <select id="levelFilter" class="form-select">
-                            <option value="">All Levels</option>
-                            {''.join(f'<option value="{escape(level)}">{escape(level)}</option>' for level in levels)}
-                        </select>
-                    </div>
-                    <div class="col-md-4">
-                        <label class="form-label fw-bold">Component</label>
-                        <select id="componentFilter" class="form-select">
-                            <option value="">All Components</option>
-                            {''.join(f'<option value="{escape(comp)}">{escape(comp)}</option>' for comp in components)}
-                        </select>
-                    </div>
-                </div>
-
-                <!-- Stats -->
-                <div class="d-flex gap-3 mb-3">
-                    <span class="badge bg-secondary">Total: <span id="totalLines">0</span> lines</span>
-                    <span class="badge bg-primary">Visible: <span id="visibleLines">0</span> lines</span>
-                    <button class="btn btn-sm btn-outline-secondary" onclick="copyLog()">
-                        <i class="bi bi-clipboard"></i> Copy Filtered
-                    </button>
-                    <button class="btn btn-sm btn-outline-secondary" onclick="downloadLog()">
-                        <i class="bi bi-download"></i> Download Filtered
-                    </button>
-                    <button class="btn btn-sm btn-outline-secondary" onclick="toggleWrap()">
-                        <i class="bi bi-text-wrap"></i> Toggle Wrap
-                    </button>
-                </div>
-
-                <!-- Log Content -->
-                <div id="logContainer" class="border rounded" style="background: #1e1e1e !important; max-height: 600px; overflow: auto;">
-                    <pre id="logView" style="margin: 0; padding: 15px; color: #f0f0f0 !important; background: #1e1e1e !important; font-family: 'Consolas', 'Monaco', 'Courier New', monospace; font-size: 13px; line-height: 1.5; text-shadow: none !important; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;"><code class="language-nvdebug" style="background: #1e1e1e !important; color: #f0f0f0 !important; text-shadow: none !important;">{escape(text_data)}</code></pre>
-                </div>
-            </div>
-        </div>
-
-        <style>
-        /* Log viewer custom styles - Force dark theme and crisp rendering */
-        /* Override Prism.js default styles completely */
-        #logContainer *,
-        #logContainer,
-        #logContainer pre,
-        #logContainer code,
-        #logContainer pre[class*="language-"],
-        #logContainer code[class*="language-"],
-        #logContainer .token,
-        #logContainer span {{
-            background: #1e1e1e !important;
-            color: #f0f0f0 !important;
-            text-shadow: none !important;
-            -webkit-font-smoothing: antialiased !important;
-            -moz-osx-font-smoothing: grayscale !important;
-            text-rendering: optimizeLegibility !important;
-        }}
-        .log-line {{
-            display: block;
-            border-left: 3px solid transparent;
-            padding-left: 8px;
-            margin: 2px 0;
-        }}
-        .log-line.log-ERROR {{
-            background-color: rgba(249, 117, 131, 0.1);
-            border-left-color: #f97583;
-        }}
-        .log-line.log-WARNING {{
-            background-color: rgba(255, 171, 112, 0.1);
-            border-left-color: #ffab70;
-        }}
-        .log-line.log-INFO {{
-            background-color: rgba(86, 182, 194, 0.05);
-            border-left-color: #56b6c2;
-        }}
-        .log-line.log-DEBUG {{
-            background-color: rgba(158, 158, 158, 0.05);
-            border-left-color: #9e9e9e;
-        }}
-        .log-line.hidden {{
-            display: none !important;
-        }}
-        #logContainer .log-timestamp {{
-            color: #999999 !important;
-            text-shadow: none !important;
-        }}
-        .log-level {{
-            font-weight: bold;
-            padding: 2px 6px;
-            border-radius: 3px;
-            text-shadow: none !important;
-        }}
-        #logContainer .log-level-INFO {{
-            color: #56b6c2 !important;
-            text-shadow: none !important;
-        }}
-        #logContainer .log-level-DEBUG {{
-            color: #9e9e9e !important;
-            text-shadow: none !important;
-        }}
-        #logContainer .log-level-ERROR {{
-            color: #f97583 !important;
-            text-shadow: none !important;
-        }}
-        #logContainer .log-level-WARNING {{
-            color: #ffab70 !important;
-            text-shadow: none !important;
-        }}
-        #logContainer .log-component {{
-            color: #4db8a8 !important;
-            font-weight: 600;
-            text-shadow: none !important;
-        }}
-        #logContainer .log-message {{
-            color: #f0f0f0 !important;
-            text-shadow: none !important;
-        }}
-        #logContainer .log-separator {{
-            color: #888888 !important;
-            opacity: 0.5;
-            border-top: 1px solid #555;
-            margin: 10px 0;
-            text-shadow: none !important;
-        }}
-        #logContainer mark {{
-            background-color: #ffeb3b !important;
-            color: #000 !important;
-            padding: 2px 4px;
-            border-radius: 2px;
-            text-shadow: none !important;
-        }}
-        </style>
-
-        <script>
-        // Define custom Prism language for nvdebug logs
-        Prism.languages.nvdebug = {{
-            'timestamp': /\\[\\d{{4}}-\\d{{2}}-\\d{{2}}\\s+\\d{{2}}:\\d{{2}}:\\d{{2}}\\.\\d{{3}}\\]/,
-            'level-error': /\\[ERROR\\]/,
-            'level-warning': /\\[WARNING\\]/,
-            'level-info': /\\[INFO\\]/,
-            'level-debug': /\\[DEBUG\\]/,
-            'component': /\\]\\s+\\[([^\\]]+)\\]/,
-            'separator': /^[=+\\-]{{2,}}.*$/m,
-            'string': /"(?:\\\\.|[^"\\\\])*"/
-        }};
-
-        // Parse and render logs with structure
-        document.addEventListener('DOMContentLoaded', function() {{
-            parseAndRenderLogs();
-
-            document.getElementById('logSearch').addEventListener('input', filterLogs);
-            document.getElementById('levelFilter').addEventListener('change', filterLogs);
-            document.getElementById('componentFilter').addEventListener('change', filterLogs);
-
-            // Apply Prism highlighting after DOM is ready
-            Prism.highlightAll();
-        }});
-
-        let logLines = [];
-        let wrapEnabled = false;
-        let renderChunkSize = 500; // Render 500 lines at a time for performance
-        let currentRenderIndex = 0;
-        let isRendering = false;
-
-        function parseAndRenderLogs() {{
-            const logView = document.getElementById('logView');
-            const code = logView.querySelector('code');
-            const text = code.textContent;
-            const lines = text.split('\\n');
-
-            // Show loading indicator for large logs
-            if (lines.length > 5000) {{
-                code.innerHTML = '<span style="color: #0dcaf0;">Parsing ' + lines.length + ' log lines...</span>';
-            }}
-
-            // Parse in chunks to avoid blocking UI
-            const chunkSize = 1000;
-            let chunkIndex = 0;
-
-            function parseChunk() {{
-                const start = chunkIndex * chunkSize;
-                const end = Math.min(start + chunkSize, lines.length);
-
-                for (let i = start; i < end; i++) {{
-                    const line = lines[i];
-                    const match = line.match(/\\[([^\\]]+)\\]\\s+\\[([^\\]]+)\\]\\s+\\[([^\\]]+)\\]\\s+(.*)/);
-                    if (match) {{
-                        logLines.push({{
-                            raw: line,
-                            timestamp: match[1],
-                            level: match[2],
-                            component: match[3],
-                            message: match[4],
-                            visible: true
-                        }});
-                    }} else {{
-                        logLines.push({{
-                            raw: line,
-                            timestamp: null,
-                            level: null,
-                            component: null,
-                            message: line,
-                            visible: true
-                        }});
-                    }}
-                }}
-
-                chunkIndex++;
-
-                if (end < lines.length) {{
-                    // Continue parsing in next frame
-                    setTimeout(parseChunk, 0);
-                }} else {{
-                    // Done parsing, now render
-                    updateStats();
-                    renderLogs();
-                }}
-            }}
-
-            parseChunk();
-        }}
-
-        function filterLogs() {{
-            const search = document.getElementById('logSearch').value.toLowerCase();
-            const levelFilter = document.getElementById('levelFilter').value;
-            const componentFilter = document.getElementById('componentFilter').value;
-
-            logLines.forEach(log => {{
-                let visible = true;
-
-                // Apply search filter
-                if (search && !log.raw.toLowerCase().includes(search)) {{
-                    visible = false;
-                }}
-
-                // Apply level filter
-                if (levelFilter && log.level !== levelFilter) {{
-                    visible = false;
-                }}
-
-                // Apply component filter
-                if (componentFilter && log.component !== componentFilter) {{
-                    visible = false;
-                }}
-
-                log.visible = visible;
-            }});
-
-            renderLogs();
-            updateStats();
-
-            // Highlight search terms
-            if (search) {{
-                highlightSearch(search);
-            }}
-        }}
-
-        function renderLogs() {{
-            const logView = document.getElementById('logView');
-            const code = logView.querySelector('code');
-
-            // Filter visible logs
-            const visibleLogs = logLines.filter(log => log.visible);
-
-            // For large logs (>2000 lines), render in chunks
-            if (visibleLogs.length > 2000) {{
-                code.innerHTML = '<span style="color: #0dcaf0;">Rendering ' + visibleLogs.length + ' log lines...</span>';
-
-                // Render in chunks to avoid UI freeze
-                let rendered = [];
-                let chunkIdx = 0;
-                const chunkSize = 500;
-
-                function renderChunk() {{
-                    const start = chunkIdx * chunkSize;
-                    const end = Math.min(start + chunkSize, visibleLogs.length);
-
-                    for (let i = start; i < end; i++) {{
-                        const log = visibleLogs[i];
-                        if (log.timestamp) {{
-                            const levelClass = `log-level-${{log.level}}`;
-                            rendered.push(`<span class="log-timestamp">[${{log.timestamp}}]</span> <span class="log-level ${{levelClass}}">[${{log.level}}]</span> <span class="log-component">[${{log.component}}]</span> <span class="log-message">${{log.message}}</span>`);
-                        }} else if (log.raw.match(/^[=+\\-]{{2,}}/)) {{
-                            rendered.push(`<span class="log-separator">${{log.raw}}</span>`);
-                        }} else {{
-                            rendered.push(`<span class="log-message">${{log.raw}}</span>`);
-                        }}
-                    }}
-
-                    chunkIdx++;
-
-                    if (end < visibleLogs.length) {{
-                        // Update progress and continue
-                        const progress = Math.round((end / visibleLogs.length) * 100);
-                        code.innerHTML = `<span style="color: #0dcaf0;">Rendering ${{progress}}%...</span>`;
-                        setTimeout(renderChunk, 0);
-                    }} else {{
-                        // Done rendering
-                        code.innerHTML = rendered.join('\\n');
-                    }}
-                }}
-
-                renderChunk();
-            }} else {{
-                // Small log, render immediately
-                const html = visibleLogs.map(log => {{
-                    if (log.timestamp) {{
-                        const levelClass = `log-level-${{log.level}}`;
-                        return `<span class="log-timestamp">[${{log.timestamp}}]</span> <span class="log-level ${{levelClass}}">[${{log.level}}]</span> <span class="log-component">[${{log.component}}]</span> <span class="log-message">${{log.message}}</span>`;
-                    }} else if (log.raw.match(/^[=+\\-]{{2,}}/)) {{
-                        return `<span class="log-separator">${{log.raw}}</span>`;
-                    }} else {{
-                        return `<span class="log-message">${{log.raw}}</span>`;
-                    }}
-                }}).join('\\n');
-
-                code.innerHTML = html;
-            }}
-        }}
-
-        function highlightSearch(search) {{
-            const logView = document.getElementById('logView');
-            const code = logView.querySelector('code');
-            const regex = new RegExp(`(${{search}})`, 'gi');
-            code.innerHTML = code.innerHTML.replace(regex, '<mark>$1</mark>');
-        }}
-
-        function updateStats() {{
-            const total = logLines.length;
-            const visible = logLines.filter(l => l.visible).length;
-            document.getElementById('totalLines').textContent = total;
-            document.getElementById('visibleLines').textContent = visible;
-        }}
-
-        function copyLog() {{
-            const filtered = logLines.filter(l => l.visible).map(l => l.raw).join('\\n');
-            navigator.clipboard.writeText(filtered).then(() => {{
-                alert('Filtered log copied to clipboard!');
-            }});
-        }}
-
-        function downloadLog() {{
-            const filtered = logLines.filter(l => l.visible).map(l => l.raw).join('\\n');
-            const blob = new Blob([filtered], {{ type: 'text/plain' }});
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = 'filtered_log.txt';
-            a.click();
-            URL.revokeObjectURL(url);
-        }}
-
-        function toggleWrap() {{
-            const pre = document.getElementById('logView');
-            wrapEnabled = !wrapEnabled;
-            pre.style.whiteSpace = wrapEnabled ? 'pre-wrap' : 'pre';
-        }}
-        </script>
-        """
-
-        return content
+        parser_metadata_json = self._json_for_script(
+            parser_metadata, separators=(",", ":")
+        )
+        return _HTML_LOG_VIEWER.render(
+            LogViewerRenderModel(
+                text_data=text_data,
+                display_name=display_name,
+                parser_metadata_json=parser_metadata_json,
+                levels=tuple(levels),
+                components=tuple(components),
+            )
+        )
 
     def _get_html_output_path_for_file(self, file_path: Path) -> Path:
         """
-        Return the HTML file path under the 'reports' directory, preserving subdir structure.
+        Return HTML output path for file.
+
+        The implementation uses ``file_path`` to produce HTML output path for
+        file.
+
+        Args:
+            file_path: filesystem location used as the file path for this
+                operation.
+
+        Returns:
+            The validated HTML output path for file filesystem path.
         """
-        try:
-            rel_path = file_path.relative_to(self.root_dir)
-        except ValueError:
-            rel_path = Path(file_path.name)
+        rel_path = self._logical_report_input_relative_path(file_path)
         html_file_relative = rel_path.with_suffix(rel_path.suffix + ".html")
         return self.report_dir / html_file_relative
 
     def _get_html_output_path(self, parent_dir: Path, filename: str) -> Path:
         """
-        Given a parent directory + desired HTML filename, returns a path under 'reports' with the same structure.
+        Return HTML output path.
+
+        The implementation uses ``parent_dir`` and ``filename`` to produce HTML
+        output path.
+
+        Args:
+            parent_dir: filesystem location used as the parent dir for this
+                operation.
+            filename: Text supplied as filename in the format accepted by this
+                function.
+
+        Returns:
+            The validated HTML output path filesystem path.
         """
-        try:
-            relative_dir = parent_dir.relative_to(self.root_dir)
-        except ValueError:
-            relative_dir = Path("")
+        relative_dir = self._logical_report_input_relative_path(parent_dir)
         return self.report_dir / relative_dir / filename
 
     def _json_tree_html(self, data) -> str:
         """
-        Returns HTML for a colorized, collapsible JSON tree, similar to the Chrome JSON Formatter.
+        Return the renderer-owned colorized, collapsible JSON tree.
+
+        After applying local validation, the function forwards ``data`` to
+        ``_HTML_RENDERER.json_tree_html`` and preserves its return and exception
+        contract.
+
+        Args:
+            data: Data consumed while the function attempts to produce the
+                renderer-owned colorized, collapsible JSON tree.
+
+        Returns:
+            The canonical JSON tree HTML text.
         """
 
-        # Convert the Python object to a direct HTML structure.
-        # We'll represent objects and arrays with curly/straight brackets,
-        # plus toggles that expand/collapse children.
-
-        def render_json(obj) -> str:
-            """
-            Recursively build the HTML representation of 'obj'.
-
-            Args:
-                obj: Object to render as HTML.
-
-            Returns:
-                HTML string.
-            """
-            if isinstance(obj, dict):
-                # For objects: { key: value, ... }
-                # We'll show braces, and each item on a new line.
-                if not obj:
-                    # Empty dict
-                    return '<span class="json-brace">{}</span>'
-                html = []
-                html.append('<span class="json-brace">{</span>')
-                html.append('<div class="json-block" style="display: block;">')
-                # Insert each key/value
-                items = list(obj.items())
-                count = len(items)
-                for i, (k, v) in enumerate(items):
-                    # Key
-                    html.append('<div class="json-item">')
-                    html.append(f'<span class="json-key">"{escape(str(k))}"</span>')
-                    html.append('<span class="json-colon">: </span>')
-                    # Value
-                    html.append('<span class="json-value">')
-                    html.append(render_json(v))
-                    html.append("</span>")
-                    # Comma if not last item
-                    if i < count - 1:
-                        html.append('<span class="json-comma">,</span>')
-                    html.append("</div>")
-                html.append("</div>")
-                html.append('<span class="json-brace">}</span>')
-                return "".join(html)
-            elif isinstance(obj, list):
-                # For arrays: [ item, ... ]
-                if not obj:
-                    return '<span class="json-bracket">[]</span>'
-                html = []
-                html.append('<span class="json-bracket">[</span>')
-                html.append('<div class="json-block" style="display: block;">')
-                count = len(obj)
-                for i, val in enumerate(obj):
-                    html.append('<div class="json-item">')
-                    # Render each item
-                    html.append(render_json(val))
-                    # Comma if not last item
-                    if i < count - 1:
-                        html.append('<span class="json-comma">,</span>')
-                    html.append("</div>")
-                html.append("</div>")
-                html.append('<span class="json-bracket">]</span>')
-                return "".join(html)
-            else:
-                # Scalar (string, int, float, bool, None)
-                return _render_scalar(obj)
-
-        def _render_scalar(value) -> str:
-            """
-            Return a color-coded span for a JSON scalar.
-
-            Args:
-                value: Scalar value to render.
-
-            Returns:
-                HTML span element.
-            """
-            if value is None:
-                return '<span class="json-literal json-null">null</span>'
-            elif isinstance(value, bool):
-                return f'<span class="json-literal json-boolean">{"true" if value else "false"}</span>'
-            elif isinstance(value, (int, float)) and not isinstance(value, bool):
-                return f'<span class="json-literal json-number">{escape(str(value))}</span>'
-            else:
-                # treat everything else as string
-                # be sure to escape properly
-                return f'<span class="json-string">"{escape(str(value))}"</span>'
-
-        # Build the main content
-        tree_html = render_json(data)
-
-        # Wrap the entire tree in a container that has toggle scripts and styles:
-        # Notice we add clickable toggles on the curly braces and brackets themselves,
-        # to replicate that "Chrome extension" style of collapsing.
-        # (You can also put the toggle on a little '+' or '–' symbol if you prefer.)
-        return f"""
-        <div class="json-container">
-            {tree_html}
-        </div>
-        <script>
-        // Collapsing/expanding logic:
-        // We'll let users click on the brace/bracket to toggle the block that follows it.
-        document.addEventListener('DOMContentLoaded', function() {{
-            const braces = document.querySelectorAll('.json-brace, .json-bracket');
-            braces.forEach(function(braceEl) {{
-                braceEl.style.cursor = 'pointer';
-                braceEl.addEventListener('click', function(e) {{
-                    e.stopPropagation();
-                    // The ".json-block" that immediately follows
-                    const sibling = braceEl.nextElementSibling;
-                    if(sibling && sibling.classList.contains('json-block')) {{
-                        if(sibling.style.display === 'none') {{
-                            sibling.style.display = 'block';
-                        }} else {{
-                            sibling.style.display = 'none';
-                        }}
-                    }}
-                }});
-            }});
-        }});
-        </script>
-        <style>
-        .json-container {{
-            font-family: monospace;
-            line-height: 1.4em;
-            font-size: 14px;
-            color: #333;
-        }}
-        .json-block {{
-            margin-left: 1.5em;
-            border-left: 1px dotted #ccc;
-            padding-left: 1em;
-        }}
-        .json-item {{
-            margin: 2px 0;
-        }}
-        .json-key {{
-            color: #92278f;  /* purple-ish for keys */
-        }}
-        .json-literal.json-boolean {{
-            color: #1a01cc;  /* bluish for booleans */
-        }}
-        .json-literal.json-null {{
-            color: #777;     /* gray for null */
-        }}
-        .json-literal.json-number {{
-            color: #0086b3;  /* teal-like for numbers */
-        }}
-        .json-string {{
-            color: #c41a16;  /* dark red for strings */
-        }}
-        .json-colon {{
-            color: #555;
-        }}
-        .json-comma {{
-            color: #555;
-            margin-left: 1px;
-        }}
-        .json-brace, .json-bracket {{
-            color: #4b6eaf;
-            font-weight: bold;
-            margin-right: 3px;
-        }}
-        </style>
-        """
+        return _HTML_RENDERER.json_tree_html(data, self.max_json_tree_depth)
 
     def _get_firmware_info(self, node_path: Path) -> Tuple[str, str]:
         """
         Get firmware information for a node.
 
+        The implementation uses ``node_path`` to get firmware information for a
+        node.
+
         Args:
-            node_path: Path to node directory.
+            node_path: filesystem location used as the node path for this
+                operation.
 
         Returns:
-            Tuple of (firmware_str, firmware_json_str).
+            A tuple containing ``summary`` and ``modal content`` in that order.
         """
         firmware_versions = {
             "BMC": [],
@@ -9546,139 +11043,93 @@ class HTMLReportService:
             "ERoT": [],
         }
 
-        raw_firmware_data = []
-
-        # Try R20 format first (table format)
-        r20_path = (
-            node_path
-            / "redfish"
-            / "Redfish_R20_firmware_inventory_table"
-            / "firmware_inventory_table.json"
-        )
-        if r20_path.exists():
+        collector_definitions = None
+        if self.orchestrator:
             try:
-                with open(r20_path, "r") as f:
-                    r20_data = json.load(f)
-                    raw_firmware_data = r20_data
-                    for item in r20_data:
-                        item_id = item.get("Id", "")
-                        version = item.get("Version", "")
+                collector_definitions = self.orchestrator.get_all_collectors()
+            except ReportInputSafetyError:
+                raise
+            except Exception:
+                collector_definitions = None
 
-                        # Compute node components
-                        if item_id.startswith("FW_BMC_0"):
-                            firmware_versions["BMC"].append(version)
-                        elif item_id.startswith("HGX_FW_BMC_0"):
-                            firmware_versions["HMC"].append(version)
-                        elif item_id.startswith("HGX_FW_GPU_"):
-                            firmware_versions["GPU"].append(version)
-                        elif item_id.startswith("MGX_FW_NVSwitch_"):
-                            firmware_versions["NVSwitch"].append(version)
-                        elif item_id == "Software Inventory":
-                            firmware_versions["Software"].append(version)
-
-                        # Switch tray components
-                        elif item_id.startswith("CPLD_"):
-                            firmware_versions["CPLD"].append(version)
-                        elif item_id.startswith("MGX_FW_BMC_"):
-                            firmware_versions["BMC"].append(version)
-                        elif item_id.startswith("MGX_FW_CPU_"):
-                            firmware_versions["CPU"].append(version)
-                        elif item_id.startswith("MGX_FW_ERoT_"):
-                            firmware_versions["ERoT"].append(version)
-            except Exception as e:
-                print(f"Error reading R20 firmware data: {e}")
-
-        # Try R9 format if R20 didn't provide data (expanded query format)
-        if not any(firmware_versions.values()):
-            r9_path = (
-                node_path
-                / "redfish"
-                / "Redfish_R9_firmware_inventory_expand_query"
-                / "Redfish_R9_firmware_inventory_expand_query.json"
+        try:
+            firmware_items = ManifestService(
+                self.root_dir,
+                finalization_receipt=self._finalization_receipt,
+                enforce_snapshot_consistency=self._enforce_snapshot_consistency,
+                max_auxiliary_json_files=(self._finalization_boundaries or {}).get(
+                    "finalization_manifest_max_auxiliary_json_files",
+                    HARD_MAX_AUXILIARY_JSON_FILES,
+                ),
+            )._extract_firmware_from_redfish(
+                node_path,
+                collector_definitions=collector_definitions,
             )
-            if r9_path.exists():
-                try:
-                    with open(r9_path, "r") as f:
-                        r9_data = json.load(f)
-                        raw_firmware_data = r9_data.get("Members", [])
-                        for member in raw_firmware_data:
-                            member_id = member.get("Id", "")
-                            version = member.get("Version", "")
-
-                            # Compute node components
-                            if member_id.startswith("FW_BMC_0"):
-                                firmware_versions["BMC"].append(version)
-                            elif member_id.startswith("HGX_FW_BMC_0"):
-                                firmware_versions["HMC"].append(version)
-                            elif member_id.startswith("HGX_FW_GPU_"):
-                                firmware_versions["GPU"].append(version)
-                            elif member_id.startswith("MGX_FW_NVSwitch_"):
-                                firmware_versions["NVSwitch"].append(version)
-                            elif member.get("Name", "") == "Software Inventory":
-                                firmware_versions["Software"].append(version)
-
-                            # Switch tray components
-                            elif member_id.startswith("CPLD_"):
-                                firmware_versions["CPLD"].append(version)
-                            elif member_id.startswith("MGX_FW_BMC_"):
-                                firmware_versions["BMC"].append(version)
-                            elif member_id.startswith("MGX_FW_CPU_"):
-                                firmware_versions["CPU"].append(version)
-                            elif member_id.startswith("MGX_FW_ERoT_"):
-                                firmware_versions["ERoT"].append(version)
-                except Exception as e:
-                    print(f"Error reading R9 firmware data: {e}")
-
-        # Try R8 format if R9 didn't provide data (basic inventory format)
-        if not any(firmware_versions.values()):
-            r8_path = (
-                node_path
-                / "redfish"
-                / "Redfish_R8_firmware_inventory"
-                / "Redfish_R8_firmware_inventory.json"
+        except ReportInputSafetyError:
+            raise
+        except Exception as exc:
+            # A malformed or unreadable inventory belongs to this node.  Keep
+            # generating the multi-node report and render the normal empty
+            # firmware state for the affected node.
+            logger.warning(
+                "Failed to extract firmware inventory for node %s: %s",
+                node_path,
+                exc,
             )
-            if r8_path.exists():
-                try:
-                    with open(r8_path, "r") as f:
-                        r8_data = json.load(f)
-                        raw_firmware_data = r8_data.get("Members", [])
-                        # R8 format only has references, not full details
-                        # We'll show the available firmware items but without versions
-                        for member in raw_firmware_data:
-                            member_id = (
-                                member.get("@odata.id", "").split("/")[-1]
-                                if member.get("@odata.id")
-                                else ""
-                            )
+            firmware_items = []
+        raw_firmware_data = []
+        for item in firmware_items:
+            raw_item = {
+                "Id": item.get("id", ""),
+                "Name": item.get("name", item.get("id", "")),
+                "Version": item.get("version", ""),
+            }
+            for source, target in (
+                ("description", "Description"),
+                ("manufacturer", "Manufacturer"),
+                ("status", "Status"),
+            ):
+                if source in item:
+                    raw_item[target] = item[source]
+            raw_firmware_data.append(raw_item)
 
-                            # Categorize by ID patterns (without versions since R8 doesn't have them)
-                            if member_id.startswith("FW_BMC_0"):
-                                firmware_versions["BMC"].append("Available")
-                            elif member_id.startswith("HGX_FW_BMC_0"):
-                                firmware_versions["HMC"].append("Available")
-                            elif member_id.startswith("HGX_FW_GPU_"):
-                                firmware_versions["GPU"].append("Available")
-                            elif member_id.startswith("MGX_FW_NVSwitch_"):
-                                firmware_versions["NVSwitch"].append("Available")
-                            elif member_id.startswith("CPLD_"):
-                                firmware_versions["CPLD"].append("Available")
-                            elif member_id.startswith("MGX_FW_BMC_"):
-                                firmware_versions["BMC"].append("Available")
-                            elif member_id.startswith("MGX_FW_CPU_"):
-                                firmware_versions["CPU"].append("Available")
-                            elif member_id.startswith("MGX_FW_ERoT_"):
-                                firmware_versions["ERoT"].append("Available")
-                except Exception as e:
-                    print(f"Error reading R8 firmware data: {e}")
+        for item in firmware_items:
+            item_id = str(item.get("id", ""))
+            item_name = str(item.get("name", ""))
+            version = str(item.get("version", "")) or "Available"
+
+            if item_id.startswith("FW_BMC_0"):
+                firmware_versions["BMC"].append(version)
+            elif item_id.startswith("HGX_FW_BMC_0"):
+                firmware_versions["HMC"].append(version)
+            elif item_id.startswith("HGX_FW_GPU_"):
+                firmware_versions["GPU"].append(version)
+            elif item_id.startswith("MGX_FW_NVSwitch_"):
+                firmware_versions["NVSwitch"].append(version)
+            elif item_id == "Software Inventory" or item_name == "Software Inventory":
+                firmware_versions["Software"].append(version)
+            elif item_id.startswith("CPLD_"):
+                firmware_versions["CPLD"].append(version)
+            elif item_id.startswith("MGX_FW_BMC_"):
+                firmware_versions["BMC"].append(version)
+            elif item_id.startswith("MGX_FW_CPU_"):
+                firmware_versions["CPU"].append(version)
+            elif item_id.startswith("MGX_FW_ERoT_"):
+                firmware_versions["ERoT"].append(version)
 
         # Generate summary display
         summary_parts = []
         for key, versions in firmware_versions.items():
             if versions:
+                # The summary is interpolated into the report body without
+                # further escaping, so device-supplied versions must be escaped
+                # here. The per-device modal path escapes separately.
+                safe_key = self._escape_html_text(key)
                 if len(set(versions)) == 1:
-                    summary_parts.append(f"{key}: {versions[0]}")
+                    safe_version = self._escape_html_text(versions[0])
+                    summary_parts.append(f"{safe_key}: {safe_version}")
                 else:
-                    summary_parts.append(f"{key}: Multiple versions")
+                    summary_parts.append(f"{safe_key}: Multiple versions")
 
         summary = (
             "<br>".join(summary_parts)
@@ -9774,7 +11225,15 @@ class HTMLReportService:
     async def _generate_dependency_check_page(self, node_path: Path) -> str:
         """
         Generate a dedicated page for dependency checks for a DUT.
+
         Returns the relative path to the generated HTML file.
+
+        Args:
+            node_path: filesystem location used as the node path for this
+                operation.
+
+        Returns:
+            The canonical generate dependency check page text.
         """
         node_name = node_path.name
         dependency_html_path = self.report_dir / node_name / "dependency_checks.html"
@@ -9812,14 +11271,26 @@ class HTMLReportService:
         """
         Main method to generate all HTML reports with progress tracking.
 
+        The implementation uses ``progress`` and ``main_task`` to main method to
+        generate all HTML reports with progress tracking. Owned asynchronous
+        work is awaited before return, so completion does not leave an
+        unobserved task behind. The operation mutates ``progress`` in place;
+        ownership of those objects remains with the caller. Cleanup in the
+        ``finally`` path runs for successful, failed, and cancelled execution.
+
         Args:
-            progress: Rich progress object for displaying progress
-            main_task: Main progress task ID
+            progress: Progress object whose ``advance`` and ``update`` state is
+                read while performing main method to generate all HTML reports
+                with progress tracking.
+            main_task: Main task consumed while the function attempts to main
+                method to generate all HTML reports with progress tracking.
 
         Returns:
-            bool: True if reports were generated successfully
+            Whether the main method to generate all HTML reports with progress
+            tracking operation succeeds.
         """
         try:
+            self._reset_report_input_budget()
             await self._log("INFO", "Generating HTML reports...")
             await self._log("DEBUG", f"Root directory: {self.root_dir}")
 
@@ -9839,12 +11310,15 @@ class HTMLReportService:
                 ".metadata",
             }
 
-            if not self.root_dir.is_dir():
+            if not self._report_input_is_dir(self.root_dir):
                 await self._log(
                     "ERROR",
                     f"Root directory {self.root_dir} is not a directory.",
                 )
                 return False
+
+            self._bind_terminal_snapshot()
+            self._refresh_common_navbar_from_bound_result()
 
             # Scan directory contents
             progress.update(
@@ -9855,15 +11329,15 @@ class HTMLReportService:
 
             # Count total nodes to process
             nodes_to_process = []
-            for node in self.root_dir.iterdir():
-                if node.is_dir() and node.name not in excluded_dirs:
+            for node in self._iter_node_directories():
+                if self._report_input_is_dir(node) and node.name not in excluded_dirs:
                     nodes_to_process.append(node)
 
             total_nodes = len(nodes_to_process)
             if total_nodes == 0:
                 progress.update(
                     main_task,
-                    completed=90,
+                    completed=65,
                     description="No nodes to process, generating final reports...",
                 )
                 await self._log("INFO", "No nodes found to process")
@@ -9935,6 +11409,12 @@ class HTMLReportService:
 
             return True
 
+        except SnapshotConsistencyError:
+            raise
+        except ReportInputSafetyError:
+            raise
         except Exception as e:
             await self._log("ERROR", f"Error generating HTML reports: {e}")
             return False
+        finally:
+            self._release_terminal_snapshot()

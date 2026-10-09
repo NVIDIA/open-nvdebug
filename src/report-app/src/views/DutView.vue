@@ -1,5 +1,22 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 <template>
-  <div ref="dutViewRef" style="min-height: calc(100vh - 88px);">
+  <div style="min-height: calc(100vh - 88px);">
     <!-- Left Sidebar -->
     <div class="nv-sidebar">
       <div class="nv-sidebar__section">
@@ -20,7 +37,7 @@
       <div class="nv-sidebar__section">
         <h4 class="nv-sidebar__section-title nv-glass--accent" style="padding: 4px 8px; border-radius: var(--nv-radius-sm); margin-bottom: 8px;">Collector Groups</h4>
         <div v-for="group in dut?.collector_groups" :key="group.name" style="margin-bottom: 4px;">
-          <router-link :to="`/dut/${dutId}/${group.name}`" class="nv-sidebar__link">
+          <router-link :to="collectorGroupRoute(dutId, group.name)" class="nv-sidebar__link">
             <ServiceBadge :service="group.name" />
           </router-link>
         </div>
@@ -109,15 +126,57 @@
       <Breadcrumbs :items="[{ label: 'Home', to: '/' }, { label: dut?.id ?? dutId }]" />
       <div style="display: flex; align-items: center; justify-content: space-between; margin: 12px 0 16px;">
         <h2 class="nv-page__title" style="margin: 0;">Node Report: {{ dut?.id }}</h2>
-        <button class="nv-btn nv-btn--sm nv-btn--ghost no-print" :disabled="isExporting" @click="handleDutPdf" title="Export PDF">
-          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" style="margin-right: 4px;"><path d="M8 1v9M4 7l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M2 12v2h12v-2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-          {{ isExporting ? 'Exporting...' : 'Export PDF' }}
+        <button class="nv-btn nv-btn--sm nv-btn--ghost no-print" @click="printReport" title="Print or save report as PDF">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right: 4px;"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>
+          Print / Save PDF
         </button>
       </div>
 
       <!-- Status Summary -->
       <div v-if="dut" class="nv-glass--subtle" style="margin-bottom: 16px; padding: 12px 16px; border-radius: var(--nv-radius-lg);">
         <ProgressBar :counts="dut.status_summary" :exclude-not-ran="!showNotRan" />
+      </div>
+
+      <!-- Optional trusted run-lifecycle extensions -->
+      <div
+        v-for="extension in (dut?.extensions ?? [])"
+        :key="extension.namespace"
+        class="nv-card"
+        style="margin-bottom: 16px;"
+      >
+        <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px;">
+          <h4 class="nv-chart-card__title" style="margin-bottom: 0;">
+            Extension: {{ extension.namespace }}
+          </h4>
+          <span
+            class="nv-badge"
+            :class="extension.outcome === 'completed' ? 'nv-badge--success' : extension.outcome === 'failed' ? 'nv-badge--error' : 'nv-badge--warning'"
+          >{{ extension.outcome }}</span>
+        </div>
+        <div style="display: flex; gap: 16px; flex-wrap: wrap; margin-top: 10px; font-size: 0.75rem; color: var(--nv-text-secondary);">
+          <span><strong>Phase:</strong> {{ extension.phase }}</span>
+          <span v-if="extension.duration_seconds !== undefined">
+            <strong>Duration:</strong> {{ extension.duration_seconds }}s
+          </span>
+          <span v-if="extension.cleanup">
+            <strong>Cleanup:</strong> {{ extension.cleanup.outcome ?? 'unknown' }}
+          </span>
+        </div>
+        <div
+          v-if="extension.capabilities.length > 0"
+          style="display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px;"
+        >
+          <span
+            v-for="(capability, capabilityIndex) in extension.capabilities"
+            :key="`${extension.namespace}:${capabilityIndex}`"
+            class="nv-badge extension-capability"
+            :class="extensionCapabilityClass(capability.status)"
+            :title="typeof capability.reason === 'string' ? capability.reason : ''"
+          >
+            {{ capability.name ?? capability.kind ?? `Capability ${capabilityIndex + 1}` }}
+            <template v-if="capability.status">· {{ capability.status }}</template>
+          </span>
+        </div>
       </div>
 
       <!-- Preflight Checks — Compact Scalable Table -->
@@ -129,9 +188,9 @@
               {{ preflightPassCount }}/{{ allPreflightChecks.length }} passed
             </span>
           </h4>
-          <router-link :to="`/dut/${dutId}/preflight`" class="nv-btn nv-btn--ghost nv-btn--sm" style="text-decoration: none;">
+          <button type="button" class="nv-btn nv-btn--ghost nv-btn--sm" @click="openPreflightModal('all')">
             View All
-          </router-link>
+          </button>
         </div>
 
         <!-- Service summary row (clickable chips) -->
@@ -227,7 +286,8 @@
           :columns="collectorColumns"
           :data="visibleCollectors"
           :searchable="true"
-          :fill-viewport="true"
+          row-key="_collectorId"
+          :highlight-row-id="highlightCollectorId"
           @row-click="onCollectorClick"
         >
           <template #cell-group="{ value }">
@@ -358,7 +418,7 @@
         <span v-if="preflightModalFailCount > 0" style="color: var(--nv-error);">&#10008; {{ preflightModalFailCount }} failed</span>
         <span v-if="preflightModalNaCount > 0">&#8212; {{ preflightModalNaCount }} not ran</span>
         <span style="margin-left: auto;">
-          <router-link :to="`/dut/${dutId}/preflight`" class="nv-btn nv-btn--ghost nv-btn--sm" style="text-decoration: none; font-size: 0.6875rem;" @click="preflightModalOpen = false">
+          <router-link :to="dutPreflightRoute(dutId)" class="nv-btn nv-btn--ghost nv-btn--sm" style="text-decoration: none; font-size: 0.6875rem;" @click="preflightModalOpen = false">
             View Full Preflight Report
           </router-link>
         </span>
@@ -368,7 +428,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useManifestStore } from '@/stores/manifest'
 import { formatDuration } from '@/utils/format'
@@ -379,14 +439,14 @@ import ProgressBar from '@/components/dashboard/ProgressBar.vue'
 import Breadcrumbs from '@/components/common/Breadcrumbs.vue'
 import ModalDialog from '@/components/common/ModalDialog.vue'
 import DependencyTable from '@/components/common/DependencyTable.vue'
-import { usePdfExport } from '@/composables/usePdfExport'
+import { usePrintReport } from '@/composables/usePrintReport'
 import { dedupFiles } from '@/utils/dedupFiles'
+import { collectorDetailRoute, collectorGroupRoute, dutPreflightRoute } from '@/utils/reportRoutes'
 
 const route = useRoute()
 const router = useRouter()
 const manifestStore = useManifestStore()
-const dutViewRef = ref<HTMLElement>()
-const { exportToPdf, isExporting } = usePdfExport()
+const { printReport } = usePrintReport()
 
 const dutId = computed(() => String(route.params.dutId))
 const dut = computed(() => manifestStore.dutById(dutId.value))
@@ -406,8 +466,11 @@ const preflightModalOpen = ref(false)
 const preflightModalTitle = ref('Preflight Checks')
 const preflightModalChecks = ref<any[]>([])
 
-function openPreflightModal(svc: PreflightServiceSummary | null) {
-  if (svc) {
+function openPreflightModal(svc: PreflightServiceSummary | null | 'all') {
+  if (svc === 'all') {
+    preflightModalTitle.value = 'Preflight Checks'
+    preflightModalChecks.value = allPreflightChecks.value as any[]
+  } else if (svc) {
     const key = svc.name.toLowerCase()
     preflightModalTitle.value = `Preflight — ${svc.label.toUpperCase()}`
     preflightModalChecks.value = (allPreflightChecks.value as any[]).filter(
@@ -429,11 +492,6 @@ const preflightModalFailCount = computed(() =>
 const preflightModalNaCount = computed(() =>
   preflightModalChecks.value.length - preflightModalPassCount.value - preflightModalFailCount.value
 )
-
-async function handleDutPdf() {
-  if (!dutViewRef.value) return
-  await exportToPdf(dutViewRef.value, `nvdebug-${dutId.value}.pdf`)
-}
 
 // --- File sorting & categorization helpers ---
 
@@ -567,6 +625,19 @@ const visibleCollectors = computed(() => {
   return allCollectors.value.filter(c => String(c.status) !== 'not_ran' && String(c.status) !== 'not ran')
 })
 
+// Deep-link target (e.g. from an anomaly click): ?highlight=<collectorId>
+const highlightCollectorId = computed(() => {
+  const value = route.query?.highlight
+  return typeof value === 'string' ? value : ''
+})
+
+// Make sure the highlighted collector is not hidden by the not-ran filter.
+watch([highlightCollectorId, allCollectors], ([id, rows]) => {
+  if (!id || showNotRan.value) return
+  const status = String(rows.find(r => r._collectorId === id)?.status ?? '')
+  if (status === 'not_ran' || status === 'not ran') showNotRan.value = true
+}, { immediate: true })
+
 const dutFiles = computed(() =>
   manifestStore.fileIndex.filter(f => f.dut_id === dutId.value)
 )
@@ -678,6 +749,16 @@ function preflightChipClass(status: string) {
   return 'preflight-chip--na'
 }
 
+function extensionCapabilityClass(status: unknown) {
+  const normalized = String(status ?? '').trim().toLowerCase()
+  if (normalized === 'completed') return 'nv-badge--success'
+  if (normalized === 'failed') return 'nv-badge--error'
+  if (normalized === 'missing_prerequisite' || normalized === 'unsupported') {
+    return 'nv-badge--warning'
+  }
+  return 'nv-badge--neutral'
+}
+
 const fileCategories = computed(() => {
   const files = dutFiles.value.filter(f => {
     const parts = f.path.split('/')
@@ -695,7 +776,7 @@ const fileCategories = computed(() => {
 })
 
 function onCollectorClick(row: any) {
-  router.push(`/dut/${dutId.value}/${row._group}/${row._collectorId}`)
+  router.push(collectorDetailRoute(dutId.value, row._group, row._collectorId))
 }
 
 

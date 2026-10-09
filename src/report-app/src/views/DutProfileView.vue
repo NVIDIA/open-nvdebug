@@ -1,3 +1,20 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 <template>
   <div style="min-height: calc(100vh - 88px);">
     <div class="nv-page" style="max-width: 960px; margin: 0 auto;">
@@ -9,7 +26,7 @@
         </div>
       </template>
       <template v-else>
-        <Breadcrumbs :items="[{ label: 'Dashboard', to: '/' }, { label: dut.id, to: `/dut/${encodeURIComponent(dut.id)}` }, { label: 'Profile' }]" />
+        <Breadcrumbs :items="[{ label: 'Dashboard', to: '/' }, { label: dut.id, to: dutRoute(dut.id) }, { label: 'Profile' }]" />
         <h2 class="nv-page__title" style="margin: 12px 0 16px;">{{ dut.id }} — Profile</h2>
 
         <!-- Identity -->
@@ -17,13 +34,33 @@
           <h3 class="dp-section__title">Identity</h3>
           <div class="dp-grid">
             <div class="dp-field"><span class="dp-field__label">DUT ID</span><span class="dp-field__value">{{ dut.id }}</span></div>
-            <div class="dp-field"><span class="dp-field__label">Baseboard</span><span class="dp-field__value">{{ dut.baseboard || '—' }}</span></div>
-            <div class="dp-field"><span class="dp-field__label">Node Type</span><span class="dp-field__value">{{ dut.node_type || '—' }}</span></div>
+            <div class="dp-field"><span class="dp-field__label">Baseboard</span><span class="dp-field__value">{{ displayIdentity.baseboard || '—' }}</span></div>
+            <div class="dp-field"><span class="dp-field__label">Node Type</span><span class="dp-field__value">{{ displayIdentity.nodeType || '—' }}</span></div>
             <div class="dp-field"><span class="dp-field__label">BMC IP</span><span class="dp-field__value" style="font-family: var(--nv-font-mono);">{{ dut.bmc_ip || '—' }}</span></div>
-            <div class="dp-field"><span class="dp-field__label">Model</span><span class="dp-field__value">{{ dut.system_info?.model || '—' }}</span></div>
-            <div class="dp-field"><span class="dp-field__label">Part Number</span><span class="dp-field__value" style="font-family: var(--nv-font-mono);">{{ dut.system_info?.part_number || '—' }}</span></div>
-            <div class="dp-field"><span class="dp-field__label">Serial Number</span><span class="dp-field__value" style="font-family: var(--nv-font-mono);">{{ dut.system_info?.serial_number || '—' }}</span></div>
+            <div class="dp-field"><span class="dp-field__label">Model</span><span class="dp-field__value">{{ displayIdentity.model || '—' }}</span></div>
+            <div class="dp-field"><span class="dp-field__label">Part Number</span><span class="dp-field__value" style="font-family: var(--nv-font-mono);">{{ displayIdentity.partNumber || '—' }}</span></div>
+            <div class="dp-field"><span class="dp-field__label">Serial Number</span><span class="dp-field__value" style="font-family: var(--nv-font-mono);">{{ displayIdentity.serialNumber || '—' }}</span></div>
             <div class="dp-field"><span class="dp-field__label">Overall Status</span><StatusBadge :status="dut.overall_status" /></div>
+          </div>
+        </div>
+
+        <!-- Explicit security-mode evidence is additive. Historical manifests
+             omit this block, and no transport or platform values are inferred. -->
+        <div v-if="dut.security_mode" class="dp-section nv-glass" data-testid="security-mode-section">
+          <h3 class="dp-section__title">Security Mode</h3>
+          <div class="dp-grid">
+            <div class="dp-field">
+              <span class="dp-field__label">Status</span>
+              <span class="dp-field__value">{{ dut.security_mode.status === 'reported' ? 'Reported' : 'Unknown' }}</span>
+            </div>
+            <div class="dp-field">
+              <span class="dp-field__label">Value</span>
+              <span class="dp-field__value">{{ formatSecurityModeValue(dut.security_mode) }}</span>
+            </div>
+            <div class="dp-field">
+              <span class="dp-field__label">Source</span>
+              <span class="dp-field__value dp-field__value--mono">{{ formatSecurityModeSource(dut.security_mode) }}</span>
+            </div>
           </div>
         </div>
 
@@ -42,12 +79,12 @@
               <span v-if="perfRank.sizeRank" class="dp-perf__rank">#{{ perfRank.sizeRank }} / {{ manifestStore.duts.length }}</span>
             </div>
             <div class="dp-perf">
-              <span class="dp-perf__value" :style="{ color: successRate >= 90 ? 'var(--nv-success)' : successRate >= 50 ? 'var(--nv-warning)' : 'var(--nv-error)' }">{{ successRate.toFixed(1) }}%</span>
+              <span class="dp-perf__value" :style="{ color: successRateColor }">{{ successRateLabel }}</span>
               <span class="dp-perf__label">Success Rate</span>
             </div>
             <div class="dp-perf">
               <span class="dp-perf__value">{{ totalCollectors }}</span>
-              <span class="dp-perf__label">Collectors Executed</span>
+              <span class="dp-perf__label">Collectors Completed</span>
             </div>
           </div>
         </div>
@@ -56,7 +93,7 @@
         <div class="dp-section nv-glass">
           <h3 class="dp-section__title">Collector Status</h3>
           <div style="display: flex; gap: 12px; flex-wrap: wrap;">
-            <span v-for="(val, key) in dut.status_summary" :key="key" class="dp-status-pill" :class="`dp-status-pill--${key}`">
+            <span v-for="(val, key) in profileStatusCounts" :key="key" class="dp-status-pill" :class="`dp-status-pill--${key}`">
               {{ key.replace('_', ' ') }}: {{ val }}
             </span>
           </div>
@@ -102,9 +139,9 @@
         <div class="dp-section nv-glass">
           <h3 class="dp-section__title">Quick Links</h3>
           <div style="display: flex; gap: 8px; flex-wrap: wrap;">
-            <router-link :to="`/dut/${encodeURIComponent(dut.id)}`" class="nv-btn nv-btn--ghost" style="font-size: 0.75rem;">DUT Overview</router-link>
-            <router-link :to="`/dut/${encodeURIComponent(dut.id)}/preflight`" class="nv-btn nv-btn--ghost" style="font-size: 0.75rem;">Preflight</router-link>
-            <router-link :to="`/dut/${encodeURIComponent(dut.id)}/firmware`" class="nv-btn nv-btn--ghost" style="font-size: 0.75rem;">Firmware</router-link>
+            <router-link :to="dutRoute(dut.id)" class="nv-btn nv-btn--ghost" style="font-size: 0.75rem;">DUT Overview</router-link>
+            <router-link :to="dutPreflightRoute(dut.id)" class="nv-btn nv-btn--ghost" style="font-size: 0.75rem;">Preflight</router-link>
+            <router-link :to="dutFirmwareRoute(dut.id)" class="nv-btn nv-btn--ghost" style="font-size: 0.75rem;">Firmware</router-link>
           </div>
         </div>
       </template>
@@ -120,7 +157,16 @@ import { detectAnomalies } from '@/composables/useAnomalyDetection'
 import Breadcrumbs from '@/components/common/Breadcrumbs.vue'
 import PageLoader from '@/components/common/PageLoader.vue'
 import StatusBadge from '@/components/common/StatusBadge.vue'
+import {
+  formatCollectorPassRate,
+  summarizeCollectorLifecycleCounts,
+} from '@/utils/collectorLifecycle'
 import { formatDuration } from '@/utils/format'
+import {
+  formatSecurityModeSource,
+  formatSecurityModeValue,
+} from '@/utils/reportMetadata'
+import { dutFirmwareRoute, dutPreflightRoute, dutRoute } from '@/utils/reportRoutes'
 
 const route = useRoute()
 const manifestStore = useManifestStore()
@@ -130,15 +176,36 @@ const dut = computed(() => {
   return manifestStore.dutById(id)
 })
 
-const totalCollectors = computed(() => {
-  if (!dut.value) return 0
-  const s = dut.value.status_summary
-  return s.success + s.error + s.partial + s.skipped
+const displayIdentity = computed(() => {
+  const current = dut.value
+  const identity = current?.platform_identity
+  return {
+    baseboard: identity?.baseboard ?? current?.baseboard ?? '',
+    nodeType: identity?.node_type ?? current?.node_type ?? '',
+    model: identity?.model ?? current?.system_info?.model ?? null,
+    partNumber: identity?.part_number ?? current?.system_info?.part_number ?? null,
+    serialNumber: identity?.serial_number ?? current?.system_info?.serial_number ?? null,
+  }
 })
 
-const successRate = computed(() => {
-  if (!dut.value || totalCollectors.value === 0) return 0
-  return (dut.value.status_summary.success / totalCollectors.value) * 100
+const lifecycleSummary = computed(() =>
+  summarizeCollectorLifecycleCounts(dut.value?.status_summary),
+)
+const profileStatusCounts = computed(() => ({
+  ...lifecycleSummary.value.counts,
+  not_ran: dut.value?.status_summary.not_ran ?? 0,
+}))
+const totalCollectors = computed(() => lifecycleSummary.value.completedCount)
+const successRateLabel = computed(() =>
+  formatCollectorPassRate(lifecycleSummary.value, 1),
+)
+const successRateColor = computed(() => {
+  if (lifecycleSummary.value.state === 'in_progress') return 'var(--nv-info)'
+  const rate = lifecycleSummary.value.passRate
+  if (rate === null) return 'var(--nv-text-tertiary)'
+  if (rate >= 90) return 'var(--nv-success)'
+  if (rate >= 50) return 'var(--nv-warning)'
+  return 'var(--nv-error)'
 })
 
 const perfRank = computed(() => {
@@ -196,6 +263,7 @@ function formatBytes(b: number): string {
   color: var(--nv-text-primary);
   font-weight: 500;
 }
+.dp-field__value--mono { font-family: var(--nv-font-mono); }
 .dp-perf-cards {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
@@ -237,9 +305,13 @@ function formatBytes(b: number): string {
   text-transform: capitalize;
 }
 .dp-status-pill--success { background: var(--nv-success-muted); color: var(--nv-success); }
+.dp-status-pill--degraded { background: var(--nv-warning-muted); color: var(--nv-warning); }
 .dp-status-pill--error { background: var(--nv-error-muted); color: var(--nv-error); }
 .dp-status-pill--partial { background: var(--nv-warning-muted); color: var(--nv-warning); }
 .dp-status-pill--skipped { background: var(--nv-glass-bg-light); color: var(--nv-text-tertiary); }
+.dp-status-pill--cancelled { background: var(--nv-warning-muted); color: var(--nv-warning); }
+.dp-status-pill--running { background: var(--nv-info-muted); color: var(--nv-info); }
+.dp-status-pill--pending { background: var(--nv-glass-bg-light); color: var(--nv-text-tertiary); }
 .dp-status-pill--not_ran { background: var(--nv-glass-bg-light); color: var(--nv-text-tertiary); }
 .dp-fw-list { display: flex; flex-direction: column; gap: 4px; }
 .dp-fw-item {

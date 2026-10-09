@@ -1,3 +1,20 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 <template>
   <div class="vexec">
     <div v-if="timelineEntries.length > 0" class="vexec__intro nv-glass--accent">
@@ -156,6 +173,7 @@
 import { computed, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { formatDuration } from '@/utils/format'
+import { collectorDetailRoute } from '@/utils/reportRoutes'
 
 interface StageTiming {
   validation: number | null
@@ -331,7 +349,7 @@ const idleGapTime = computed(() => {
 const idleOrOverheadTime = computed(() => Math.max(idleGapTime.value, wallClockDuration.value - activeCollectorTime.value))
 const issueCount = computed(() => filteredEntries.value.filter(entry => {
   const status = normalizeStatus(entry.status)
-  return status === 'error' || status === 'partial'
+  return status === 'degraded' || status === 'error' || status === 'partial'
 }).length)
 const slowestEntry = computed(() => {
   return filteredEntries.value.reduce<TimelineEvent | null>((slowest, entry) => {
@@ -438,7 +456,7 @@ function scrollToCollector(entry: TimelineEvent): void {
 }
 
 function navigateToCollector(entry: TimelineEvent): void {
-  router.push(`/dut/${entry.dutId}/${entry.group}/${entry.id}`)
+  router.push(collectorDetailRoute(entry.dutId, entry.group, entry.id))
 }
 </script>
 
@@ -581,6 +599,7 @@ function navigateToCollector(entry: TimelineEvent): void {
 }
 
 .vexec__dot--success { background: var(--nv-success); }
+.vexec__dot--degraded { background: var(--nv-warning); }
 .vexec__dot--partial { background: var(--nv-warning); }
 .vexec__dot--skipped { background: var(--nv-skipped); }
 .vexec__dot--error { background: var(--nv-error); }
@@ -656,6 +675,7 @@ function navigateToCollector(entry: TimelineEvent): void {
 }
 
 .vexec__event--success .vexec__marker { background: var(--nv-success); }
+.vexec__event--degraded .vexec__marker { background: var(--nv-warning); }
 .vexec__event--partial .vexec__marker { background: var(--nv-warning); }
 .vexec__event--skipped .vexec__marker { background: var(--nv-skipped); }
 .vexec__event--error .vexec__marker { background: var(--nv-error); }
@@ -720,6 +740,7 @@ function navigateToCollector(entry: TimelineEvent): void {
 }
 
 .vexec__status--success { color: var(--nv-success); }
+.vexec__status--degraded { color: var(--nv-warning); }
 .vexec__status--partial { color: var(--nv-warning); }
 .vexec__status--skipped { color: var(--nv-skipped); }
 .vexec__status--error { color: var(--nv-error); }

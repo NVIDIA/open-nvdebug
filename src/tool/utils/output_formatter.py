@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 """
 Output Formatter Utility for CLI Commands.
 
@@ -31,6 +32,7 @@ from rich.table import Table
 class OutputFormatter:
     """
     Utility class for formatting command output in JSON or table format.
+
     Handles JSON and table output formatting for various commands including
     collector lists, baseboard information, and configuration data.
     """
@@ -39,8 +41,13 @@ class OutputFormatter:
         """
         Initialize the OutputFormatter.
 
+        The initializer records ``console`` and ``sanitized_console`` for later
+        operations and establishes the instance invariants before any public
+        method runs.
+
         Args:
-            sanitized_console: Sanitized console instance.
+            sanitized_console: Optional sanitized console; ``None`` selects the
+                function's default behavior.
         """
         self.sanitized_console = sanitized_console
         self.console = Console()
@@ -55,11 +62,19 @@ class OutputFormatter:
         """
         Output collectors in JSON or table format.
 
+        The implementation uses ``filtered_collectors``,
+        ``sequential_collectors``, ``json_output``, and ``output_file`` to
+        output collectors in JSON or table format.
+
         Args:
-            filtered_collectors: List of filtered collectors
-            sequential_collectors: Set of sequential collectors
-            json_output: Whether to output in JSON format
-            output_file: File path to output to
+            filtered_collectors: Entries supplied as ``filtered_collectors``
+                without transferring container ownership.
+            sequential_collectors: Entries supplied as ``sequential_collectors``
+                without transferring container ownership.
+            json_output: Whether JSON output is enabled or required for this
+                operation.
+            output_file: Optional filesystem location used as the output file
+                for this operation.
         """
         if json_output:
             if output_file:
@@ -85,10 +100,16 @@ class OutputFormatter:
         """
         Output preflight results in JSON or table format.
 
+        The implementation uses ``results``, ``json_output``, and
+        ``output_file`` to output preflight results in JSON or table format.
+
         Args:
-            results: Results to output
-            json_output: Whether to output in JSON format
-            output_file: File path to output to
+            results: Mapping supplying fields for output preflight results in
+                JSON or table format.
+            json_output: Whether JSON output is enabled or required for this
+                operation.
+            output_file: Optional filesystem location used as the output file
+                for this operation.
         """
         if json_output:
             if output_file:
@@ -107,9 +128,14 @@ class OutputFormatter:
         """
         Print JSON output directly to stdout.
 
+        The implementation uses ``filtered_collectors`` and
+        ``sequential_collectors`` to print JSON output directly to stdout.
+
         Args:
-            filtered_collectors: List of filtered collectors
-            sequential_collectors: Set of sequential collectors
+            filtered_collectors: Entries supplied as ``filtered_collectors``
+                without transferring container ownership.
+            sequential_collectors: Entries supplied as ``sequential_collectors``
+                without transferring container ownership.
         """
         collectors_data = []
 
@@ -147,10 +173,18 @@ class OutputFormatter:
         """
         Write JSON output to a specified file.
 
+        The implementation uses ``filtered_collectors``,
+        ``sequential_collectors``, and ``output_path`` to write JSON output to a
+        specified file. Success is reported only after the owning output
+        boundary has completed its required write or publication step.
+
         Args:
-            filtered_collectors: List of filtered collectors
-            sequential_collectors: Set of sequential collectors
-            output_path: Path to the output file
+            filtered_collectors: Entries supplied as ``filtered_collectors``
+                without transferring container ownership.
+            sequential_collectors: Entries supplied as ``sequential_collectors``
+                without transferring container ownership.
+            output_path: filesystem location used as the output path for this
+                operation.
         """
         # Validate and create output directory if needed
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -194,9 +228,14 @@ class OutputFormatter:
         """
         Print rich table output to stdout.
 
+        The implementation uses ``filtered_collectors`` and
+        ``sequential_collectors`` to print rich table output to stdout.
+
         Args:
-            filtered_collectors: List of filtered collectors
-            sequential_collectors: Set of sequential collectors
+            filtered_collectors: Entries supplied as ``filtered_collectors``
+                without transferring container ownership.
+            sequential_collectors: Entries supplied as ``sequential_collectors``
+                without transferring container ownership.
         """
         table = Table(title="Available Collectors")
         table.add_column("ID", style="cyan")
@@ -240,10 +279,18 @@ class OutputFormatter:
         """
         Write plain text table output to a specified file.
 
+        The implementation uses ``filtered_collectors``,
+        ``sequential_collectors``, and ``output_path`` to write plain text table
+        output to a specified file. Success is reported only after the owning
+        output boundary has completed its required write or publication step.
+
         Args:
-            filtered_collectors: List of filtered collectors
-            sequential_collectors: Set of sequential collectors
-            output_path: Path to the output file
+            filtered_collectors: Entries supplied as ``filtered_collectors``
+                without transferring container ownership.
+            sequential_collectors: Entries supplied as ``sequential_collectors``
+                without transferring container ownership.
+            output_path: filesystem location used as the output path for this
+                operation.
         """
         # Validate and create output directory if needed
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -285,8 +332,12 @@ class OutputFormatter:
         """
         Print preflight results as JSON to stdout.
 
+        The implementation uses ``results`` to print preflight results as JSON
+        to stdout.
+
         Args:
-            results: Results to output
+            results: Mapping supplying fields for print preflight results as
+                JSON to stdout.
         """
         print(json.dumps(results, indent=2))
 
@@ -296,9 +347,16 @@ class OutputFormatter:
         """
         Write preflight results as JSON to a specified file.
 
+        The implementation uses ``results`` and ``output_path`` to write
+        preflight results as JSON to a specified file. Success is reported only
+        after the owning output boundary has completed its required write or
+        publication step.
+
         Args:
-            results: Results to output
-            output_path: Path to the output file
+            results: Mapping supplying fields for preflight results as JSON to a
+                specified file.
+            output_path: filesystem location used as the output path for this
+                operation.
         """
         # Validate and create output directory if needed
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -317,8 +375,12 @@ class OutputFormatter:
         """
         Print preflight results as rich table to stdout.
 
+        The implementation uses ``results`` to print preflight results as rich
+        table to stdout.
+
         Args:
-            results: Results to output
+            results: Mapping supplying fields for print preflight results as
+                rich table to stdout.
         """
 
         # Get all unique service groups from the results
@@ -384,6 +446,17 @@ class OutputFormatter:
 
         # Create failure/skip details table if there are any failures or skips
         if failure_details:
+            for dut_id, service, reason, status in failure_details:
+                diagnostic = f"Preflight {status} ({dut_id}/{service}): {reason}"
+                style = "bold yellow" if status == "skip" else "bold red"
+                if self.sanitized_console:
+                    self.sanitized_console.print(
+                        diagnostic,
+                        style,
+                        soft_wrap=True,
+                    )
+                else:
+                    self.console.print(diagnostic, style=style, soft_wrap=True)
             self.console.print("")  # Add spacing
 
             failure_table = Table(title="Preflight Failure/Skip Details")
@@ -409,9 +482,16 @@ class OutputFormatter:
         """
         Write preflight results as plain text table to a specified file.
 
+        The implementation uses ``results`` and ``output_path`` to write
+        preflight results as plain text table to a specified file. Success is
+        reported only after the owning output boundary has completed its
+        required write or publication step.
+
         Args:
-            results: Results to output
-            output_path: Path to the output file
+            results: Mapping supplying fields for preflight results as plain
+                text table to a specified file.
+            output_path: filesystem location used as the output path for this
+                operation.
         """
         # Validate and create output directory if needed
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -455,8 +535,11 @@ class OutputFormatter:
         """
         Print baseboards as JSON to stdout.
 
+        The implementation uses ``data`` to print baseboards as JSON to stdout.
+
         Args:
-            data: Data to output
+            data: Mapping supplying fields for print baseboards as JSON to
+                stdout.
         """
         print(json.dumps(data, indent=2))
 
@@ -466,9 +549,15 @@ class OutputFormatter:
         """
         Write baseboards as JSON to a specified file.
 
+        The implementation uses ``data`` and ``output_path`` to write baseboards
+        as JSON to a specified file. Success is reported only after the owning
+        output boundary has completed its required write or publication step.
+
         Args:
-            data: Data to output
-            output_path: Path to the output file
+            data: Mapping supplying fields for baseboards as JSON to a specified
+                file.
+            output_path: filesystem location used as the output path for this
+                operation.
         """
         # Validate and create output directory if needed
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -487,8 +576,12 @@ class OutputFormatter:
         """
         Print baseboards as rich table to stdout.
 
+        The implementation uses ``data`` to print baseboards as rich table to
+        stdout.
+
         Args:
-            data: Data to output
+            data: Mapping supplying fields for print baseboards as rich table to
+                stdout.
         """
         baseboards = data.get("baseboards", [])
 
@@ -519,9 +612,16 @@ class OutputFormatter:
         """
         Write baseboards as plain text table to a specified file.
 
+        The implementation uses ``data`` and ``output_path`` to write baseboards
+        as plain text table to a specified file. Success is reported only after
+        the owning output boundary has completed its required write or
+        publication step.
+
         Args:
-            data: Data to output
-            output_path: Path to the output file
+            data: Mapping supplying fields for baseboards as plain text table to
+                a specified file.
+            output_path: filesystem location used as the output path for this
+                operation.
         """
         # Validate and create output directory if needed
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -554,11 +654,17 @@ class OutputFormatter:
         """
         Convert float seconds to a human-readable time format like 'Xh Ym Z.zzs'.
 
+        The implementation uses ``seconds`` to convert float seconds to a
+        human-readable time format like 'Xh Ym Z.zzs'. The source value keeps
+        its ownership while the normalized representation is returned
+        separately.
+
         Args:
-            seconds: Time in seconds as a float
+            seconds: Numeric seconds used while the operation performs bounded
+                accounting.
 
         Returns:
-            str: Human-readable time string (e.g., "12m 35.48s", "1h 23m 45.67s")
+            The canonical time text.
         """
         if seconds <= 0:
             return "0.00s"

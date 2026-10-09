@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 """
 Dynamic Discovery Service.
 
@@ -22,10 +23,21 @@ support for iterating over systems, chassis, and managers.
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+from urllib.parse import unquote, urlsplit
 
 from ..utils.enums import ResourceType
+from ..utils.redfish_limits import (
+    MAX_FOLLOWED_REDFISH_COLLECTION_MEMBERS,
+    bound_redfish_collection_members,
+)
+from ..utils.redfish_topology_profile import (
+    RedfishTopologyProfileError,
+    validate_redfish_request_uri,
+    validate_redfish_uri_path,
+)
 from ..utils.uri_config_manager import URIConfigManager
 
 logger = logging.getLogger(__name__)
@@ -35,27 +47,34 @@ logger = logging.getLogger(__name__)
 class DiscoveryConfig:
     """
     Configuration for dynamic discovery.
+
+    The coherent record keeps ``core_endpoints``, ``optional_endpoints``,
+    ``sub_resource_endpoints``, ``manager_types``, and ``cache_enabled``
+    together so consumers observe one discovery config state. Consumers receive
+    the fields as one unit instead of assembling partial state.
+
+    Attributes:
+        core_endpoints: Collection of core endpoints entries retained by this
+            record.
+        optional_endpoints: Collection of optional endpoints entries retained by
+            this record.
+        sub_resource_endpoints: Collection of sub resource endpoints entries
+            retained by this record.
+        manager_types: Collection of manager types entries retained by this
+            record.
+        cache_enabled: Whether cache enabled applies to this record.
+        verbose_logging: Whether verbose logging applies to this record.
+        discover_sub_resources: Whether discover sub resources applies to this
+            record.
+        discover_firmware_inventory: Whether discover firmware inventory applies
+            to this record.
     """
 
     # Core Redfish endpoints to discover
-    core_endpoints: List[ResourceType] = field(
-        default_factory=lambda: [
-            ResourceType.SYSTEMS,
-            ResourceType.CHASSIS,
-            ResourceType.MANAGERS,
-            ResourceType.UPDATE_SERVICE,
-        ]
-    )
+    core_endpoints: Optional[List[ResourceType]] = None
 
     # Optional endpoints to discover
-    optional_endpoints: List[ResourceType] = field(
-        default_factory=lambda: [
-            ResourceType.TASK_SERVICE,
-            ResourceType.EVENT_SERVICE,
-            ResourceType.SESSION_SERVICE,
-            ResourceType.ACCOUNT_SERVICE,
-        ]
-    )
+    optional_endpoints: Optional[List[ResourceType]] = None
 
     # Sub-resource endpoints to discover (collections under singleton services)
     # Note: Excluding endpoints that commonly cause 403 errors or are slow
@@ -104,52 +123,164 @@ class DynamicDiscoveryService:
     base_collector.py but natively without external dependencies.
     """
 
+    MAX_DISCOVERY_MEMBERS = MAX_FOLLOWED_REDFISH_COLLECTION_MEMBERS
+    MAX_DISCOVERY_PAGE_REQUESTS = 64
+    DISCOVERY_DEADLINE_SECONDS = 120.0
+
     def __init__(
         self, dut_manager, logger, uri_config_manager: Optional[URIConfigManager] = None
     ):
         """
         Initialize the Dynamic Discovery service.
 
+        The initializer records ``_discovery_cache``, ``_resource_details``,
+        ``_resource_members``, ``_resource_metadata``, and ``_resource_uris``
+        for later operations and establishes the instance invariants before any
+        public method runs. If the function cannot initialize the Dynamic
+        Discovery service, its exception reaches the caller instead of being
+        converted into a successful result.
+
         Args:
-            dut_manager: DUT manager instance.
-            logger: Logger instance.
-            uri_config_manager: URI config manager instance.
+            dut_manager: DUT manager consumed while the function attempts to
+                initialize the Dynamic Discovery service.
+            logger: Sanitized logger used for operator-visible diagnostics.
+            uri_config_manager: Validated remote resource identifier used for
+                URI config manager.
+
+        Raises:
+            ValueError: If dynamicdiscoveryservice lacks a URI configuration
+                manager.
         """
         self.dut_manager = dut_manager
         self.logger = logger
-        self.config = DiscoveryConfig()
+        if uri_config_manager is None:
+            raise ValueError(
+                "DynamicDiscoveryService requires a URI configuration manager"
+            )
         self.uri_config_manager = uri_config_manager
+        self.config = self._resolve_config(DiscoveryConfig())
 
         # Cache for discovered resources
         self._discovery_cache: Dict[str, Any] = {}
         self._resource_members: Dict[str, List[str]] = {}
         self._resource_details: Dict[str, Dict[str, Any]] = {}
+        self._resource_metadata: Dict[str, Dict[str, Any]] = {}
 
         # Core resource mappings (will be populated dynamically using URI config manager)
         self._resource_uris = {}
+
+    def _sanitize_diagnostic(self, text: str) -> str:
+        """
+        Route exception text through the run sanitizer or withhold it.
+
+        The implementation uses ``text`` to route exception text through the run
+        sanitizer or withhold it.
+
+        Args:
+            text: Text supplied as text in the format accepted by this function.
+
+        Returns:
+            The canonical diagnostic text.
+        """
+
+        sanitize = getattr(self.logger, "_sanitize_text", None)
+        if callable(sanitize):
+            sanitized = sanitize(text)
+            if isinstance(sanitized, str):
+                return sanitized
+        return "Discovery failure details withheld: run sanitizer unavailable"
 
     def set_config(self, config: DiscoveryConfig) -> None:
         """
         Set discovery configuration.
 
+        The implementation uses ``config`` to set discovery configuration. It
+        updates ``config`` on the instance as part of that state transition.
+
         Args:
-            config: Discovery configuration.
+            config: Config governing set discovery configuration.
         """
-        self.config = config
+        self.config = self._resolve_config(config)
+
+    def _resolve_config(self, config: DiscoveryConfig) -> DiscoveryConfig:
+        """
+        Fill topology-owned discovery categories without a local fallback.
+
+        The implementation uses ``config`` to fill topology-owned discovery
+        categories without a local fallback.
+
+        Args:
+            config: Config governing fill topology-owned discovery categories
+                without a local fallback.
+
+        Returns:
+            The validated ``config``.
+        """
+
+        if config.core_endpoints is None:
+            config.core_endpoints = (
+                self.uri_config_manager.get_discovery_resource_types("core")
+            )
+        if config.optional_endpoints is None:
+            config.optional_endpoints = (
+                self.uri_config_manager.get_discovery_resource_types("optional")
+            )
+        return config
 
     def _get_resource_uri(self, dut_id: str, resource_type: ResourceType) -> str:
         """
-        Get URI for a resource type using URI config manager or fallback.
+        Get the catalog-owned URI for a resource type.
+
+        After applying local validation, the function forwards ``dut_id`` and
+        ``resource_type`` to ``self.uri_config_manager.get_uri`` and preserves
+        its return and exception contract.
 
         Args:
-            dut_id: DUT ID.
-            resource_type: Resource type.
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+            resource_type: Resource type consumed while the function attempts to
+                get the catalog-owned URI for a resource type.
+
+        Returns:
+            The canonical resource URI text.
         """
-        if self.uri_config_manager:
-            return self.uri_config_manager.get_uri(dut_id, resource_type)
-        else:
-            # Fallback to hardcoded URI if no URI config manager
-            return f"/redfish/v1/{resource_type.value}"
+        return self.uri_config_manager.get_uri(dut_id, resource_type)
+
+    def _get_firmware_inventory_resource_types(self) -> List[ResourceType]:
+        """
+        Return the catalog-owned ordered firmware inventory candidates.
+
+        The implementation uses current instance state to produce the
+        catalog-owned ordered firmware inventory candidates. If the function
+        cannot produce the catalog-owned ordered firmware inventory candidates,
+        its exception reaches the caller instead of being converted into a
+        successful result.
+
+        Returns:
+            The validated ``resource_types``.
+
+        Raises:
+            ValueError: If catalog Redfish topology must define a non-empty
+                discovery.firmware_inventory_candidates list; or catalog Redfish
+                topology firmware inventory candidate ``index`` is not a
+                supported resource: ``resource_type``.
+        """
+
+        resource_types = self.uri_config_manager.get_discovery_resource_types(
+            "firmware_inventory_candidates"
+        )
+        if not isinstance(resource_types, list) or not resource_types:
+            raise ValueError(
+                "Catalog Redfish topology must define a non-empty "
+                "discovery.firmware_inventory_candidates list"
+            )
+        for index, resource_type in enumerate(resource_types):
+            if not isinstance(resource_type, ResourceType):
+                raise ValueError(
+                    "Catalog Redfish topology firmware inventory candidate "
+                    f"{index} is not a supported resource: {resource_type!r}"
+                )
+        return resource_types
 
     def _create_standardized_collector_result(
         self,
@@ -165,21 +296,31 @@ class DynamicDiscoveryService:
         """
         Create a standardized collector result dictionary.
 
-        This method provides a consistent result format for all collector operations.
-        Now aligned with BaseService signature for consistency.
+        This method provides a consistent result format for all collector
+        operations. Now aligned with BaseService signature for consistency.
 
         Args:
-            successful_operations: Number of successful operations
-            total_operations: Total number of operations attempted
-            output_files: List of output file paths
-            error_messages: List of error messages
-            operation_name: Name of the operation performed
-            additional_context: Additional context information
-            dut_id: DUT identifier (optional, added to additional_context if provided)
-            collector_id: Collector identifier (optional, added to additional_context if provided)
+            successful_operations: Numeric successful operations used while the
+                operation performs bounded accounting.
+            total_operations: Numeric total operations used while the operation
+                performs bounded accounting.
+            output_files: Optional output files; ``None`` selects the function's
+                default behavior.
+            error_messages: Optional error messages; ``None`` selects the
+                function's default behavior.
+            operation_name: Stable operation name used for lookup and
+                operator-facing diagnostics.
+            additional_context: Optional additional context; ``None`` selects
+                the function's default behavior.
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+            collector_id: Stable collector identifier used to correlate
+                configuration, logs, and results.
 
         Returns:
-            Standardized result dictionary
+            A mapping containing the ``success``, ``successful_operations``,
+            ``total_operations``, ``output_files``, and ``error_messages``
+            fields.
         """
         if output_files is None:
             output_files = []
@@ -210,12 +351,19 @@ class DynamicDiscoveryService:
         """
         Discover all configured Redfish resources for a DUT.
 
+        The implementation uses ``dut_id`` and ``preflight_results`` to discover
+        all configured Redfish resources for a DUT. Owned asynchronous work is
+        awaited before return, so completion does not leave an unobserved task
+        behind.
+
         Args:
-            dut_id: The DUT identifier
-            preflight_results: Optional preflight results to check Redfish status
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+            preflight_results: Optional preflight results; ``None`` selects the
+                function's default behavior.
 
         Returns:
-            dict: Discovery results with resource members and metadata
+            A mapping containing discover all resources.
         """
         await self.logger.write_to_dut_runtime_log(
             dut_id, "INFO", "DynamicDiscovery", "Starting Redfish dynamic discovery..."
@@ -244,6 +392,7 @@ class DynamicDiscoveryService:
 
         discovery_results = {
             "success": True,
+            "partial": False,
             "dut_id": dut_id,
             "discovered_resources": {},
             "raw_response_data": {},
@@ -251,6 +400,7 @@ class DynamicDiscoveryService:
                 "discovery_timestamp": None,
                 "total_resources": 0,
                 "cache_enabled": self.config.cache_enabled,
+                "truncated_resources": [],
             },
         }
 
@@ -285,9 +435,21 @@ class DynamicDiscoveryService:
                 """
                 Discover a single endpoint and return (category, resource_type, result).
 
+                The implementation uses ``category`` and ``resource_type`` to
+                discover a single endpoint and return (category, resource_type,
+                result). Owned asynchronous work is awaited before return, so
+                completion does not leave an unobserved task behind.
+
                 Args:
-                    category: Category of the resource.
-                    resource_type: Resource type.
+                    category: Text supplied as category in the format accepted
+                        by this function.
+                    resource_type: Resource type object whose ``value`` state is
+                        read while performing discover a single endpoint and
+                        return (category, resource_type, result).
+
+                Returns:
+                    A tuple containing ``category``, ``resource type``, and
+                    ``discover endpoint value 3`` in that order.
                 """
                 try:
                     await self.logger.write_to_dut_runtime_log(
@@ -319,7 +481,7 @@ class DynamicDiscoveryService:
 
             # Process results
             for result_item in discovery_results_list:
-                if isinstance(result_item, Exception):
+                if isinstance(result_item, BaseException):
                     await self.logger.write_to_dut_runtime_log(
                         dut_id,
                         "ERROR",
@@ -331,13 +493,42 @@ class DynamicDiscoveryService:
                 category, resource_type, result = result_item
 
                 if result["success"]:
-                    discovery_results["discovered_resources"][resource_type.value] = {
+                    resource_result = {
                         "success": True,
                         "members": result["members"],
                         "total_count": result.get(
                             "total_count", len(result["members"])
                         ),
                     }
+                    for metadata_key in (
+                        "complete",
+                        "partial",
+                        "truncated",
+                        "pagination_complete",
+                        "source_member_count",
+                        "advertised_member_count",
+                        "advertised_count_mismatch",
+                        "member_limit",
+                        "page_count",
+                        "request_count",
+                        "rejected_member_count",
+                        "duplicate_member_count",
+                        "incomplete_reasons",
+                    ):
+                        if metadata_key in result:
+                            resource_result[metadata_key] = result[metadata_key]
+                    discovery_results["discovered_resources"][
+                        resource_type.value
+                    ] = resource_result
+                    if result.get("partial"):
+                        discovery_results["partial"] = True
+                        discovery_results["metadata"].setdefault(
+                            "incomplete_resources", []
+                        ).append(resource_type.value)
+                    if result.get("truncated"):
+                        discovery_results["metadata"]["truncated_resources"].append(
+                            resource_type.value
+                        )
                     discovery_results["raw_response_data"][resource_type.value] = (
                         result.get("member_details", {})
                     )
@@ -386,34 +577,55 @@ class DynamicDiscoveryService:
         except Exception as e:
             import traceback
 
-            from tool.utils.sanitizer import BuiltInSanitizers, LogSanitizer
-
-            error_details = traceback.format_exc()
-            # Sanitize stack trace to remove any credential values
-            sanitizer = LogSanitizer(
-                additional_regex=[
-                    BuiltInSanitizers.CREDENTIALS,
-                    BuiltInSanitizers.API_KEYS,
-                    BuiltInSanitizers.TOKENS,
-                ]
+            error_details = self._sanitize_diagnostic(
+                f"Discovery failed: {e}\nTraceback:\n{traceback.format_exc()}"
             )
-            error_details = sanitizer.sanitize(error_details)
             await self.logger.write_to_dut_runtime_log(
                 dut_id,
                 "ERROR",
                 "DynamicDiscovery",
-                f"Discovery failed: {str(e)}\nTraceback:\n{error_details}",
+                error_details,
             )
             return self._create_standardized_collector_result(
                 successful_operations=0,
                 total_operations=1,
                 output_files=[],
-                error_messages=[str(e), error_details],
+                error_messages=[error_details],
                 operation_name="dynamic_discovery",
                 additional_context={"error_traceback": error_details},
                 dut_id=dut_id,
                 collector_id="dynamic_discovery",
             )
+
+    def _normalize_collection_link(
+        self, dut_id: str, uri: str, *, context: str, hmc: bool
+    ) -> str:
+        """
+        Rebase a response link before checking its collection membership.
+
+        Proxies may advertise the catalog root inside a response fetched through
+        a custom root. Validate the original path first, then translate that root
+        without granting a link permission to escape its collection. Keep both
+        pagination and member comparisons in the resolved collection namespace.
+        BMC collections may still advertise independently routed HMC members.
+
+        Args:
+            dut_id: DUT whose effective collection root anchors the response.
+            uri: Path-only response link, optionally containing a page query.
+            context: Diagnostic name of the resource or pagination link.
+            hmc: Resolved namespace of the collection whose links are validated.
+
+        Returns:
+            A validated request path in the effective collection namespace.
+
+        Raises:
+            RedfishTopologyProfileError: If the original or rebased URI is unsafe.
+        """
+
+        validated = validate_redfish_request_uri(uri, context=context)
+        return self.uri_config_manager.normalize_response_uri(
+            dut_id, validated, hmc=hmc
+        )
 
     async def _discover_resource(
         self, dut_id: str, resource_type: ResourceType
@@ -421,12 +633,25 @@ class DynamicDiscoveryService:
         """
         Discover a specific Redfish resource type.
 
+        The implementation uses ``dut_id`` and ``resource_type`` to discover a
+        specific Redfish resource type. Owned asynchronous work is awaited
+        before return, so completion does not leave an unobserved task behind.
+        If the function cannot discover a specific Redfish resource type, its
+        exception reaches the caller instead of being converted into a
+        successful result.
+
         Args:
-            dut_id: The DUT identifier
-            resource_type: The resource type to discover
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+            resource_type: Resource type object whose ``value`` state is read
+                while performing discover a specific Redfish resource type.
 
         Returns:
-            dict: Discovery result with members and metadata
+            A mapping containing discover resource.
+
+        Raises:
+            RedfishTopologyProfileError: If nextLink escaped its collection; or
+                nextLink repeated a page.
         """
         # Get URI from config manager if available, otherwise use fallback
         if self.uri_config_manager:
@@ -467,19 +692,32 @@ class DynamicDiscoveryService:
             }
 
         try:
+            discovery_started = time.monotonic()
+            try:
+                collection_request_uri = validate_redfish_request_uri(
+                    uri,
+                    context=f"{resource_type.value} collection URI",
+                )
+            except (RedfishTopologyProfileError, TypeError, ValueError):
+                return {
+                    "success": False,
+                    "error": f"Invalid {resource_type.value} collection URI",
+                }
+
             # Get the resource collection
             await self.logger.write_to_dut_runtime_log(
                 dut_id,
                 "DEBUG",
                 "DynamicDiscovery",
-                f"_discover_resource: making Redfish request GET {uri}",
+                f"_discover_resource: making Redfish request GET {collection_request_uri}",
             )
 
             success, collection, error_info, _ = (
                 await self.dut_manager.execute_redfish_request(
-                    dut_id, "GET", uri, timeout=10
+                    dut_id, "GET", collection_request_uri, timeout=10
                 )
             )
+            request_count = 1
 
             await self.logger.write_to_dut_runtime_log(
                 dut_id,
@@ -505,7 +743,7 @@ class DynamicDiscoveryService:
                     dut_id,
                     "ERROR",
                     "DynamicDiscovery",
-                    f"_discover_resource: failed to get valid {resource_type.value} collection from {uri} (HTTP {http_status}): {str(error_message)[:200]}",
+                    f"_discover_resource: failed to get valid {resource_type.value} collection from {collection_request_uri} (HTTP {http_status}): {str(error_message)[:200]}",
                 )
                 return {
                     "success": False,
@@ -526,9 +764,150 @@ class DynamicDiscoveryService:
                     f"_discover_resource: got valid JSON for {resource_type.value} despite HTTP error {http_status}, proceeding with discovery",
                 )
 
-            members = collection.get("Members", [])
+            members: List[Any] = []
+            source_member_count = 0
+            members_truncated = False
+            pagination_complete = bool(success)
+            pagination_errors: List[str] = []
+            page_count = 0
+            collection_path = unquote(urlsplit(collection_request_uri).path)
+            collection_hmc = self.uri_config_manager._is_hmc_uri(
+                collection_request_uri, dut_id
+            )
+            seen_page_uris = {collection_request_uri}
+            current_page = collection
+
+            while True:
+                page_count += 1
+                try:
+                    page_members, page_source_count, page_truncated = (
+                        bound_redfish_collection_members(
+                            current_page.get("Members", []),
+                            field_name=f"{resource_type.value} Members",
+                            limit=self.MAX_DISCOVERY_MEMBERS,
+                        )
+                    )
+                except ValueError:
+                    if page_count == 1:
+                        return {
+                            "success": False,
+                            "error": f"Invalid {resource_type.value} Members collection",
+                        }
+                    pagination_complete = False
+                    pagination_errors.append("paginated Members value was malformed")
+                    break
+
+                source_member_count += page_source_count
+                remaining_capacity = self.MAX_DISCOVERY_MEMBERS - len(members)
+                members.extend(page_members[: max(0, remaining_capacity)])
+                if page_truncated or page_source_count > remaining_capacity:
+                    members_truncated = True
+                    pagination_complete = False
+                    pagination_errors.append("member follow limit was reached")
+                    break
+
+                next_link = current_page.get(
+                    "Members@odata.nextLink"
+                ) or current_page.get("@odata.nextLink")
+                if not next_link:
+                    break
+                if len(members) >= self.MAX_DISCOVERY_MEMBERS:
+                    members_truncated = True
+                    pagination_complete = False
+                    pagination_errors.append(
+                        "member follow limit was reached before the next page"
+                    )
+                    break
+
+                try:
+                    next_page_uri = self._normalize_collection_link(
+                        dut_id,
+                        next_link,
+                        context=f"{resource_type.value} Members nextLink",
+                        hmc=collection_hmc,
+                    )
+                    next_page_parts = urlsplit(next_page_uri)
+                    if unquote(next_page_parts.path) != collection_path:
+                        raise RedfishTopologyProfileError(
+                            "nextLink escaped its collection"
+                        )
+                    canonical_page_uri = unquote(next_page_parts.path) + (
+                        f"?{next_page_parts.query}" if next_page_parts.query else ""
+                    )
+                    if canonical_page_uri in seen_page_uris:
+                        raise RedfishTopologyProfileError("nextLink repeated a page")
+                except (RedfishTopologyProfileError, TypeError, ValueError) as error:
+                    pagination_complete = False
+                    pagination_errors.append(str(error))
+                    break
+
+                elapsed = time.monotonic() - discovery_started
+                if request_count >= self.MAX_DISCOVERY_PAGE_REQUESTS:
+                    pagination_complete = False
+                    pagination_errors.append("pagination request budget was exhausted")
+                    break
+                if elapsed >= self.DISCOVERY_DEADLINE_SECONDS:
+                    pagination_complete = False
+                    pagination_errors.append("pagination deadline was exceeded")
+                    break
+
+                seen_page_uris.add(canonical_page_uri)
+                request_count += 1
+                page_success, page_payload, _, _ = (
+                    await self.dut_manager.execute_redfish_request(
+                        dut_id,
+                        "GET",
+                        next_page_uri,
+                        timeout=max(
+                            1,
+                            min(
+                                10,
+                                int(self.DISCOVERY_DEADLINE_SECONDS - elapsed),
+                            ),
+                        ),
+                    )
+                )
+                if not isinstance(page_payload, dict):
+                    pagination_complete = False
+                    pagination_errors.append("next page was not a JSON object")
+                    break
+                if not page_success:
+                    pagination_complete = False
+                    pagination_errors.append("next page request was unsuccessful")
+                current_page = page_payload
+
+            raw_advertised_count = collection.get("Members@odata.count")
+            advertised_count_valid = raw_advertised_count is None or (
+                type(raw_advertised_count) is int and raw_advertised_count >= 0
+            )
+            advertised_member_count = (
+                raw_advertised_count if advertised_count_valid else None
+            )
+            advertised_count_mismatch = bool(
+                raw_advertised_count is not None
+                and (
+                    not advertised_count_valid
+                    or raw_advertised_count != source_member_count
+                )
+            )
+            if advertised_count_mismatch:
+                pagination_complete = False
+                pagination_errors.append(
+                    "Members@odata.count did not match the observed member count"
+                )
+            if members_truncated:
+                await self.logger.write_to_dut_runtime_log(
+                    dut_id,
+                    "WARNING",
+                    "DynamicDiscovery",
+                    f"_discover_resource: limiting {resource_type.value} members "
+                    f"from {source_member_count} to {self.MAX_DISCOVERY_MEMBERS}",
+                )
             member_ids = []
             member_details = {}
+            rejected_member_count = 0
+            duplicate_member_count = 0
+            seen_member_ids = set()
             is_singleton_service = len(members) == 0
 
             # Log the type of resource discovered
@@ -598,8 +977,11 @@ class DynamicDiscoveryService:
 
             # Process each member (for collections) or handle singleton special cases
             for member in members:
-                member_uri = member.get("@odata.id")
+                member_uri = (
+                    member.get("@odata.id") if isinstance(member, dict) else None
+                )
                 if not member_uri:
+                    rejected_member_count += 1
                     await self.logger.write_to_dut_runtime_log(
                         dut_id,
                         "WARN",
@@ -608,8 +990,42 @@ class DynamicDiscoveryService:
                     )
                     continue
 
-                # Extract member ID from URI
-                member_id = member_uri.split("/")[-1]
+                try:
+                    request_member_uri = member_uri
+                    member_uri = self._normalize_collection_link(
+                        dut_id,
+                        member_uri,
+                        context=f"{resource_type.value} member URI",
+                        hmc=collection_hmc,
+                    )
+                    member_uri = validate_redfish_uri_path(
+                        member_uri,
+                        context=f"{resource_type.value} member URI",
+                        service_root=collection_path,
+                    )
+                except (RedfishTopologyProfileError, TypeError, ValueError):
+                    rejected_member_count += 1
+                    await self.logger.write_to_dut_runtime_log(
+                        dut_id,
+                        "WARN",
+                        "DynamicDiscovery",
+                        f"_discover_resource: rejected invalid {resource_type.value} member URI",
+                    )
+                    continue
+
+                if collection_hmc:
+                    request_member_uri = member_uri
+
+                # The path validator proves that decoding cannot introduce a
+                # separator or traversal segment. Decode safe aliases before
+                # deduplication so ``System_0`` and ``%53ystem_0`` cannot cause
+                # repeated detail requests or state-changing work downstream.
+                member_uri = unquote(member_uri)
+                member_id = member_uri.rsplit("/", 1)[-1]
+                if member_id in seen_member_ids:
+                    duplicate_member_count += 1
+                    continue
+                seen_member_ids.add(member_id)
                 member_ids.append(member_id)
 
                 await self.logger.write_to_dut_runtime_log(
@@ -623,7 +1039,7 @@ class DynamicDiscoveryService:
                 if self.config.verbose_logging:
                     detail_success, detail_data, _, _ = (
                         await self.dut_manager.execute_redfish_request(
-                            dut_id, "GET", member_uri, timeout=10
+                            dut_id, "GET", request_member_uri, timeout=10
                         )
                     )
                     if detail_success and detail_data:
@@ -685,23 +1101,15 @@ class DynamicDiscoveryService:
                 except Exception as fw_error:
                     import traceback
 
-                    from tool.utils.sanitizer import BuiltInSanitizers, LogSanitizer
-
-                    error_traceback = traceback.format_exc()
-                    # Sanitize stack trace to remove any credential values
-                    sanitizer = LogSanitizer(
-                        additional_regex=[
-                            BuiltInSanitizers.CREDENTIALS,
-                            BuiltInSanitizers.API_KEYS,
-                            BuiltInSanitizers.TOKENS,
-                        ]
+                    error_traceback = self._sanitize_diagnostic(
+                        "_discover_resource: firmware inventory discovery failed: "
+                        f"{fw_error}\nTraceback:\n{traceback.format_exc()}"
                     )
-                    error_traceback = sanitizer.sanitize(error_traceback)
                     await self.logger.write_to_dut_runtime_log(
                         dut_id,
                         "ERROR",
                         "DynamicDiscovery",
-                        f"_discover_resource: firmware inventory discovery failed: {str(fw_error)}\nTraceback:\n{error_traceback}",
+                        error_traceback,
                     )
             elif (
                 resource_type == ResourceType.UPDATE_SERVICE
@@ -714,9 +1122,43 @@ class DynamicDiscoveryService:
                     "_discover_resource: skipping firmware inventory discovery for UpdateService (disabled in config)",
                 )
 
-            # Cache the results
+            discovery_complete = bool(
+                pagination_complete
+                and not members_truncated
+                and not advertised_count_mismatch
+                and rejected_member_count == 0
+                and duplicate_member_count == 0
+            )
+            if rejected_member_count:
+                pagination_errors.append(
+                    f"{rejected_member_count} collection members were rejected"
+                )
+            if duplicate_member_count:
+                pagination_errors.append(
+                    f"{duplicate_member_count} duplicate collection members were ignored"
+                )
+
+            # Cache the results and their completeness as one snapshot. Bare
+            # member lists remain available for compatibility, while safety-
+            # sensitive consumers use get_resource_member_snapshot().
             cache_key = f"{dut_id}_{resource_type.value}"
             self._resource_members[cache_key] = member_ids
+            resource_metadata = {
+                "complete": discovery_complete,
+                "partial": not discovery_complete,
+                "truncated": members_truncated,
+                "pagination_complete": pagination_complete,
+                "source_member_count": source_member_count,
+                "advertised_member_count": advertised_member_count,
+                "advertised_count_mismatch": advertised_count_mismatch,
+                "member_limit": self.MAX_DISCOVERY_MEMBERS,
+                "page_count": page_count,
+                "request_count": request_count,
+                "rejected_member_count": rejected_member_count,
+                "duplicate_member_count": duplicate_member_count,
+                "incomplete_reasons": list(dict.fromkeys(pagination_errors)),
+            }
+            self._resource_metadata[cache_key] = resource_metadata
             if member_details:
                 self._resource_details[cache_key] = member_details
 
@@ -765,23 +1207,27 @@ class DynamicDiscoveryService:
                 "members": member_ids,
                 "member_details": member_details,
                 "total_count": len(member_ids),
+                **resource_metadata,
             }
 
         except Exception as e:
             import traceback
 
-            error_details = traceback.format_exc()
+            error_details = self._sanitize_diagnostic(
+                f"Failed to discover {resource_type.value}: {e}\n"
+                f"Traceback:\n{traceback.format_exc()}"
+            )
             await self.logger.write_to_dut_runtime_log(
                 dut_id,
                 "ERROR",
                 "DynamicDiscovery",
-                f"Failed to discover {resource_type.value}: {str(e)}\nTraceback:\n{error_details}",
+                error_details,
             )
             return self._create_standardized_collector_result(
                 successful_operations=0,
                 total_operations=1,
                 output_files=[],
-                error_messages=[str(e), error_details],
+                error_messages=[error_details],
                 operation_name=f"discover_{resource_type.value}",
                 additional_context={
                     "resource_type": resource_type.value,
@@ -797,93 +1243,116 @@ class DynamicDiscoveryService:
         """
         Discover firmware inventory from UpdateService.
 
+        ``update_service_uri`` remains in the signature for compatibility with
+        the discovery callback. Candidate paths are resolved from catalog
+        resources instead of being constructed from this value.
+
         Args:
-            dut_id: The DUT identifier
-            update_service_uri: The UpdateService URI
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+            update_service_uri: Validated remote resource identifier used for
+                update service URI.
 
         Returns:
-            dict: Firmware inventory data or None if not available
+            A mapping containing the ``uri``, ``total_components``,
+            ``components``, ``inventory_data``, and ``partial`` fields.
         """
         try:
-            # Get firmware inventory URI from config manager if available
-            if self.uri_config_manager:
-                dut_config = self.dut_manager.get_dut_config(dut_id) or {}
-                baseboard = dut_config.get("baseboard")
-                platform = dut_config.get("platform")
+            # ``update_service_uri`` remains in the signature for compatibility
+            # with the discovery callback. Candidate paths are resolved from
+            # catalog resources instead of being constructed from this value.
+            del update_service_uri
+            dut_config = self.dut_manager.get_dut_config(dut_id) or {}
+            baseboard = dut_config.get("baseboard")
+            platform = dut_config.get("platform")
+            legacy_uri = dut_config.get("firmware_inventory_uri")
 
-                firmware_uri = self.uri_config_manager.get_uri(
-                    dut_id, "firmware_inventory", baseboard, platform
-                )
-                if not firmware_uri:
-                    firmware_uri = dut_config.get(
-                        "firmware_inventory_uri",
-                        f"{update_service_uri}/FirmwareInventory",
+            def iter_candidate_uris():
+                """
+                Yield candidate firmware-inventory URIs in selection order.
+
+                The implementation uses current instance state to yield
+                candidate firmware-inventory URIs in selection order.
+
+                Yields:
+                    Each candidate URIs admitted by the operation, in
+                    deterministic iteration order.
+                """
+                seen_uris = set()
+                if legacy_uri is not None:
+                    normalized_legacy_uri = validate_redfish_uri_path(
+                        legacy_uri,
+                        context="DUT firmware_inventory_uri",
                     )
-            else:
-                # Fallback to DUT config or default
-                dut_config = self.dut_manager.get_dut_config(dut_id) or {}
-                firmware_uri = dut_config.get(
-                    "firmware_inventory_uri", f"{update_service_uri}/FirmwareInventory"
-                )
+                    seen_uris.add(normalized_legacy_uri)
+                    yield "DUT firmware_inventory_uri", normalized_legacy_uri
 
-            # Try the configured firmware inventory URI
-            success, firmware_inventory, _, _ = (
-                await self.dut_manager.execute_redfish_request(
-                    dut_id, "GET", firmware_uri
-                )
-            )
+                for resource_type in self._get_firmware_inventory_resource_types():
+                    candidate_uri = self.uri_config_manager.get_uri(
+                        dut_id,
+                        resource_type,
+                        baseboard,
+                        platform,
+                    )
+                    normalized_candidate_uri = validate_redfish_uri_path(
+                        candidate_uri,
+                        context=f"Catalog {resource_type.value} URI",
+                    )
+                    if normalized_candidate_uri not in seen_uris:
+                        seen_uris.add(normalized_candidate_uri)
+                        yield (
+                            f"catalog {resource_type.value}",
+                            normalized_candidate_uri,
+                        )
 
-            if success and firmware_inventory:
-                firmware_inventory_uri = firmware_uri
-                await self.logger.write_to_dut_runtime_log(
-                    dut_id,
-                    "INFO",
-                    "DynamicDiscovery",
-                    f"Using configured firmware inventory URI: {firmware_uri}",
+            firmware_inventory = None
+            firmware_inventory_uri = None
+            for candidate_source, candidate_uri in iter_candidate_uris():
+                success, inventory, _, _ = (
+                    await self.dut_manager.execute_redfish_request(
+                        dut_id, "GET", candidate_uri
+                    )
                 )
-            else:
+                if success and inventory:
+                    firmware_inventory = inventory
+                    firmware_inventory_uri = candidate_uri
+                    await self.logger.write_to_dut_runtime_log(
+                        dut_id,
+                        "INFO",
+                        "DynamicDiscovery",
+                        "Using firmware inventory URI from "
+                        f"{candidate_source}: {candidate_uri}",
+                    )
+                    break
+
                 await self.logger.write_to_dut_runtime_log(
                     dut_id,
                     "WARN",
                     "DynamicDiscovery",
-                    f"Configured firmware inventory URI failed: {firmware_uri}",
-                )
-                firmware_inventory = None
-
-            # If no custom URI or custom URI failed, try standard URIs
-            if not firmware_inventory:
-                # Standard firmware inventory URI
-                firmware_inventory_uri = f"{update_service_uri}/FirmwareInventory"
-
-                success, firmware_inventory, _, _ = (
-                    await self.dut_manager.execute_redfish_request(
-                        dut_id, "GET", firmware_inventory_uri
-                    )
+                    f"Firmware inventory URI failed ({candidate_source}): "
+                    f"{candidate_uri}",
                 )
 
-                if not success or not firmware_inventory:
-                    # Try alternative URI patterns
-                    alternative_uris = [
-                        f"{update_service_uri}/SoftwareInventory",
-                        f"{update_service_uri}/Inventory",
-                        f"{update_service_uri}/Firmware",
-                    ]
-
-                    for alt_uri in alternative_uris:
-                        success, inventory, _, _ = (
-                            await self.dut_manager.execute_redfish_request(
-                                dut_id, "GET", alt_uri
-                            )
-                        )
-                        if success and inventory:
-                            firmware_inventory = inventory
-                            firmware_inventory_uri = alt_uri
-                            break
-                else:
-                    firmware_inventory_uri = f"{update_service_uri}/FirmwareInventory"
+            if firmware_inventory is None or firmware_inventory_uri is None:
+                return None
 
             if firmware_inventory:
-                members = firmware_inventory.get("Members", [])
+                try:
+                    members, source_member_count, members_truncated = (
+                        bound_redfish_collection_members(
+                            firmware_inventory.get("Members", []),
+                            field_name="FirmwareInventory Members",
+                            limit=self.MAX_DISCOVERY_MEMBERS,
+                        )
+                    )
+                except ValueError:
+                    await self.logger.write_to_dut_runtime_log(
+                        dut_id,
+                        "WARN",
+                        "DynamicDiscovery",
+                        "Firmware inventory returned an invalid Members collection",
+                    )
+                    return None
                 if not members:
                     await self.logger.write_to_dut_runtime_log(
                         dut_id,
@@ -892,6 +1361,14 @@ class DynamicDiscoveryService:
                         "Firmware inventory returned no members",
                     )
                     return None
+                if members_truncated:
+                    await self.logger.write_to_dut_runtime_log(
+                        dut_id,
+                        "WARNING",
+                        "DynamicDiscovery",
+                        "Firmware inventory member walk was truncated from "
+                        f"{source_member_count} to {self.MAX_DISCOVERY_MEMBERS}",
+                    )
                 await self.logger.write_to_dut_runtime_log(
                     dut_id,
                     "INFO",
@@ -901,10 +1378,30 @@ class DynamicDiscoveryService:
 
                 # Get detailed information for each firmware component
                 firmware_details = {}
+                rejected_members = 0
 
                 for member in members:
-                    member_uri = member.get("@odata.id")
+                    member_uri = (
+                        member.get("@odata.id") if isinstance(member, dict) else None
+                    )
                     if not member_uri:
+                        rejected_members += 1
+                        continue
+
+                    try:
+                        member_uri = validate_redfish_uri_path(
+                            member_uri,
+                            context="FirmwareInventory member URI",
+                            service_root=firmware_inventory_uri,
+                        )
+                    except (RedfishTopologyProfileError, TypeError, ValueError):
+                        rejected_members += 1
+                        await self.logger.write_to_dut_runtime_log(
+                            dut_id,
+                            "WARN",
+                            "DynamicDiscovery",
+                            "Rejected invalid firmware inventory member URI",
+                        )
                         continue
 
                     # Extract component ID from URI
@@ -924,6 +1421,11 @@ class DynamicDiscoveryService:
                     "total_components": len(members),
                     "components": firmware_details,
                     "inventory_data": firmware_inventory,
+                    "partial": members_truncated or rejected_members > 0,
+                    "truncated": members_truncated,
+                    "source_member_count": source_member_count,
+                    "member_limit": self.MAX_DISCOVERY_MEMBERS,
+                    "rejected_member_count": rejected_members,
                 }
 
             return None
@@ -941,12 +1443,16 @@ class DynamicDiscoveryService:
         """
         Get cached resource members for a specific resource type.
 
+        Log what's being retrieved from cache using async logging.
+
         Args:
-            dut_id: The DUT identifier
-            resource_type: The resource type (e.g., "Systems", "Chassis", "Managers")
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+            resource_type: Text supplied as resource type in the format accepted
+                by this function.
 
         Returns:
-            list: List of resource member IDs
+            The validated ``members``.
         """
         cache_key = f"{dut_id}_{resource_type}"
         members = self._resource_members.get(cache_key, [])
@@ -961,18 +1467,61 @@ class DynamicDiscoveryService:
 
         return members
 
+    async def get_resource_member_snapshot(
+        self, dut_id: str, resource_type: str
+    ) -> Dict[str, Any]:
+        """
+        Return cached members together with completeness metadata.
+
+        State-changing consumers must not infer completeness from a bounded
+        list. An absent metadata record is deliberately incomplete.
+
+        Args:
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+            resource_type: Text supplied as resource type in the format accepted
+                by this function.
+
+        Returns:
+            The validated ``snapshot``.
+        """
+
+        cache_key = f"{dut_id}_{resource_type}"
+        members = list(self._resource_members.get(cache_key, []))
+        metadata = dict(self._resource_metadata.get(cache_key, {}))
+        snapshot = {
+            "members": members,
+            "complete": bool(metadata.get("complete", False)),
+            "partial": not bool(metadata.get("complete", False)),
+            **metadata,
+        }
+        await self.logger.write_to_dut_runtime_log(
+            dut_id,
+            "DEBUG",
+            "DynamicDiscovery",
+            (
+                f"get_resource_member_snapshot: cache_key='{cache_key}', "
+                f"members={len(members)}, complete={snapshot['complete']}"
+            ),
+        )
+        return snapshot
+
     async def get_resource_details(
         self, dut_id: str, resource_type: str
     ) -> Dict[str, Any]:
         """
         Get cached resource details for a specific resource type.
 
+        Log what's being retrieved from cache using async logging.
+
         Args:
-            dut_id: The DUT identifier
-            resource_type: The resource type
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+            resource_type: Text supplied as resource type in the format accepted
+                by this function.
 
         Returns:
-            dict: Resource details by member ID
+            The validated ``details``.
         """
         cache_key = f"{dut_id}_{resource_type}"
         details = self._resource_details.get(cache_key, {})
@@ -991,11 +1540,14 @@ class DynamicDiscoveryService:
         """
         Get cached discovery results for a DUT.
 
+        Log what's being retrieved from cache using async logging.
+
         Args:
-            dut_id: The DUT identifier
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
 
         Returns:
-            dict: Cached discovery results or None if not found
+            The validated ``results``, or ``None`` when no value qualifies.
         """
         cache_key = f"{dut_id}_discovery"
         results = self._discovery_cache.get(cache_key)
@@ -1022,11 +1574,17 @@ class DynamicDiscoveryService:
         """
         Get cached firmware inventory for a DUT.
 
+        The implementation uses ``dut_id`` to get cached firmware inventory for
+        a DUT. Owned asynchronous work is awaited before return, so completion
+        does not leave an unobserved task behind.
+
         Args:
-            dut_id: The DUT identifier
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
 
         Returns:
-            dict: Firmware inventory data or None if not found
+            The validated ``firmware_inventory``, or ``None`` when no value
+            qualifies.
         """
         cache_key = f"{dut_id}_UpdateService"
         update_service_details = self._resource_details.get(cache_key, {})
@@ -1069,8 +1627,13 @@ class DynamicDiscoveryService:
         """
         Clear discovery cache.
 
+        The implementation uses ``dut_id`` to clear discovery cache. Owned
+        asynchronous work is awaited before return, so completion does not leave
+        an unobserved task behind.
+
         Args:
-            dut_id: Optional DUT ID to clear specific cache, or None to clear all
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
         """
         if dut_id:
             # Clear specific DUT cache
@@ -1086,12 +1649,15 @@ class DynamicDiscoveryService:
 
             # Clear resource members and details for this DUT
             keys_to_remove = [
-                k for k in self._resource_members.keys() if k.startswith(f"{dut_id}_")
+                f"{dut_id}_{resource_type.value}"
+                for resource_type in ResourceType
+                if f"{dut_id}_{resource_type.value}" in self._resource_members
             ]
             for key in keys_to_remove:
                 del self._resource_members[key]
                 if key in self._resource_details:
                     del self._resource_details[key]
+                self._resource_metadata.pop(key, None)
 
             if keys_to_remove:
                 await self.logger.write_to_dut_runtime_log(
@@ -1105,32 +1671,40 @@ class DynamicDiscoveryService:
             discovery_cache_size = len(self._discovery_cache)
             resource_members_size = len(self._resource_members)
             resource_details_size = len(self._resource_details)
+            resource_metadata_size = len(self._resource_metadata)
 
             self._discovery_cache.clear()
             self._resource_members.clear()
             self._resource_details.clear()
+            self._resource_metadata.clear()
 
             await self.logger.write_to_dut_runtime_log(
                 "system",
                 "DEBUG",
                 "DynamicDiscovery",
-                f"clear_cache: cleared all cache - discovery: {discovery_cache_size}, members: {resource_members_size}, details: {resource_details_size}",
+                f"clear_cache: cleared all cache - discovery: {discovery_cache_size}, members: {resource_members_size}, details: {resource_details_size}, metadata: {resource_metadata_size}",
             )
 
     async def get_cache_stats(self, dut_id: str = "system") -> Dict[str, Any]:
         """
         Get cache statistics.
 
+        The implementation uses ``dut_id`` to get cache statistics. Owned
+        asynchronous work is awaited before return, so completion does not leave
+        an unobserved task behind.
+
         Args:
-            dut_id: DUT ID for logging purposes (defaults to "system")
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
 
         Returns:
-            dict: Cache statistics
+            The validated ``stats``.
         """
         stats = {
             "discovery_cache_size": len(self._discovery_cache),
             "resource_members_cache_size": len(self._resource_members),
             "resource_details_cache_size": len(self._resource_details),
+            "resource_metadata_cache_size": len(self._resource_metadata),
             "cached_duts": list(
                 set([k.split("_")[0] for k in self._resource_members.keys()])
             ),

@@ -1,3 +1,20 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 <template>
   <div style="min-height: calc(100vh - 88px);">
     <div class="nv-sidebar"><AnalysisNav /></div>
@@ -55,7 +72,7 @@
               <!-- Expanded: failed DUTs -->
               <div v-if="expandedChecks.has(check.name) && check.failedDuts.length > 0" class="ps-check__detail">
                 <strong style="font-size: 0.6875rem; color: var(--nv-text-tertiary);">Failed on:</strong>
-                <div v-for="fd in check.failedDuts" :key="fd.dutId" class="ps-check__dut" @click.stop="router.push(`/dut/${encodeURIComponent(fd.dutId)}/preflight`)">
+                <div v-for="fd in check.failedDuts" :key="fd.dutId" class="ps-check__dut" @click.stop="router.push(dutPreflightRoute(fd.dutId))">
                   <span style="color: var(--nv-accent); font-weight: 600;">{{ fd.dutId }}</span>
                   <span style="color: var(--nv-text-tertiary);">{{ fd.details }}</span>
                 </div>
@@ -70,7 +87,7 @@
               :columns="dutColumns"
               :data="dutPreflightData"
               :searchable="true"
-              @row-click="(row: Record<string, any>) => router.push(`/dut/${encodeURIComponent(row.dutId)}/preflight`)"
+              @row-click="(row: Record<string, any>) => router.push(dutPreflightRoute(row.dutId))"
             >
               <template #cell-passRate="{ value }">
                 <span :style="{ color: Number(value) >= 100 ? 'var(--nv-success)' : Number(value) >= 50 ? 'var(--nv-warning)' : 'var(--nv-error)', fontWeight: 600 }">{{ Number(value).toFixed(0) }}%</span>
@@ -91,6 +108,8 @@ import Breadcrumbs from '@/components/common/Breadcrumbs.vue'
 import PageLoader from '@/components/common/PageLoader.vue'
 import DataTable from '@/components/common/DataTable.vue'
 import AnalysisNav from '@/components/common/AnalysisNav.vue'
+import { dutPreflightRoute } from '@/utils/reportRoutes'
+import { normalizePreflightStatus, summarizePreflightChecks } from '@/utils/preflight'
 
 const router = useRouter()
 const manifestStore = useManifestStore()
@@ -130,14 +149,15 @@ const checkSummaries = computed<CheckSummary[]>(() => {
       }
       const s = map.get(check.name)!
       s.total++
-      if (check.status === 'pass') { s.passCount++; s.applicable++ }
-      else if (check.status === 'fail') {
+      const status = normalizePreflightStatus(check.status)
+      if (status === 'pass') { s.passCount++; s.applicable++ }
+      else if (status === 'fail') {
         s.failCount++
         s.applicable++
         s.failedDuts.push({ dutId: dutPf.dut_id, details: check.details })
       }
-      else if (check.status === 'warning') { s.warnCount++; s.applicable++ }
-      else if (check.status === 'skip') s.skipCount++
+      else if (status === 'warning') { s.warnCount++; s.applicable++ }
+      else if (status === 'skip') s.skipCount++
       else s.naCount++
     }
   }
@@ -166,13 +186,9 @@ const dutColumns = [
 
 const dutPreflightData = computed(() =>
   preflightData.value.map(dpf => {
-    let pass = 0, fail = 0, warn = 0, skip = 0
-    for (const c of (dpf.checks ?? [])) {
-      if (c.status === 'pass') pass++
-      else if (c.status === 'fail') fail++
-      else if (c.status === 'warning') warn++
-      else skip++
-    }
+    const counts = summarizePreflightChecks(dpf.checks)
+    const { pass, fail, warning: warn } = counts
+    const skip = counts.skip + counts.na
     const applicable = pass + fail + warn
     return {
       dutId: dpf.dut_id,

@@ -13,24 +13,129 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 """
 Variable Substitution Service for NVDebug Tool.
 
 Handles dynamic replacement of placeholders in action URIs, payloads, and
 configurations with support for DUT-specific values and nested substitutions.
+
+Only placeholders authored in the input template are evaluated. Resolved values
+are opaque data. Intentional nesting must be supplied separately through the
+``trusted_templates`` argument so lower-trust runtime or device values cannot
+cross into configuration, environment, DUT, or other runtime namespaces.
 """
 
 import os
 import re
-from typing import Any, Dict, List, Set
+from collections.abc import Iterable
+from typing import Any, Dict, Set
+
+_ENVIRONMENT_ALLOWLIST_MAX_ENTRIES = 64
+_ENVIRONMENT_NAME_MAX_LENGTH = 128
+_ENVIRONMENT_VALUE_MAX_CHARS = 64 * 1024
+_ENVIRONMENT_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+_SENSITIVE_ENVIRONMENT_NAME_COMPONENTS = frozenset(
+    {
+        "ACCESS",
+        "AUTH",
+        "AUTHORIZATION",
+        "COOKIE",
+        "CREDS",
+        "CREDENTIAL",
+        "CREDENTIALS",
+        "CSRF",
+        "DIR",
+        "DIRECTORY",
+        "DSN",
+        "FILE",
+        "HOME",
+        "JWT",
+        "KEY",
+        "NONCE",
+        "OTP",
+        "PASS",
+        "PASSPHRASE",
+        "PASSWD",
+        "PASSWORD",
+        "PATH",
+        "PAT",
+        "PRIVATE",
+        "PWD",
+        "SECRET",
+        "SESSION",
+        "SIGNATURE",
+        "TOKEN",
+        "URI",
+        "URL",
+        "XSRF",
+    }
+)
+_SENSITIVE_ENVIRONMENT_COMPACT_MARKERS = (
+    "ACCESSKEY",
+    "APIKEY",
+    "AUTHKEY",
+    "AUTHTOKEN",
+    "CLIENTSECRET",
+    "COOKIE",
+    "CREDENTIAL",
+    "PASSWD",
+    "PASSWORD",
+    "PASSPHRASE",
+    "PRIVATEKEY",
+    "REFRESHTOKEN",
+    "SECRET",
+    "SESSIONTOKEN",
+    "TOKEN",
+)
+_SENSITIVE_ENVIRONMENT_NAMES = frozenset(
+    {
+        "BASH_ENV",
+        "CLOUDSDK_CONFIG",
+        "DOCKER_CONFIG",
+        "ENV",
+        "GIT_ASKPASS",
+        "LD_AUDIT",
+        "LD_LIBRARY_PATH",
+        "LD_PRELOAD",
+        "KUBECONFIG",
+        "NETRC",
+        "PERL5LIB",
+        "PERL5OPT",
+        "PYTHONHOME",
+        "PYTHONPATH",
+        "RUBYOPT",
+        "SHELL",
+        "SSLKEYLOGFILE",
+        "SSH_ASKPASS",
+        "SSH_ASKPASS_REQUIRE",
+        "SSH_AUTH_SOCK",
+        "SUDO_ASKPASS",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+    }
+)
 
 
 class VariableSubstitutionError(Exception):
     """
     Exception raised for variable substitution errors.
 
-    Raised when variable substitution fails due to missing variables,
-    type validation errors, or other substitution issues.
+    Raised when variable substitution fails due to missing variables, type
+    validation errors, or other substitution issues.
+    """
+
+    pass
+
+
+class EnvironmentVariablePolicyError(VariableSubstitutionError):
+    """
+    Environment substitution was rejected by the explicit trust policy.
+
+    Callers receive this exception when the environment variable policy error
+    invariant prevents the requested operation from completing. The distinct
+    type lets them handle that boundary without parsing an error message.
     """
 
     pass
@@ -38,20 +143,41 @@ class VariableSubstitutionError(Exception):
 
 class VariableSubstitutionService:
     """
-    Service for variable substitution that dynamically replaces placeholders
-    with runtime context values, with proper async logging support.
+    Manage variable substitution service operations for the NVDebug runtime.
+
+    The type coordinates ``create``, ``_initialize``, ``substitute_variables``,
+    ``_resolve_approved_template``, and ``_is_cache_safe`` and retains the state
+    those operations share between calls. Resource ownership remains inside the
+    instance until the matching close, exit, or cleanup operation completes.
     """
 
-    def __init__(self, logger=None, orchestrator=None):
+    def __init__(
+        self,
+        logger=None,
+        orchestrator=None,
+        *,
+        environment_allowlist: Iterable[str] | None = None,
+    ):
         """
         Initialize the VariableSubstitutionService.
 
+        The initializer records ``cache_hits``, ``cache_misses``,
+        ``cache_size``, ``config_pattern``, and ``config_resolver`` for later
+        operations and establishes the instance invariants before any public
+        method runs.
+
         Args:
-            logger: AsyncSafeLogger instance for DUT-specific logging
-            orchestrator: WorkflowOrchestrator instance for accessing configurations
+            logger: Sanitized logger used for operator-visible diagnostics.
+            orchestrator: Optional orchestrator; ``None`` selects the function's
+                default behavior.
+            environment_allowlist: Optional environment allowlist; ``None``
+                selects the function's default behavior.
         """
         self.logger = logger
         self.orchestrator = orchestrator
+        self.environment_allowlist = self._validate_environment_allowlist(
+            environment_allowlist
+        )
 
         # Initialize with default settings
         self.enable_caching = True
@@ -71,6 +197,15 @@ class VariableSubstitutionService:
         self.config_pattern = re.compile(r"\{config\.([a-zA-Z0-9_.]+)\}")
         self.env_pattern = re.compile(r"\{env\.([A-Z_][A-Z0-9_]*)\}")
         self.dut_pattern = re.compile(r"\{dut\.([a-zA-Z0-9_.]+)\}")
+        # Match every supported placeholder in source order.  Public substitution
+        # walks the approved template once with this pattern so values returned by
+        # one resolver never become input to another resolver.
+        self.placeholder_pattern = re.compile(
+            r"\{(?:(?:config\.(?P<config>[a-zA-Z0-9_.]+))|"
+            r"(?:env\.(?P<env>[A-Z_][A-Z0-9_]*))|"
+            r"(?:dut\.(?P<dut>[a-zA-Z0-9_.]+))|"
+            r"(?P<runtime>[a-zA-Z_][a-zA-Z0-9_]*))\}"
+        )
 
         # Supported variable types and their validation patterns
         self.variable_types = {
@@ -133,18 +268,37 @@ class VariableSubstitutionService:
         config_resolver=None,
         dut_object=None,
         cache_size=None,
+        environment_allowlist: Iterable[str] | None = None,
     ):
         """
-        Factory method to create and initialize VariableSubstitutionService asynchronously.
+        Create the configured resource.
+
+        The implementation uses ``logger``, ``orchestrator``,
+        ``config_resolver``, ``dut_object``, and ``cache_size`` to create the
+        configured resource. Owned asynchronous work is awaited before return,
+        so completion does not leave an unobserved task behind.
 
         Args:
-            logger: AsyncSafeLogger instance for DUT-specific logging
-            orchestrator: WorkflowOrchestrator instance for accessing configurations
-            config_resolver: ConfigurationVariableResolver for config variables
-            dut_object: DUT object for DUT-specific variables
-            cache_size: Optional cache size override (default: 128)
+            logger: Sanitized logger used for operator-visible diagnostics.
+            orchestrator: Optional orchestrator; ``None`` selects the function's
+                default behavior.
+            config_resolver: Optional Config resolver governing configured
+                resource.
+            dut_object: Optional DUT object; ``None`` selects the function's
+                default behavior.
+            cache_size: Numeric cache size used by the operation's bounded
+                accounting.
+            environment_allowlist: Optional environment allowlist; ``None``
+                selects the function's default behavior.
+
+        Returns:
+            The validated ``instance``.
         """
-        instance = cls(logger, orchestrator)
+        instance = cls(
+            logger,
+            orchestrator,
+            environment_allowlist=environment_allowlist,
+        )
         instance.config_resolver = config_resolver
         instance.dut_object = dut_object
         if cache_size is not None:
@@ -164,10 +318,18 @@ class VariableSubstitutionService:
             """
             Helper to log messages using async logger if available.
 
+            The implementation uses ``level``, ``message``, and ``dut_id`` to
+            helper to log messages using async logger if available. Owned
+            asynchronous work is awaited before return, so completion does not
+            leave an unobserved task behind.
+
             Args:
-                level: Log level.
-                message: Log message.
-                dut_id: Optional DUT ID for DUT-specific logging.
+                level: Text supplied as level in the format accepted by this
+                    function.
+                message: Operator-facing text carried by the reported event or
+                    failure.
+                dut_id: Stable DUT identifier used to correlate configuration,
+                    logs, and results.
             """
             if self.logger and dut_id:
                 # Use DUT-specific logging
@@ -188,35 +350,71 @@ class VariableSubstitutionService:
         dut_id: str = None,
         validate_types: bool = True,
         allow_missing: bool = False,
+        trusted_templates: Dict[str, str] = None,
+        max_depth: int = 10,
     ) -> str:
         """
         Substitute variables in a template string with values from context.
 
+        The implementation uses ``template``, ``context``, ``dut_id``,
+        ``validate_types``, and ``allow_missing`` to substitute variables in a
+        template string with values from context. Owned asynchronous work is
+        awaited before return, so completion does not leave an unobserved task
+        behind. It updates ``cache_hits`` and ``cache_misses`` on the instance
+        as part of that state transition. If the function cannot substitute
+        variables in a template string with values from context, its exception
+        reaches the caller instead of being converted into a successful result.
+
         Args:
-            template: String containing variable placeholders like {variable_name}, {config.path.to.value}, {env.VARIABLE_NAME}
-            context: Dictionary containing variable values
-            dut_id: DUT ID for DUT-specific logging
-            validate_types: Whether to validate variable types
-            allow_missing: Whether to allow missing variables (keep as-is)
+            template: Text supplied as template in the format accepted by this
+                function.
+            context: Runtime context carrying state shared across this
+                operation.
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+            validate_types: Whether validate types is enabled or required for
+                this operation.
+            allow_missing: Whether allow missing is enabled or required for this
+                operation.
+            trusted_templates: Optional trusted templates; ``None`` selects the
+                function's default behavior.
+            max_depth: Upper bound enforced for max depth; the consuming
+                boundary rejects or truncates values that exceed it.
 
         Returns:
-            String with variables substituted
+            The canonical substitute variables text.
 
         Raises:
-            VariableSubstitutionError: If substitution fails
+            VariableSubstitutionError: If max_depth cannot be negative; or
+                substitution failed: ``e``.
         """
         if not template:
             return template
 
+        if max_depth < 0:
+            raise VariableSubstitutionError("max_depth cannot be negative")
+
+        approved_templates = dict(trusted_templates or {})
+
         # Check cache first if enabled
         cache_key = None
-        if self.enable_caching:
-            cache_key = self._generate_cache_key(template, context)
+        cache_allowed = self.enable_caching and self._is_cache_safe(
+            template, approved_templates
+        )
+        if cache_allowed:
+            cache_key = self._generate_cache_key(
+                template,
+                context,
+                trusted_templates=approved_templates,
+                validate_types=validate_types,
+                allow_missing=allow_missing,
+                max_depth=max_depth,
+            )
             if cache_key in self.substitution_cache:
                 self.cache_hits += 1
                 await self._log(
                     "DEBUG",
-                    f"Cache hit for template: {template[:50]}...",
+                    "Variable substitution cache hit",
                     dut_id,
                 )
                 return self.substitution_cache[cache_key]
@@ -227,41 +425,170 @@ class VariableSubstitutionService:
             self.cache_misses += 1
 
         try:
-            result = template
-
-            # 1. Substitute configuration variables first: {config.path.to.value}
-            result = await self._substitute_config_variables(
-                result, context, dut_id, allow_missing
-            )
-
-            # 2. Substitute environment variables: {env.VARIABLE_NAME}
-            result = await self._substitute_env_variables(result, dut_id, allow_missing)
-
-            # 3. Substitute DUT variables: {dut.attribute}
-            result = await self._substitute_dut_variables(result, dut_id, allow_missing)
-
-            # 4. Substitute runtime context variables: {variable_name}
-            result = await self._substitute_runtime_variables(
-                result, context, dut_id, validate_types, allow_missing
-            )
-
-            # Handle nested variable substitution
-            result = await self._handle_nested_substitution(
-                result, context, dut_id, validate_types, allow_missing
+            result = await self._resolve_approved_template(
+                template,
+                context,
+                dut_id,
+                validate_types,
+                allow_missing,
+                approved_templates,
+                max_depth=max_depth,
             )
 
             # Cache result if enabled
-            if self.enable_caching:
+            if cache_allowed:
                 self._cache_result(cache_key, result)
 
-            await self._log(
-                "DEBUG", f"Substitution completed: {result[:100]}...", dut_id
-            )
+            await self._log("DEBUG", "Variable substitution completed", dut_id)
             return result
 
+        except EnvironmentVariablePolicyError:
+            await self._log(
+                "ERROR",
+                "Environment variable substitution denied by policy",
+                dut_id,
+            )
+            raise
+        except VariableSubstitutionError as e:
+            await self._log("ERROR", f"Variable substitution failed: {e}", dut_id)
+            raise
         except Exception as e:
             await self._log("ERROR", f"Variable substitution failed: {e}", dut_id)
             raise VariableSubstitutionError(f"Substitution failed: {e}")
+
+    async def _resolve_approved_template(
+        self,
+        template: str,
+        context: Dict[str, Any],
+        dut_id: str,
+        validate_types: bool,
+        allow_missing: bool,
+        trusted_templates: Dict[str, str],
+        max_depth: int,
+        depth: int = 0,
+        resolution_stack: tuple[str, ...] = (),
+    ) -> str:
+        """
+        Resolve placeholders present in an approved template.
+
+        Resolver values are appended as opaque data. Only fragments supplied via
+        ``trusted_templates`` are parsed recursively, which prevents device
+        data, environment values, configuration values, or DUT attributes from
+        creating a new placeholder at a more trusted source.
+
+        Args:
+            template: Text supplied as template in the format accepted by this
+                function.
+            context: Runtime context carrying state shared across this
+                operation.
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+            validate_types: Whether validate types is enabled or required for
+                this operation.
+            allow_missing: Whether allow missing is enabled or required for this
+                operation.
+            trusted_templates: Mapping supplying fields for placeholders present
+                in an approved template.
+            max_depth: Upper bound enforced for max depth; the consuming
+                boundary rejects or truncates values that exceed it.
+            depth: Numeric depth used while the operation performs bounded
+                accounting.
+            resolution_stack: Entries supplied as ``resolution_stack`` without
+                transferring container ownership.
+
+        Returns:
+            The canonical approved template text.
+        """
+        parts = []
+        cursor = 0
+
+        for match in self.placeholder_pattern.finditer(template):
+            parts.append(template[cursor : match.start()])
+            full_pattern = match.group(0)
+
+            if match.group("config") is not None:
+                replacement = await self._substitute_config_variables(
+                    full_pattern, context, dut_id, allow_missing
+                )
+            elif match.group("env") is not None:
+                replacement = await self._substitute_env_variables(
+                    full_pattern, dut_id, allow_missing
+                )
+            elif match.group("dut") is not None:
+                replacement = await self._substitute_dut_variables(
+                    full_pattern, dut_id, allow_missing
+                )
+            else:
+                variable_name = match.group("runtime")
+                if variable_name in trusted_templates:
+                    if variable_name in resolution_stack:
+                        cycle = " -> ".join((*resolution_stack, variable_name))
+                        await self._log(
+                            "WARNING",
+                            f"Trusted template cycle detected: {cycle}",
+                            dut_id,
+                        )
+                        replacement = full_pattern
+                    elif depth >= max_depth:
+                        await self._log(
+                            "WARNING",
+                            f"Maximum nested substitution depth ({max_depth}) reached",
+                            dut_id,
+                        )
+                        replacement = full_pattern
+                    else:
+                        nested_template = self._format_value(
+                            trusted_templates[variable_name]
+                        )
+                        replacement = await self._resolve_approved_template(
+                            nested_template,
+                            context,
+                            dut_id,
+                            validate_types,
+                            allow_missing,
+                            trusted_templates,
+                            max_depth,
+                            depth + 1,
+                            (*resolution_stack, variable_name),
+                        )
+                else:
+                    replacement = await self._substitute_runtime_variables(
+                        full_pattern,
+                        context,
+                        dut_id,
+                        validate_types,
+                        allow_missing,
+                    )
+
+            parts.append(replacement)
+            cursor = match.end()
+
+        parts.append(template[cursor:])
+        return "".join(parts)
+
+    def _is_cache_safe(self, template: str, trusted_templates: Dict[str, str]) -> bool:
+        """
+        Return whether a result depends only on explicit method arguments.
+
+        The implementation uses ``template`` and ``trusted_templates`` to
+        determine whether a result depends only on explicit method arguments.
+
+        Args:
+            template: Text supplied as template in the format accepted by this
+                function.
+            trusted_templates: Mapping supplying fields for result depends only
+                on explicit method arguments.
+
+        Returns:
+            Whether a result depends only on explicit method arguments.
+        """
+        external_patterns = (self.config_pattern, self.env_pattern, self.dut_pattern)
+        approved_fragments = (template, *map(str, trusted_templates.values()))
+        return not any(
+            pattern.search(fragment)
+            for fragment in approved_fragments
+            for pattern in external_patterns
+        )
 
     async def _substitute_config_variables(
         self,
@@ -273,14 +600,32 @@ class VariableSubstitutionService:
         """
         Substitute configuration variables: {config.path.to.value}.
 
+        The implementation uses ``template``, ``context``, ``dut_id``, and
+        ``allow_missing`` to substitute configuration variables:
+        {config.path.to.value}. Owned asynchronous work is awaited before
+        return, so completion does not leave an unobserved task behind.
+        Filesystem effects remain confined to the caller-selected paths and the
+        owning resource lifecycle. If the function cannot substitute
+        configuration variables: {config.path.to.value}, its exception reaches
+        the caller instead of being converted into a successful result.
+
         Args:
-            template: Template string.
-            context: Variable context.
-            dut_id: DUT ID.
-            allow_missing: Whether to allow missing variables.
+            template: Text supplied as template in the format accepted by this
+                function.
+            context: Runtime context carrying state shared across this
+                operation.
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+            allow_missing: Whether allow missing is enabled or required for this
+                operation.
 
         Returns:
-            Template with config variables substituted.
+            The canonical substitute config variables text.
+
+        Raises:
+            VariableSubstitutionError: If missing config variable:
+                ``config_path``; or error resolving config variable
+                ``config_path``: ``e``.
         """
         has_config_placeholders = bool(self.config_pattern.search(template))
 
@@ -317,7 +662,7 @@ class VariableSubstitutionService:
                     result = result.replace(full_pattern, config_value)
                     await self._log(
                         "DEBUG",
-                        f"Substituted {full_pattern} with {config_value}",
+                        f"Substituted {full_pattern} from configuration",
                         dut_id,
                     )
                 else:
@@ -351,13 +696,31 @@ class VariableSubstitutionService:
         """
         Substitute environment variables: {env.VARIABLE_NAME}.
 
+        The implementation uses ``template``, ``dut_id``, and ``allow_missing``
+        to substitute environment variables: {env.VARIABLE_NAME}. Owned
+        asynchronous work is awaited before return, so completion does not leave
+        an unobserved task behind. Filesystem effects remain confined to the
+        caller-selected paths and the owning resource lifecycle. If the function
+        cannot substitute environment variables: {env.VARIABLE_NAME}, its
+        exception reaches the caller instead of being converted into a
+        successful result.
+
         Args:
-            template: Template string.
-            dut_id: DUT ID.
-            allow_missing: Whether to allow missing variables.
+            template: Text supplied as template in the format accepted by this
+                function.
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+            allow_missing: Whether allow missing is enabled or required for this
+                operation.
 
         Returns:
-            Template with environment variables substituted.
+            The validated ``result``.
+
+        Raises:
+            EnvironmentVariablePolicyError: If environment variable substitution
+                denied by policy.
+            VariableSubstitutionError: If missing environment variable:
+                ``env_var_name``.
         """
         result = template
 
@@ -365,12 +728,18 @@ class VariableSubstitutionService:
             env_var_name = match.group(1)
             full_pattern = match.group(0)
 
+            self._require_environment_variable_allowed(env_var_name)
+
             env_value = os.environ.get(env_var_name)
             if env_value is not None:
+                if len(env_value) > _ENVIRONMENT_VALUE_MAX_CHARS:
+                    raise EnvironmentVariablePolicyError(
+                        "Environment variable substitution denied by policy"
+                    )
                 result = result.replace(full_pattern, env_value)
                 await self._log(
                     "DEBUG",
-                    f"Substituted {full_pattern} with {env_value}",
+                    f"Substituted {full_pattern} from environment",
                     dut_id,
                 )
             else:
@@ -387,19 +756,146 @@ class VariableSubstitutionService:
 
         return result
 
+    @staticmethod
+    def _is_sensitive_environment_name(name: str) -> bool:
+        """
+        Return whether an environment name can expose secrets or host paths.
+
+        The implementation uses ``name`` to determine whether an environment
+        name can expose secrets or host paths.
+
+        Args:
+            name: Stable name used for lookup and operator-facing diagnostics.
+
+        Returns:
+            Whether an environment name can expose secrets or host paths.
+        """
+        if name in _SENSITIVE_ENVIRONMENT_NAMES:
+            return True
+        components = frozenset(name.split("_"))
+        if components & _SENSITIVE_ENVIRONMENT_NAME_COMPONENTS:
+            return True
+        if any(
+            marker in component
+            for component in components
+            for marker in _SENSITIVE_ENVIRONMENT_COMPACT_MARKERS
+        ):
+            return True
+        return any(
+            component.endswith(("DIR", "FILE", "HOME", "PATH"))
+            for component in components
+        )
+
+    @classmethod
+    def _validate_environment_allowlist(
+        cls, environment_allowlist: Iterable[str] | None
+    ) -> frozenset[str]:
+        """
+        Validate and freeze the bounded, code-supplied environment allowlist.
+
+        The implementation uses ``environment_allowlist`` to validate and freeze
+        the bounded, code-supplied environment allowlist. Every required
+        invariant is checked before a successful value is returned; invalid
+        input follows the function's explicit exception path.
+
+        Args:
+            environment_allowlist: Optional environment allowlist; ``None``
+                selects the function's default behavior.
+
+        Returns:
+            The unique environment allowlist returned by the operation.
+
+        Raises:
+            EnvironmentVariablePolicyError: If environment variable allowlist is
+                invalid; environment variable allowlist exceeds policy limits;
+                or environment variable allowlist contains a prohibited name.
+        """
+        if environment_allowlist is None:
+            return frozenset()
+        if isinstance(environment_allowlist, (str, bytes)):
+            raise EnvironmentVariablePolicyError(
+                "Environment variable allowlist is invalid"
+            )
+
+        approved = set()
+        try:
+            iterator = iter(environment_allowlist)
+        except TypeError as error:
+            raise EnvironmentVariablePolicyError(
+                "Environment variable allowlist is invalid"
+            ) from error
+
+        for index, name in enumerate(iterator):
+            if index >= _ENVIRONMENT_ALLOWLIST_MAX_ENTRIES:
+                raise EnvironmentVariablePolicyError(
+                    "Environment variable allowlist exceeds policy limits"
+                )
+            if (
+                not isinstance(name, str)
+                or not name
+                or len(name) > _ENVIRONMENT_NAME_MAX_LENGTH
+                or _ENVIRONMENT_NAME_RE.fullmatch(name) is None
+                or cls._is_sensitive_environment_name(name)
+            ):
+                raise EnvironmentVariablePolicyError(
+                    "Environment variable allowlist contains a prohibited name"
+                )
+            approved.add(name)
+
+        return frozenset(approved)
+
+    def _require_environment_variable_allowed(self, name: str) -> None:
+        """
+        Fail closed before consulting ambient process state.
+
+        The implementation uses ``name`` to fail closed before consulting
+        ambient process state. If the function cannot fail closed before
+        consulting ambient process state, its exception reaches the caller
+        instead of being converted into a successful result.
+
+        Args:
+            name: Stable name used for lookup and operator-facing diagnostics.
+
+        Raises:
+            EnvironmentVariablePolicyError: If environment variable substitution
+                denied by policy.
+        """
+        if (
+            name not in self.environment_allowlist
+            or self._is_sensitive_environment_name(name)
+        ):
+            raise EnvironmentVariablePolicyError(
+                "Environment variable substitution denied by policy"
+            )
+
     async def _substitute_dut_variables(
         self, template: str, dut_id: str, allow_missing: bool
     ) -> str:
         """
         Substitute DUT-specific variables: {dut.attribute}.
 
+        The implementation uses ``template``, ``dut_id``, and ``allow_missing``
+        to substitute DUT-specific variables: {dut.attribute}. Owned
+        asynchronous work is awaited before return, so completion does not leave
+        an unobserved task behind. Filesystem effects remain confined to the
+        caller-selected paths and the owning resource lifecycle. If the function
+        cannot substitute DUT-specific variables: {dut.attribute}, its exception
+        reaches the caller instead of being converted into a successful result.
+
         Args:
-            template: Template string.
-            dut_id: DUT ID.
-            allow_missing: Whether to allow missing variables.
+            template: Text supplied as template in the format accepted by this
+                function.
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+            allow_missing: Whether allow missing is enabled or required for this
+                operation.
 
         Returns:
-            Template with DUT variables substituted.
+            The canonical substitute DUT variables text.
+
+        Raises:
+            VariableSubstitutionError: If missing DUT variable: ``dut_path``; or
+                error resolving DUT variable ``dut_path``: ``e``.
         """
         if not self.dut_object:
             await self._log(
@@ -422,7 +918,7 @@ class VariableSubstitutionService:
                     result = result.replace(full_pattern, str(dut_value))
                     await self._log(
                         "DEBUG",
-                        f"Substituted {full_pattern} with {dut_value}",
+                        f"Substituted {full_pattern} from DUT context",
                         dut_id,
                     )
                 else:
@@ -454,18 +950,38 @@ class VariableSubstitutionService:
         """
         Get DUT attribute using dot notation (e.g., 'config.i2c_bus').
 
+        DUT templates expose operational attributes only. Private object
+        internals and credential-bearing fields must never become
+        catalog-substituted URI, command, or log content.
+
         Args:
-            path: Dot-separated attribute path.
+            path: filesystem location used as the path for this operation.
 
         Returns:
-            Attribute value or None if not found.
+            The validated ``current``.
         """
         if not self.dut_object:
             return None
 
         try:
             current = self.dut_object
-            for part in path.split("."):
+            parts = path.split(".")
+            if len(parts) > 8:
+                return None
+            for part in parts:
+                normalized_part = part.casefold()
+                if (
+                    part.startswith("_")
+                    or normalized_part == "credentials"
+                    or any(
+                        marker in normalized_part
+                        for marker in ("password", "passwd", "secret", "token")
+                    )
+                ):
+                    # DUT templates expose operational attributes only. Private
+                    # object internals and credential-bearing fields must never
+                    # become catalog-substituted URI, command, or log content.
+                    return None
                 if hasattr(current, part):
                     current = getattr(current, part)
                 elif isinstance(current, dict) and part in current:
@@ -489,15 +1005,33 @@ class VariableSubstitutionService:
         """
         Substitute runtime context variables: {variable_name}.
 
+        The implementation uses ``template``, ``context``, ``dut_id``,
+        ``validate_types``, and ``allow_missing`` to substitute runtime context
+        variables: {variable_name}. Owned asynchronous work is awaited before
+        return, so completion does not leave an unobserved task behind.
+        Filesystem effects remain confined to the caller-selected paths and the
+        owning resource lifecycle. If the function cannot substitute runtime
+        context variables: {variable_name}, its exception reaches the caller
+        instead of being converted into a successful result.
+
         Args:
-            template: Template string.
-            context: Variable context.
-            dut_id: DUT ID.
-            validate_types: Whether to validate types.
-            allow_missing: Whether to allow missing variables.
+            template: Text supplied as template in the format accepted by this
+                function.
+            context: Runtime context carrying state shared across this
+                operation.
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+            validate_types: Whether validate types is enabled or required for
+                this operation.
+            allow_missing: Whether allow missing is enabled or required for this
+                operation.
 
         Returns:
-            Template with runtime variables substituted.
+            The validated ``result``.
+
+        Raises:
+            VariableSubstitutionError: If missing required variable:
+                ``var_name``.
         """
         # Find all runtime variables in the template
         variables = self._extract_variables(template)
@@ -513,12 +1047,13 @@ class VariableSubstitutionService:
         for var_name in variables:
             if var_name in context:
                 value = context[var_name]
-                # Convert value to string and escape any special characters
+                # Convert to text only. Values are not escaped here: each sink
+                # must apply its own context-specific encoding or validation.
                 str_value = self._format_value(value)
                 result = result.replace(f"{{{var_name}}}", str_value)
                 await self._log(
                     "DEBUG",
-                    f"Substituted {{{var_name}}} with {str_value}",
+                    f"Substituted {{{var_name}}} from runtime context",
                     dut_id,
                 )
             else:
@@ -540,11 +1075,15 @@ class VariableSubstitutionService:
         """
         Extract all variable names from a template string.
 
+        The implementation uses ``template`` to extract all variable names from
+        a template string.
+
         Args:
-            template: Template string to parse.
+            template: Text supplied as template in the format accepted by this
+                function.
 
         Returns:
-            Set of variable names found in the template.
+            The validated ``variables``.
         """
         variables = set()
         for match in self.variable_pattern.finditer(template):
@@ -555,12 +1094,19 @@ class VariableSubstitutionService:
         """
         Validate variable types and values.
 
+        Check if we have a type definition for this variable.
+
         Args:
-            variables: Set of variable names to validate
-            context: Context containing variable values
+            variables: Entries supplied as ``variables`` without transferring
+                container ownership.
+            context: Runtime context carrying state shared across this
+                operation.
 
         Raises:
-            VariableSubstitutionError: If validation fails
+            VariableSubstitutionError: If variable ``var_name`` value
+                '``str_value``' does not match expected pattern: ``pattern``;
+                variable ``var_name`` cannot be None; or variable ``var_name``
+                cannot be converted to string: ``e``.
         """
         for var_name in variables:
             if var_name in context:
@@ -596,11 +1142,16 @@ class VariableSubstitutionService:
         """
         Format a value for substitution, handling different types.
 
+        The implementation uses ``value`` to format a value for substitution,
+        handling different types. The source value keeps its ownership while the
+        normalized representation is returned separately.
+
         Args:
-            value: Value to format.
+            value: Value evaluated while performing value for substitution,
+                handling different types.
 
         Returns:
-            Formatted string representation of the value.
+            The canonical value.
         """
         if value is None:
             return ""
@@ -622,88 +1173,106 @@ class VariableSubstitutionService:
         validate_types: bool,
         allow_missing: bool,
         max_depth: int = 10,
+        trusted_templates: Dict[str, str] = None,
     ) -> str:
         """
-        Handle nested variable substitution (variables within variables).
+        Resolve a template with explicit, trusted nested template fragments.
+
+        This compatibility helper no longer reparses arbitrary resolver output.
+        Callers that intentionally use nested, operator-authored fragments must
+        provide them separately via ``trusted_templates``.
 
         Args:
-            template: Template string to process
-            context: Context dictionary
-            dut_id: DUT ID for logging
-            validate_types: Whether to validate variable types
-            allow_missing: Whether to allow missing variables
-            max_depth: Maximum nesting depth to prevent infinite loops
+            template: Text supplied as template in the format accepted by this
+                function.
+            context: Runtime context carrying state shared across this
+                operation.
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+            validate_types: Whether validate types is enabled or required for
+                this operation.
+            allow_missing: Whether allow missing is enabled or required for this
+                operation.
+            max_depth: Upper bound enforced for max depth; the consuming
+                boundary rejects or truncates values that exceed it.
+            trusted_templates: Optional trusted templates; ``None`` selects the
+                function's default behavior.
 
         Returns:
-            String with nested variables resolved
+            The canonical handle nested substitution text.
+
+        Raises:
+            VariableSubstitutionError: If max_depth cannot be negative.
         """
-        result = template
-        depth = 0
-        previous_result = None
+        if max_depth < 0:
+            raise VariableSubstitutionError("max_depth cannot be negative")
 
-        while depth < max_depth:
-            # Check if there are any remaining variables
-            remaining_vars = self._extract_variables(result)
-            if not remaining_vars:
-                break
+        return await self._resolve_approved_template(
+            template,
+            context,
+            dut_id,
+            validate_types,
+            allow_missing,
+            dict(trusted_templates or {}),
+            max_depth,
+        )
 
-            # Store previous result to detect if anything changed
-            previous_result = result
-
-            # Perform one level of substitution by calling individual methods directly
-            # to avoid infinite recursion
-            result = await self._substitute_config_variables(
-                result, context, dut_id, allow_missing
-            )
-            result = await self._substitute_env_variables(result, dut_id, allow_missing)
-            result = await self._substitute_dut_variables(result, dut_id, allow_missing)
-            result = await self._substitute_runtime_variables(
-                result, context, dut_id, validate_types, allow_missing
-            )
-
-            depth += 1
-
-            await self._log(
-                "DEBUG",
-                f"Nested substitution depth {depth}: {result[:100]}...",
-                dut_id,
-            )
-
-            # If result hasn't changed, no more substitutions can be made
-            if result == previous_result:
-                break
-
-        if depth >= max_depth:
-            await self._log(
-                "WARNING",
-                f"Maximum nested substitution depth ({max_depth}) reached",
-                dut_id,
-            )
-
-        return result
-
-    def _generate_cache_key(self, template: str, context: Dict[str, Any]) -> str:
+    def _generate_cache_key(
+        self,
+        template: str,
+        context: Dict[str, Any],
+        *,
+        trusted_templates: Dict[str, str] = None,
+        validate_types: bool = True,
+        allow_missing: bool = False,
+        max_depth: int = 10,
+    ) -> str:
         """
         Generate a cache key for the template and context combination.
 
+        The implementation uses ``template``, ``context``,
+        ``trusted_templates``, ``validate_types``, and ``allow_missing`` to
+        generate a cache key for the template and context combination.
+
         Args:
-            template: Template string.
-            context: Variable context.
+            template: Text supplied as template in the format accepted by this
+                function.
+            context: Runtime context carrying state shared across this
+                operation.
+            trusted_templates: Optional trusted templates; ``None`` selects the
+                function's default behavior.
+            validate_types: Whether validate types is enabled or required for
+                this operation.
+            allow_missing: Whether allow missing is enabled or required for this
+                operation.
+            max_depth: Upper bound enforced for max depth; the consuming
+                boundary rejects or truncates values that exceed it.
 
         Returns:
-            Cache key string.
+            The canonical generate cache key text.
         """
-        # Create a sorted string representation of the context
+        # Include behavior-affecting options so a permissive/missing result cannot
+        # be reused by a stricter call with the same template and context.
         context_str = str(sorted(context.items()))
-        return f"{hash(template)}:{hash(context_str)}"
+        trusted_template_str = str(sorted((trusted_templates or {}).items()))
+        options = (validate_types, allow_missing, max_depth)
+        return (
+            f"{hash(template)}:{hash(context_str)}:"
+            f"{hash(trusted_template_str)}:{hash(options)}"
+        )
 
     def _cache_result(self, cache_key: str, result: str) -> None:
         """
         Cache a substitution result.
 
+        The implementation uses ``cache_key`` and ``result`` to cache a
+        substitution result.
+
         Args:
-            cache_key: Cache key.
-            result: Result to cache.
+            cache_key: Stable cache key used for lookup and operator-facing
+                diagnostics.
+            result: Text supplied as result in the format accepted by this
+                function.
         """
         if len(self.substitution_cache) >= self.cache_size:
             # Remove oldest entry (simple FIFO)
@@ -716,11 +1285,16 @@ class VariableSubstitutionService:
         """
         Get cache statistics.
 
+        The implementation uses ``dut_id`` to get cache statistics. Owned
+        asynchronous work is awaited before return, so completion does not leave
+        an unobserved task behind.
+
         Args:
-            dut_id: Optional DUT ID for logging.
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
 
         Returns:
-            Dictionary containing cache statistics.
+            The validated ``stats``.
         """
         stats = {
             "cache_hits": self.cache_hits,
@@ -740,14 +1314,19 @@ class VariableSubstitutionService:
         """
         Clear the substitution cache.
 
+        The implementation uses ``dut_id`` to clear the substitution cache.
+        Owned asynchronous work is awaited before return, so completion does not
+        leave an unobserved task behind. It updates ``cache_hits`` and
+        ``cache_misses`` on the instance as part of that state transition.
+
         Args:
-            dut_id: Optional DUT ID for logging.
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
         """
         self.substitution_cache.clear()
         self.cache_hits = 0
         self.cache_misses = 0
         await self._log("INFO", "Variable substitution cache cleared", dut_id)
-
 
 
 # Backward compatibility - keep the old class name for existing code

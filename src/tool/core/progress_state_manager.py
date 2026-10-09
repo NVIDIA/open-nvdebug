@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 """
 Progress State Manager for NVDebug Tool.
 
@@ -30,18 +31,15 @@ class CollectorStatus(Enum):
     """
     Status of a collector.
 
-    Attributes:
-        PENDING: Collector is queued.
-        RUNNING: Collector is executing.
-        COMPLETED: Collector finished successfully.
-        PARTIAL: Collector completed partially.
-        SKIPPED: Collector was skipped.
-        FAILED: Collector failed.
+    Its serialized members form a shared vocabulary for configuration, runtime
+    state, logs, and reports. Renaming or renumbering a member is therefore a
+    compatibility change.
     """
 
     PENDING = "pending"
     RUNNING = "running"
     COMPLETED = "completed"
+    DEGRADED = "degraded"
     PARTIAL = "partial"
     SKIPPED = "skipped"
     FAILED = "failed"
@@ -52,14 +50,19 @@ class CollectorProgress:
     """
     Progress tracking for a single collector.
 
+    The coherent record keeps ``collector_id``, ``dut_id``, ``status``,
+    ``start_time``, and ``end_time`` together so consumers observe one collector
+    progress state. Consumers receive the fields as one unit instead of
+    assembling partial state.
+
     Attributes:
-        collector_id (str): Collector identifier.
-        dut_id (str): DUT identifier.
-        status (CollectorStatus): Current status.
-        start_time (Optional[datetime]): Start timestamp.
-        end_time (Optional[datetime]): End timestamp.
-        execution_time (float): Execution duration in seconds.
-        reason (str): Status reason or error message.
+        collector_id: Canonical text used as collector identifier.
+        dut_id: Canonical text used as DUT identifier.
+        status: Canonical status exposed to downstream status consumers.
+        start_time: Start time retained as part of the record's public state.
+        end_time: End time retained as part of the record's public state.
+        execution_time: Numeric execution time retained by this record.
+        reason: Canonical reason exposed to downstream status consumers.
     """
 
     collector_id: str
@@ -73,13 +76,19 @@ class CollectorProgress:
     @property
     def is_completed(self) -> bool:
         """
-        Check if collector is completed (success, partial, skipped, or failed).
+        Check if collector is in a terminal state.
+
+        Each access computes the value from ``status`` on the current instance;
+        the derived view is not stored as independent state. Every required
+        invariant is checked before a successful value is returned; invalid
+        input follows the function's explicit exception path.
 
         Returns:
-            bool: True if collector has finished execution.
+            Whether the if collector is in a terminal state operation succeeds.
         """
         return self.status in [
             CollectorStatus.COMPLETED,
+            CollectorStatus.DEGRADED,
             CollectorStatus.PARTIAL,
             CollectorStatus.SKIPPED,
             CollectorStatus.FAILED,
@@ -90,8 +99,12 @@ class CollectorProgress:
         """
         Get duration in seconds.
 
+        Each access computes the value from ``end_time`` and ``start_time`` on
+        the current instance; the derived view is not stored as independent
+        state.
+
         Returns:
-            Duration in seconds, or 0 if not completed.
+            The numeric duration value.
         """
         if self.start_time and self.end_time:
             return (self.end_time - self.start_time).total_seconds()
@@ -105,23 +118,37 @@ class DUTProgress:
     """
     Progress tracking for a single DUT.
 
+    The coherent record keeps ``dut_id``, ``total_collectors``,
+    ``completed_collectors``, ``degraded_collectors``, and
+    ``partial_collectors`` together so consumers observe one DUT progress state.
+    Consumers receive the fields as one unit instead of assembling partial
+    state.
+
     Attributes:
-        dut_id: DUT identifier.
-        total_collectors: Total number of collectors.
-        completed_collectors: Set of completed collector IDs.
-        partial_collectors: Set of partially completed collector IDs.
-        failed_collectors: Set of failed collector IDs.
-        skipped_collectors: Set of skipped collector IDs.
-        running_collectors: Set of currently running collector IDs.
-        start_time: Collection start time.
-        end_time: Collection end time.
-        current_service: Currently executing service.
-        current_bucket: Currently executing bucket.
+        dut_id: Canonical text used as DUT identifier.
+        total_collectors: Number of total collectors represented by this record.
+        completed_collectors: Collection of completed collectors entries
+            retained by this record.
+        degraded_collectors: Collection of degraded collectors entries retained
+            by this record.
+        partial_collectors: Collection of partial collectors entries retained by
+            this record.
+        failed_collectors: Collection of failed collectors entries retained by
+            this record.
+        skipped_collectors: Collection of skipped collectors entries retained by
+            this record.
+        running_collectors: Collection of running collectors entries retained by
+            this record.
+        start_time: Start time retained as part of the record's public state.
+        end_time: End time retained as part of the record's public state.
+        current_service: Canonical text used as current service.
+        current_bucket: Canonical text used as current bucket.
     """
 
     dut_id: str
     total_collectors: int
     completed_collectors: Set[str] = field(default_factory=set)
+    degraded_collectors: Set[str] = field(default_factory=set)
     partial_collectors: Set[str] = field(default_factory=set)
     failed_collectors: Set[str] = field(default_factory=set)
     skipped_collectors: Set[str] = field(default_factory=set)
@@ -136,8 +163,11 @@ class DUTProgress:
         """
         Get count of completed collectors.
 
+        Each access computes the value from ``completed_collectors`` on the
+        current instance; the derived view is not stored as independent state.
+
         Returns:
-            Number of successfully completed collectors.
+            The numeric completed count.
         """
         return len(self.completed_collectors)
 
@@ -146,11 +176,17 @@ class DUTProgress:
         """
         Get total count of completed collectors (including partial/failed/skipped).
 
+        Each access computes the value from ``completed_collectors``,
+        ``degraded_collectors``, ``failed_collectors``, ``partial_collectors``,
+        and ``skipped_collectors`` on the current instance; the derived view is
+        not stored as independent state.
+
         Returns:
-            Total number of collectors that finished execution.
+            The numeric total completed value.
         """
         return (
             len(self.completed_collectors)
+            + len(self.degraded_collectors)
             + len(self.partial_collectors)
             + len(self.failed_collectors)
             + len(self.skipped_collectors)
@@ -161,8 +197,12 @@ class DUTProgress:
         """
         Get progress percentage (0.0 to 100.0).
 
+        Each access computes the value from ``total_collectors`` and
+        ``total_completed`` on the current instance; the derived view is not
+        stored as independent state.
+
         Returns:
-            Progress percentage.
+            The numeric progress percentage value.
         """
         if self.total_collectors == 0:
             return 100.0
@@ -173,8 +213,12 @@ class DUTProgress:
         """
         Get total duration in seconds.
 
+        Each access computes the value from ``end_time`` and ``start_time`` on
+        the current instance; the derived view is not stored as independent
+        state.
+
         Returns:
-            Duration in seconds.
+            The numeric duration value.
         """
         if self.start_time and self.end_time:
             return (self.end_time - self.start_time).total_seconds()
@@ -187,15 +231,8 @@ class ProgressStateManager:
     """
     Manages progress state across all DUTs and collectors.
 
-    Tracks collector execution progress, timing, and status across multiple
-    DUTs with thread-safe state management.
-
-    Attributes:
-        dut_ids: List of DUT IDs.
-        collectors: List of collector IDs.
-        total_work: Total number of collector tasks.
-        dut_progress: Per-DUT progress tracking.
-        collector_progress: Per-collector progress tracking.
+    Tracks collector execution progress, timing, and status across multiple DUTs
+    with thread-safe state management.
     """
 
     def __init__(
@@ -204,10 +241,44 @@ class ProgressStateManager:
         collectors: List[str],
         logger=None,
         console=None,
+        *,
+        collectors_per_dut: Optional[Dict[str, List[str]]] = None,
     ):
+        """
+        Initialize a ``ProgressStateManager`` instance.
+
+        The initializer records ``_progress_callbacks``, ``collector_progress``,
+        ``collectors``, ``console``, and ``dut_ids`` for later operations and
+        establishes the instance invariants before any public method runs.
+
+        Args:
+            dut_ids: Entries supplied as ``dut_ids`` without transferring
+                container ownership.
+            collectors: Entries supplied as ``collectors`` without transferring
+                container ownership.
+            logger: Sanitized logger used for operator-visible diagnostics.
+            console: Optional console; ``None`` selects the function's default
+                behavior.
+            collectors_per_dut: Actual scheduled collectors for each DUT. When
+                supplied, omitted DUTs have no work and inapplicable pairs are
+                excluded from progress without manufacturing terminal events.
+                ``None`` preserves the uniform plan used by older callers.
+        """
         self.dut_ids = dut_ids
         self.collectors = collectors
-        self.total_work = len(collectors) * len(dut_ids)
+        self.collectors_per_dut = {}
+        for dut_id in dut_ids:
+            selected = set(
+                collectors
+                if collectors_per_dut is None
+                else collectors_per_dut.get(dut_id, [])
+            )
+            self.collectors_per_dut[dut_id] = [
+                collector_id for collector_id in collectors if collector_id in selected
+            ]
+        self.total_work = sum(
+            len(selected) for selected in self.collectors_per_dut.values()
+        )
         self.logger = logger
         self.console = console
 
@@ -215,7 +286,7 @@ class ProgressStateManager:
         self.dut_progress: Dict[str, DUTProgress] = {}
         for dut_id in dut_ids:
             self.dut_progress[dut_id] = DUTProgress(
-                dut_id=dut_id, total_collectors=len(collectors)
+                dut_id=dut_id, total_collectors=len(self.collectors_per_dut[dut_id])
             )
 
         # Initialize collector progress tracking
@@ -223,6 +294,8 @@ class ProgressStateManager:
         for collector_id in collectors:
             self.collector_progress[collector_id] = {}
             for dut_id in dut_ids:
+                if collector_id not in self.collectors_per_dut[dut_id]:
+                    continue
                 self.collector_progress[collector_id][dut_id] = CollectorProgress(
                     collector_id=collector_id, dut_id=dut_id
                 )
@@ -230,6 +303,7 @@ class ProgressStateManager:
         # Overall progress tracking
         self.overall_start_time = datetime.now()
         self.overall_completed = 0
+        self.overall_degraded = 0
         self.overall_partial = 0
         self.overall_failed = 0
         self.overall_skipped = 0
@@ -240,6 +314,11 @@ class ProgressStateManager:
     async def initialize(self) -> None:
         """
         Initialize the progress state manager (async operations).
+
+        The implementation uses current instance state to initialize the
+        progress state manager (async operations). Owned asynchronous work is
+        awaited before return, so completion does not leave an unobserved task
+        behind.
         """
         if self.logger:
             await self._logger("INFO", "ProgressStateManager initialized")
@@ -248,10 +327,18 @@ class ProgressStateManager:
         """
         Log message using the configured logger or fallback to print.
 
+        The implementation uses ``level``, ``message``, and ``dut_id`` to log
+        message using the configured logger or fallback to print. Owned
+        asynchronous work is awaited before return, so completion does not leave
+        an unobserved task behind.
+
         Args:
-            level: Log level.
-            message: Message to log.
-            dut_id: Optional DUT ID.
+            level: Text supplied as level in the format accepted by this
+                function.
+            message: Operator-facing text carried by the reported event or
+                failure.
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
         """
         if self.logger:
             try:
@@ -286,8 +373,11 @@ class ProgressStateManager:
         """
         Mark DUT collection as started.
 
+        The implementation uses ``dut_id`` to mark DUT collection as started.
+
         Args:
-            dut_id: DUT ID.
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
         """
         if dut_id in self.dut_progress:
             self.dut_progress[dut_id].start_time = datetime.now()
@@ -297,8 +387,11 @@ class ProgressStateManager:
         """
         Mark DUT collection as completed.
 
+        The implementation uses ``dut_id`` to mark DUT collection as completed.
+
         Args:
-            dut_id: DUT ID.
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
         """
         if dut_id in self.dut_progress:
             self.dut_progress[dut_id].end_time = datetime.now()
@@ -314,13 +407,19 @@ class ProgressStateManager:
         """
         Mark a collector as started.
 
+        Start DUT collection timer if this is the first collector.
+
         Args:
-            dut_id: DUT ID.
-            collector_id: Collector ID.
-            service: Optional service name.
-            bucket: Optional bucket name.
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+            collector_id: Stable collector identifier used to correlate
+                configuration, logs, and results.
+            service: Optional service; ``None`` selects the function's default
+                behavior.
+            bucket: Optional bucket; ``None`` selects the function's default
+                behavior.
         """
-        if dut_id in self.dut_progress and collector_id in self.collector_progress:
+        if dut_id in self.collector_progress.get(collector_id, {}):
             dut_progress = self.dut_progress[dut_id]
 
             # Start DUT collection timer if this is the first collector
@@ -362,14 +461,26 @@ class ProgressStateManager:
         """
         Mark a collector as completed.
 
+        The implementation uses ``dut_id``, ``collector_id``, ``status``,
+        ``reason``, and ``execution_time`` to mark a collector as completed.
+        Owned asynchronous work is awaited before return, so completion does not
+        leave an unobserved task behind. It updates ``overall_completed``,
+        ``overall_degraded``, ``overall_failed``, ``overall_partial``, and
+        ``overall_skipped`` on the instance as part of that state transition.
+
         Args:
-            dut_id: DUT ID.
-            collector_id: Collector ID.
-            status: Completion status.
-            reason: Optional reason string.
-            execution_time: Execution time in seconds.
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+            collector_id: Stable collector identifier used to correlate
+                configuration, logs, and results.
+            status: Text supplied as status in the format accepted by this
+                function.
+            reason: Text supplied as reason in the format accepted by this
+                function.
+            execution_time: Numeric execution time used while the operation
+                performs bounded accounting.
         """
-        if dut_id in self.dut_progress and collector_id in self.collector_progress:
+        if dut_id in self.collector_progress.get(collector_id, {}):
             # Update DUT progress
             dut_progress = self.dut_progress[dut_id]
             dut_progress.running_collectors.discard(collector_id)
@@ -395,6 +506,15 @@ class ProgressStateManager:
                 await self._logger(
                     "DEBUG",
                     f"Collector {collector_id} on {dut_id} completed. Overall: {self.overall_completed}, DUT {dut_id}: {len(dut_progress.completed_collectors)}",
+                    dut_id,
+                )
+            elif status == "degraded":
+                collector_progress.status = CollectorStatus.DEGRADED
+                dut_progress.degraded_collectors.add(collector_id)
+                self.overall_degraded += 1
+                await self._logger(
+                    "DEBUG",
+                    f"Collector {collector_id} on {dut_id} degraded. Overall: {self.overall_degraded}",
                     dut_id,
                 )
             elif status == "skipped":
@@ -450,11 +570,16 @@ class ProgressStateManager:
         """
         Get overall progress information.
 
+        The implementation uses current instance state to get overall progress
+        information.
+
         Returns:
-            Dictionary containing overall progress metrics.
+            A mapping containing the ``total_work``, ``completed``,
+            ``degraded``, ``partial``, and ``failed`` fields.
         """
         total_completed = (
             self.overall_completed
+            + self.overall_degraded
             + self.overall_partial
             + self.overall_failed
             + self.overall_skipped
@@ -464,6 +589,7 @@ class ProgressStateManager:
         return {
             "total_work": self.total_work,
             "completed": self.overall_completed,
+            "degraded": self.overall_degraded,
             "partial": self.overall_partial,
             "failed": self.overall_failed,
             "skipped": self.overall_skipped,
@@ -481,11 +607,17 @@ class ProgressStateManager:
         """
         Get progress for a specific DUT.
 
+        After applying local validation, the function forwards ``dut_id`` to
+        ``self.dut_progress.get`` and preserves its return and exception
+        contract.
+
         Args:
-            dut_id: DUT ID.
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
 
         Returns:
-            DUTProgress object or None if not found.
+            A ``DUTProgress`` representing DUT progress, or ``None`` when the
+            requested value is unavailable.
         """
         return self.dut_progress.get(dut_id)
 
@@ -495,12 +627,17 @@ class ProgressStateManager:
         """
         Get list of remaining (pending/running) collectors for a DUT or overall.
 
+        The implementation uses ``dut_id`` and ``max_display`` to get list of
+        remaining (pending/running) collectors for a DUT or overall.
+
         Args:
-            dut_id: Optional DUT ID for DUT-specific remaining collectors.
-            max_display: Maximum number of collectors to return.
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+            max_display: Upper bound enforced for max display; the consuming
+                boundary rejects or truncates values that exceed it.
 
         Returns:
-            List of remaining collector IDs.
+            The remaining collectors returned in operation-defined order.
         """
         remaining = []
 
@@ -508,9 +645,10 @@ class ProgressStateManager:
             # Get remaining collectors for specific DUT
             if dut_id in self.dut_progress:
                 dut_progress = self.dut_progress[dut_id]
-                for collector_id in self.collectors:
+                for collector_id in self.collectors_per_dut[dut_id]:
                     if (
                         collector_id not in dut_progress.completed_collectors
+                        and collector_id not in dut_progress.degraded_collectors
                         and collector_id not in dut_progress.failed_collectors
                         and collector_id not in dut_progress.skipped_collectors
                         and collector_id not in dut_progress.partial_collectors

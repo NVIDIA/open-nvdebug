@@ -1,3 +1,20 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 <template>
   <div style="min-height: calc(100vh - 88px);">
     <div class="nv-sidebar">
@@ -39,9 +56,13 @@
           <select v-model="statusFilter" class="nv-input nv-input--sm" style="font-size: 0.75rem; max-width: 140px;">
             <option value="">All Statuses</option>
             <option value="success">Success</option>
+            <option value="degraded">Degraded</option>
             <option value="error">Error</option>
             <option value="partial">Partial</option>
             <option value="skipped">Skipped</option>
+            <option value="cancelled">Cancelled</option>
+            <option value="running">Running</option>
+            <option value="pending">Pending</option>
             <option value="not_ran">Not Ran</option>
           </select>
           <label style="font-size: 0.6875rem; color: var(--nv-text-secondary); display: flex; align-items: center; gap: 4px;">
@@ -62,7 +83,7 @@
             </thead>
             <tbody>
               <tr v-for="dut in duts" :key="dut.id">
-                <td class="cm-td cm-td--row" @click="router.push(`/dut/${encodeURIComponent(dut.id)}`)">{{ dut.id }}</td>
+                <td class="cm-td cm-td--row" @click="router.push(dutRoute(dut.id))">{{ dut.id }}</td>
                 <td
                   v-for="cid in filteredCollectorIds"
                   :key="cid"
@@ -78,9 +99,13 @@
         <!-- Legend -->
         <div style="display: flex; gap: 12px; margin-top: 12px; font-size: 0.6875rem; color: var(--nv-text-secondary); flex-wrap: wrap;">
           <span style="display: flex; align-items: center; gap: 4px;"><span class="cm-legend cm-legend--success"></span> Success</span>
+          <span style="display: flex; align-items: center; gap: 4px;"><span class="cm-legend cm-legend--degraded"></span> Degraded</span>
           <span style="display: flex; align-items: center; gap: 4px;"><span class="cm-legend cm-legend--error"></span> Error</span>
           <span style="display: flex; align-items: center; gap: 4px;"><span class="cm-legend cm-legend--partial"></span> Partial</span>
           <span style="display: flex; align-items: center; gap: 4px;"><span class="cm-legend cm-legend--skipped"></span> Skipped</span>
+          <span style="display: flex; align-items: center; gap: 4px;"><span class="cm-legend cm-legend--cancelled"></span> Cancelled</span>
+          <span style="display: flex; align-items: center; gap: 4px;"><span class="cm-legend cm-legend--running"></span> Running</span>
+          <span style="display: flex; align-items: center; gap: 4px;"><span class="cm-legend cm-legend--pending"></span> Pending</span>
           <span style="display: flex; align-items: center; gap: 4px;"><span class="cm-legend cm-legend--not_ran"></span> Not Ran</span>
         </div>
       </template>
@@ -92,10 +117,12 @@
 import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useManifestStore } from '@/stores/manifest'
+import { normalizeCollectorStatus } from '@/utils/collectorLifecycle'
 import { naturalCompare } from '@/utils/naturalSort'
 import Breadcrumbs from '@/components/common/Breadcrumbs.vue'
 import PageLoader from '@/components/common/PageLoader.vue'
 import AnalysisNav from '@/components/common/AnalysisNav.vue'
+import { collectorDetailRoute, dutRoute } from '@/utils/reportRoutes'
 
 const router = useRouter()
 const manifestStore = useManifestStore()
@@ -131,7 +158,7 @@ const matrixMap = computed(() => {
     for (const g of dut.collector_groups) {
       for (const c of g.collectors) {
         map.set(`${dut.id}::${c.id}`, {
-          status: c.status,
+          status: normalizeCollectorStatus(c.status),
           time: c.execution_time,
           reason: c.reason,
           group: g.name,
@@ -207,7 +234,7 @@ function cellTooltip(dutId: string, cid: string): string {
 function navigateToCollector(dutId: string, cid: string) {
   const info = matrixMap.value.get(`${dutId}::${cid}`)
   if (info) {
-    router.push(`/dut/${encodeURIComponent(dutId)}/${encodeURIComponent(info.group)}/${encodeURIComponent(cid)}`)
+    router.push(collectorDetailRoute(dutId, info.group, cid))
   }
 }
 </script>
@@ -277,9 +304,13 @@ function navigateToCollector(dutId: string, cid: string) {
 }
 .cm-cell:hover { opacity: 0.7; border-color: var(--nv-text-primary); }
 .cm-cell--success { background: var(--nv-success); }
+.cm-cell--degraded { background: var(--nv-warning); }
 .cm-cell--error { background: var(--nv-error); }
 .cm-cell--partial { background: var(--nv-warning); }
 .cm-cell--skipped { background: var(--nv-text-tertiary); }
+.cm-cell--cancelled { background: var(--nv-warning); }
+.cm-cell--running { background: var(--nv-info); }
+.cm-cell--pending { background: var(--nv-chart-gray); }
 .cm-cell--not_ran { background: var(--nv-glass-bg-light); }
 .cm-cell--empty { background: transparent; }
 .cm-legend {
@@ -289,8 +320,12 @@ function navigateToCollector(dutId: string, cid: string) {
   border-radius: 2px;
 }
 .cm-legend--success { background: var(--nv-success); }
+.cm-legend--degraded { background: var(--nv-warning); }
 .cm-legend--error { background: var(--nv-error); }
 .cm-legend--partial { background: var(--nv-warning); }
 .cm-legend--skipped { background: var(--nv-text-tertiary); }
+.cm-legend--cancelled { background: var(--nv-warning); }
+.cm-legend--running { background: var(--nv-info); }
+.cm-legend--pending { background: var(--nv-chart-gray); }
 .cm-legend--not_ran { background: var(--nv-glass-bg-light); border: 1px solid var(--nv-glass-border); }
 </style>

@@ -1,3 +1,18 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 import { createRouter, createWebHashHistory } from 'vue-router'
 import type { RouteRecordRaw } from 'vue-router'
 
@@ -11,6 +26,7 @@ const routes: RouteRecordRaw[] = [
   { path: '/dut/:dutId/:group/:collectorId', name: 'collector-detail', component: () => import('@/views/CollectorDetailView.vue') },
   { path: '/file/:encodedPath(.*)', name: 'file', component: () => import('@/views/FileView.vue') },
   { path: '/file-map', name: 'file-map', component: () => import('@/views/FileMapView.vue') },
+  { path: '/coredumps', name: 'coredumps', component: () => import('@/views/CoreDumpAnalyzerView.vue') },
   { path: '/timing', name: 'timing', component: () => import('@/views/TimingView.vue') },
   { path: '/timing/gantt', name: 'gantt', component: () => import('@/views/GanttTimelineView.vue') },
   { path: '/status/:statusType', name: 'status-detail', component: () => import('@/views/StatusDetailView.vue') },
@@ -22,6 +38,7 @@ const routes: RouteRecordRaw[] = [
   { path: '/firmware-compare', name: 'firmware-compare', component: () => import('@/views/FirmwareCompareView.vue') },
   { path: '/co-failure', name: 'co-failure', component: () => import('@/views/CoFailureView.vue') },
   { path: '/stage-profiling', name: 'stage-profiling', component: () => import('@/views/StageProfilingView.vue') },
+  { path: '/resources', name: 'resources', component: () => import('@/views/ResourcesView.vue') },
   { path: '/error-timeline', name: 'error-timeline', component: () => import('@/views/ErrorTimelineView.vue') },
   { path: '/preflight-summary', name: 'preflight-summary', component: () => import('@/views/PreflightSummaryView.vue') },
   { path: '/diff', name: 'diff', component: () => import('@/views/DiffView.vue') },

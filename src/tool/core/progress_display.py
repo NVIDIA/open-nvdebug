@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 """
 Progress Display for NVDebug Tool.
 
@@ -20,16 +21,117 @@ Shows real-time progress bars for collector execution using Rich progress bars
 with per-DUT task tracking and overall progress visualization.
 """
 
-from datetime import datetime
-
 from rich.progress import (
     BarColumn,
     Progress,
+    ProgressColumn,
     SpinnerColumn,
     TaskProgressColumn,
     TextColumn,
-    TimeElapsedColumn,
 )
+from rich.text import Text
+
+
+class StateElapsedColumn(ProgressColumn):
+    """
+    Render one shared wall-clock timeline for the run and every DUT row.
+
+    Every row uses the state manager's common run start and continues advancing
+    until the display stops, even when the scheduler starts or completes DUTs at
+    different times. Per-DUT execution and completion durations remain
+    available in progress metadata and are not changed by this display-only
+    policy.
+    """
+
+    def __init__(self, progress_state_getter):
+        """
+        Initialize a ``StateElapsedColumn`` instance.
+
+        The initializer records ``_progress_state_getter`` for later operations
+        and establishes the instance invariants before any public method runs.
+
+        Args:
+            progress_state_getter: Progress state getter consumed while the
+                function attempts to initialize a ``StateElapsedColumn``
+                instance.
+        """
+        super().__init__()
+        self._progress_state_getter = progress_state_getter
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        """
+        Format duration.
+
+        The implementation uses ``seconds`` to format duration. The source value
+        keeps its ownership while the normalized representation is returned
+        separately.
+
+        Args:
+            seconds: Numeric seconds used while the operation performs bounded
+                accounting.
+
+        Returns:
+            The canonical duration text.
+        """
+        seconds = max(0, int(seconds or 0))
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+
+    @staticmethod
+    def _now_for(start_time):
+        """
+        Return the now for.
+
+        The implementation uses ``start_time`` to produce the now for.
+
+        Args:
+            start_time: Start time consumed while the function attempts to
+                produce the now for.
+
+        Returns:
+            The current timestamp in the timezone used by ``start_time``.
+        """
+        from datetime import datetime as _state_datetime
+
+        timezone = getattr(start_time, "tzinfo", None)
+        return (
+            _state_datetime.now(tz=timezone)
+            if timezone is not None
+            else _state_datetime.now()
+        )
+
+    def render(self, task) -> Text:
+        """
+        Render the current value for operator-facing output.
+
+        After applying local validation, the function forwards ``task`` to
+        ``Text`` and preserves its return and exception contract. The source
+        value keeps its ownership while the normalized representation is
+        returned separately.
+
+        Args:
+            task: Task consumed while the function attempts to render the
+                current value for operator-facing output.
+
+        Returns:
+            Rich text containing the task's current elapsed-time display.
+        """
+        elapsed = getattr(task, "elapsed", None) or 0.0
+        try:
+            progress_state = self._progress_state_getter()
+            overall_start_time = getattr(progress_state, "overall_start_time", None)
+            if overall_start_time is not None:
+                elapsed = (
+                    self._now_for(overall_start_time) - overall_start_time
+                ).total_seconds()
+        except (AttributeError, KeyError, TypeError, ValueError):
+            # Rich's monotonic task clock remains a safe fallback for callers
+            # which have not attached a progress-state manager.
+            elapsed = getattr(task, "elapsed", None) or 0.0
+
+        return Text(self._format_duration(elapsed), style="progress.elapsed")
 
 
 class ProgressDisplay:
@@ -38,23 +140,20 @@ class ProgressDisplay:
 
     Provides real-time visualization of collector execution progress across
     multiple DUTs using Rich progress bars.
-
-    Attributes:
-        console: Console for output.
-        logger: Logger instance.
-        progress: Rich Progress instance.
-        overall_task: Overall progress task ID.
-        dut_tasks (dict): Per-DUT progress task IDs.
-        progress_state: Progress state manager.
     """
 
     def __init__(self, console, logger=None):
         """
         Initialize progress display.
 
+        The initializer records ``console``, ``dut_tasks``, ``logger``,
+        ``overall_task``, and ``progress`` for later operations and establishes
+        the instance invariants before any public method runs.
+
         Args:
-            console: Console instance.
-            logger: Optional logger instance.
+            console: Console consumed while the function attempts to initialize
+                progress display.
+            logger: Sanitized logger used for operator-visible diagnostics.
         """
         self.console = console
         self.logger = logger
@@ -67,8 +166,13 @@ class ProgressDisplay:
         """
         Set the progress state manager to track.
 
+        The implementation uses ``progress_state`` to set the progress state
+        manager to track. It updates ``progress_state`` on the instance as part
+        of that state transition.
+
         Args:
-            progress_state: Progress state manager instance.
+            progress_state: Progress state consumed while the function attempts
+                to set the progress state manager to track.
         """
         self.progress_state = progress_state
 
@@ -76,11 +180,16 @@ class ProgressDisplay:
         """
         Format duration in seconds to H:MM:SS format.
 
+        The implementation uses ``seconds`` to format duration in seconds to
+        H:MM:SS format. The source value keeps its ownership while the
+        normalized representation is returned separately.
+
         Args:
-            seconds: Duration in seconds.
+            seconds: Numeric seconds used while the operation performs bounded
+                accounting.
 
         Returns:
-            Formatted duration string.
+            The canonical duration text.
         """
         if seconds <= 0:
             return "0:00:00"
@@ -95,9 +204,16 @@ class ProgressDisplay:
         """
         Start the progress display.
 
+        The implementation uses ``dut_ids`` and ``total_collectors`` to start
+        the progress display. It updates ``overall_task`` and ``progress`` on
+        the instance as part of that state transition.
+
         Args:
-            dut_ids (list): List of DUT IDs.
-            total_collectors (int): Total number of collectors.
+            dut_ids: Entries supplied as ``dut_ids`` without transferring
+                container ownership.
+            total_collectors: Number of distinct collectors in the plan. Work
+                totals come from the attached state so DUT-specific exclusions
+                do not inflate the progress bars.
         """
         if not self.progress_state:
             return
@@ -108,26 +224,30 @@ class ProgressDisplay:
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
             TaskProgressColumn(),
-            TimeElapsedColumn(),
+            StateElapsedColumn(lambda: self.progress_state),
             console=self.console,
+            auto_refresh=True,
+            refresh_per_second=4,
         )
 
         # Start the progress bar
         self.progress.start()
 
         # Create overall progress task
-        total_work = total_collectors * len(dut_ids)
+        total_work = self.progress_state.get_overall_progress()["total_work"]
         self.overall_task = self.progress.add_task(
-            f"[bold blue]Overall Progress ({total_collectors} collectors × {len(dut_ids)} DUTs)",
+            f"[bold blue]Overall Progress ({total_work} operations across {len(dut_ids)} DUTs)",
             total=total_work,
         )
 
         # Create DUT progress tasks
         for dut_id in dut_ids:
+            dut_progress = self.progress_state.get_dut_progress(dut_id)
             task = self.progress.add_task(
                 f"[green]{dut_id}[/green]",
-                total=total_collectors,
+                total=dut_progress.total_collectors if dut_progress else 0,
                 start=False,
+                dut_id=dut_id,
             )
             self.dut_tasks[dut_id] = task
 
@@ -139,10 +259,18 @@ class ProgressDisplay:
         """
         Log message using the configured logger or fallback to print.
 
+        The implementation uses ``level``, ``message``, and ``dut_id`` to log
+        message using the configured logger or fallback to print. Owned
+        asynchronous work is awaited before return, so completion does not leave
+        an unobserved task behind.
+
         Args:
-            level: Log level (DEBUG, INFO, WARNING, ERROR).
-            message: Message to log.
-            dut_id: Optional DUT ID for DUT-specific logging.
+            level: Text supplied as level in the format accepted by this
+                function.
+            message: Operator-facing text carried by the reported event or
+                failure.
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
         """
         if self.logger:
             try:
@@ -161,83 +289,24 @@ class ProgressDisplay:
     async def update(self):
         """
         Update progress display from progress state manager.
-        """
-        await self._logger("DEBUG", "ProgressDisplay.update() method called")
-        await self._logger(
-            "DEBUG",
-            f"self.progress_state exists: {self.progress_state is not None}",
-        )
-        await self._logger(
-            "DEBUG", f"self.progress exists: {self.progress is not None}"
-        )
 
+        The implementation uses current instance state to update progress
+        display from progress state manager. Owned asynchronous work is awaited
+        before return, so completion does not leave an unobserved task behind.
+        """
         if not self.progress_state or not self.progress:
-            await self._logger(
-                "DEBUG",
-                "ProgressDisplay.update() - no progress_state or progress",
-            )
             return
 
-        await self._logger(
-            "DEBUG",
-            "ProgressDisplay.update() - both progress_state and progress exist",
-        )
-        await self._logger(
-            "DEBUG",
-            f"self.overall_task exists: {self.overall_task is not None}",
-        )
-
         try:
-            await self._logger("DEBUG", "Entering try block in update method")
-
-            await self._logger("DEBUG", f"overall_task value: {self.overall_task}")
-            await self._logger("DEBUG", f"overall_task type: {type(self.overall_task)}")
-            await self._logger(
-                "DEBUG", f"overall_task is None: {self.overall_task is None}"
-            )
-
             # Update overall progress
             if self.overall_task is not None:
-                await self._logger("DEBUG", "About to call get_overall_progress()")
                 overall_progress = self.progress_state.get_overall_progress()
-                await self._logger(
-                    "DEBUG",
-                    f"get_overall_progress() returned: {overall_progress}",
-                )
                 total_completed = (
                     overall_progress["completed"]
+                    + overall_progress["degraded"]
+                    + overall_progress["partial"]
                     + overall_progress["failed"]
                     + overall_progress["skipped"]
-                )
-
-                # Debug logging
-                await self._logger(
-                    "DEBUG",
-                    f"Overall progress - completed: {overall_progress['completed']}, failed: {overall_progress['failed']}, skipped: {overall_progress['skipped']}, total: {overall_progress['total_work']}",
-                )
-                await self._logger(
-                    "DEBUG",
-                    f"ProgressDisplay.update() called at {datetime.now()}",
-                )
-                await self._logger(
-                    "DEBUG",
-                    f"ProgressDisplay.progress_state object: {self.progress_state}",
-                )
-                await self._logger(
-                    "DEBUG",
-                    f"ProgressDisplay.progress_state type: {type(self.progress_state)}",
-                )
-                await self._logger(
-                    "DEBUG",
-                    f"ProgressDisplay.progress_state.overall_completed: {self.progress_state.overall_completed}",
-                )
-                await self._logger(
-                    "DEBUG",
-                    f"ProgressDisplay.progress_state.overall_failed: {self.progress_state.overall_failed}",
-                )
-                await self._logger(
-                    "DEBUG",
-                    f"ProgressDisplay.progress_state.overall_skipped: {self.progress_state.overall_skipped}",
                 )
 
                 self.progress.update(self.overall_task, completed=total_completed)
@@ -256,6 +325,10 @@ class ProgressDisplay:
 
                 if overall_progress["failed"] > 0:
                     description += f" - {overall_progress['failed']} failed"
+                if overall_progress["degraded"] > 0:
+                    description += f" - {overall_progress['degraded']} degraded"
+                if overall_progress["partial"] > 0:
+                    description += f" - {overall_progress['partial']} partial"
                 if overall_progress["skipped"] > 0:
                     description += f" - {overall_progress['skipped']} skipped"
                 self.progress.update(self.overall_task, description=description)
@@ -264,12 +337,6 @@ class ProgressDisplay:
             for dut_id, task in self.dut_tasks.items():
                 dut_progress = self.progress_state.get_dut_progress(dut_id)
                 if dut_progress:
-                    # Debug logging
-                    await self._logger(
-                        "DEBUG",
-                        f"DEBUG: DUT {dut_id} progress - total_completed: {dut_progress.total_completed}, total_collectors: {dut_progress.total_collectors}",
-                    )
-
                     # Update progress count
                     self.progress.update(task, completed=dut_progress.total_completed)
 
@@ -281,32 +348,28 @@ class ProgressDisplay:
                         dut_progress.total_collectors - dut_progress.total_completed
                     )
 
-                    # Format per-DUT elapsed time
-                    # Format per-DUT elapsed time
-                    duration_str = self._format_duration(
-                        dut_progress.duration
-                        if hasattr(dut_progress, "duration")
-                        else 0.0
-                    )
-
                     if remaining_count > 0 and remaining_collectors:
-                        # Show remaining collector names with per-DUT elapsed time
+                        # Elapsed time is rendered by StateElapsedColumn so it
+                        # keeps ticking without another state or logging event.
                         remaining_text = ", ".join(remaining_collectors)
-                        description = f"[green]{dut_id}[/green] - {remaining_text} remaining ({dut_progress.total_completed}/{dut_progress.total_collectors}) {duration_str}"
+                        description = f"[green]{dut_id}[/green] - {remaining_text} remaining ({dut_progress.total_completed}/{dut_progress.total_collectors})"
                     else:
                         # All completed for this DUT
-                        description = f"[green]{dut_id}[/green] - Complete! ({dut_progress.total_completed}/{dut_progress.total_collectors}) {duration_str}"
+                        description = f"[green]{dut_id}[/green] - Complete! ({dut_progress.total_completed}/{dut_progress.total_collectors})"
 
                     self.progress.update(task, description=description)
 
-        except Exception as e:
+        except Exception:
             # Don't let progress display errors break execution
-            await self._logger("ERROR", f"Progress display update error: {e}")
             pass
 
     def stop(self):
         """
         Stop the progress display and clean up.
+
+        The implementation uses current instance state to stop the progress
+        display and clean up. It updates ``dut_tasks``, ``overall_task``, and
+        ``progress`` on the instance as part of that state transition.
         """
         if self.progress:
             self.progress.stop()

@@ -1,4 +1,26 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 import type { ErrorEntry } from '@/types/manifest'
+import {
+  ERROR_CLUSTER_INPUT_LIMIT,
+  ERROR_CLUSTER_MESSAGE_LIMIT,
+  normalizeErrorEntry,
+} from '@/utils/errorEntries'
+
+export { ERROR_CLUSTER_INPUT_LIMIT, ERROR_CLUSTER_MESSAGE_LIMIT }
 
 export interface ErrorCluster {
   id: number
@@ -17,6 +39,16 @@ export interface KnownIssue {
   description: string
   fix: string
 }
+
+export interface ErrorClusteringResult {
+  clusters: ErrorCluster[]
+  processedErrors: number
+  omittedErrors: number
+  comparisons: number
+}
+
+// Keep all attacker-controlled work on the UI thread behind explicit ceilings.
+export const ERROR_CLUSTER_COMPARISON_LIMIT = 512
 
 const KNOWN_ISSUES: KnownIssue[] = [
   {
@@ -64,9 +96,8 @@ const KNOWN_ISSUES: KnownIssue[] = [
 ]
 
 function levenshteinDistance(a: string, b: string): number {
-  const maxLen = 200
-  const sa = a.slice(0, maxLen)
-  const sb = b.slice(0, maxLen)
+  const sa = a.slice(0, ERROR_CLUSTER_MESSAGE_LIMIT)
+  const sb = b.slice(0, ERROR_CLUSTER_MESSAGE_LIMIT)
   const la = sa.length
   const lb = sb.length
 
@@ -95,8 +126,15 @@ function similarity(a: string, b: string): number {
   return 1 - levenshteinDistance(a, b) / maxLen
 }
 
-function normalizeMessage(msg: string): string {
-  return msg
+function boundedMessage(value: unknown): string {
+  if (typeof value === 'string') return value.slice(0, ERROR_CLUSTER_MESSAGE_LIMIT)
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value)
+  if (typeof value === 'boolean') return value ? 'true' : 'false'
+  return ''
+}
+
+function normalizeMessage(msg: unknown): string {
+  return boundedMessage(msg)
     .replace(/0x[0-9a-fA-F]+/g, '0xHEX')
     .replace(/\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/g, 'IP_ADDR')
     .replace(/\b[0-9a-f]{8,}\b/gi, 'HASH')
@@ -120,34 +158,84 @@ function classifySeverity(cluster: { count: number; dutIds: string[] }): ErrorCl
   return 'low'
 }
 
-export function clusterErrors(errors: ErrorEntry[], threshold = 0.6): ErrorCluster[] {
-  if (errors.length === 0) return []
-
-  const clusters: ErrorCluster[] = []
-  const assigned = new Set<number>()
-
-  for (let i = 0; i < errors.length; i++) {
-    if (assigned.has(i)) continue
-
-    const cluster: ErrorEntry[] = [errors[i]]
-    const normI = normalizeMessage(errors[i].message)
-    assigned.add(i)
-
-    for (let j = i + 1; j < errors.length; j++) {
-      if (assigned.has(j)) continue
-      const normJ = normalizeMessage(errors[j].message)
-      if (similarity(normI, normJ) >= threshold) {
-        cluster.push(errors[j])
-        assigned.add(j)
+export function clusterErrorsWithStats(
+  errors: readonly unknown[],
+  threshold = 0.6,
+): ErrorClusteringResult {
+  let sourceLength = 0
+  try {
+    if (Array.isArray(errors)) {
+      const length: unknown = errors.length
+      if (typeof length === 'number' && Number.isSafeInteger(length) && length >= 0) {
+        sourceLength = length
       }
     }
+  } catch {
+    sourceLength = 0
+  }
 
+  const boundedErrors: ErrorEntry[] = []
+  const boundedLength = Math.min(sourceLength, ERROR_CLUSTER_INPUT_LIMIT)
+  for (let index = 0; index < boundedLength; index++) {
+    let candidate: unknown
+    try {
+      candidate = errors[index]
+    } catch {
+      continue
+    }
+    const normalized = normalizeErrorEntry(candidate)
+    if (normalized) boundedErrors.push(normalized)
+  }
+  if (boundedErrors.length === 0) {
+    return {
+      clusters: [],
+      processedErrors: 0,
+      omittedErrors: Math.max(0, sourceLength - boundedLength),
+      comparisons: 0,
+    }
+  }
+
+  // Collapse exact normalized matches in one pass before spending any fuzzy
+  // comparison budget. This retains useful counts for common repeated errors.
+  const exactGroups = new Map<
+    string,
+    { normalized: string; entries: ErrorEntry[] }
+  >()
+  for (const error of boundedErrors) {
+    const normalized = normalizeMessage(error.message)
+    const existing = exactGroups.get(normalized)
+    if (existing) existing.entries.push(error)
+    else exactGroups.set(normalized, { normalized, entries: [error] })
+  }
+
+  const mergedGroups: Array<{ normalized: string; entries: ErrorEntry[] }> = []
+  const safeThreshold = Number.isFinite(threshold)
+    ? Math.min(1, Math.max(0, threshold))
+    : 0.6
+  let comparisons = 0
+
+  for (const group of exactGroups.values()) {
+    let matchedGroup: { normalized: string; entries: ErrorEntry[] } | undefined
+    for (const candidate of mergedGroups) {
+      if (comparisons >= ERROR_CLUSTER_COMPARISON_LIMIT) break
+      comparisons++
+      if (similarity(candidate.normalized, group.normalized) >= safeThreshold) {
+        matchedGroup = candidate
+        break
+      }
+    }
+    if (matchedGroup) matchedGroup.entries.push(...group.entries)
+    else mergedGroups.push(group)
+  }
+
+  const clusters: ErrorCluster[] = mergedGroups.map(({ entries }, id) => {
+    const cluster = entries
     const dutIds = [...new Set(cluster.map(e => e.dut_id))]
     const collectorIds = [...new Set(cluster.map(e => e.collector_id))]
-    const representative = cluster[0].message
+    const representative = boundedMessage(cluster[0].message)
 
-    clusters.push({
-      id: clusters.length,
+    return {
+      id,
       representative,
       count: cluster.length,
       entries: cluster,
@@ -155,12 +243,23 @@ export function clusterErrors(errors: ErrorEntry[], threshold = 0.6): ErrorClust
       collectorIds,
       severity: classifySeverity({ count: cluster.length, dutIds }),
       knownIssue: matchKnownIssue(representative),
-    })
-  }
+    }
+  })
 
-  return clusters.sort((a, b) => {
+  clusters.sort((a, b) => {
     const sev = { critical: 0, high: 1, medium: 2, low: 3 }
     if (sev[a.severity] !== sev[b.severity]) return sev[a.severity] - sev[b.severity]
     return b.count - a.count
   })
+
+  return {
+    clusters,
+    processedErrors: boundedErrors.length,
+    omittedErrors: Math.max(0, sourceLength - boundedLength),
+    comparisons,
+  }
+}
+
+export function clusterErrors(errors: readonly unknown[], threshold = 0.6): ErrorCluster[] {
+  return clusterErrorsWithStats(errors, threshold).clusters
 }

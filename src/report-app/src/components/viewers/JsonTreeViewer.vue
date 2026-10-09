@@ -1,3 +1,20 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 <template>
   <div class="nv-log json-tree-viewer" @click="closeContextMenu">
     <!-- Toolbar -->
@@ -55,6 +72,10 @@
       </button>
     </div>
 
+    <div v-if="traversalNotice" class="json-tree-viewer__notice" role="status">
+      {{ traversalNotice }}
+    </div>
+
     <!-- Raw JSON (Monaco) -->
     <div v-if="showRaw">
       <MonacoViewer :content="rawJson" language="json" :height="height" :word-wrap="wordWrap" />
@@ -109,6 +130,7 @@ import JsonNode from './JsonNode.vue'
 import { showToast } from '@/composables/useToast'
 import { copyToClipboard } from '@/utils/clipboard'
 import { jsonRawMode, wordWrap } from '@/composables/useViewerPrefs'
+import { jsonTreeTruncationNotice, walkJsonTreeBounded } from '@/utils/jsonTree'
 
 const props = withDefaults(defineProps<{
   content: string
@@ -124,6 +146,7 @@ const hoveredPath = ref('')
 const treeContainer = ref<HTMLElement>()
 const searchInputRef = ref<HTMLInputElement>()
 const currentMatchIndex = ref(0)
+const operationNotice = ref('')
 
 watch(showRaw, (v) => { jsonRawMode.value = v })
 
@@ -144,26 +167,25 @@ const rawJson = computed(() => {
 })
 
 // --- Search match collection ---
-const matchPaths = computed(() => {
-  if (!searchText.value) return [] as string[]
+const searchWalk = computed(() => {
+  if (!searchText.value) return { paths: [] as string[], notice: '' }
   const q = searchText.value.toLowerCase()
   const results: string[] = []
-  function walk(data: any, path: string, label?: string) {
-    if (data !== null && typeof data === 'object') {
+  const walkResult = walkJsonTreeBounded(parsedData.value, ({ value, path, label }) => {
+    if (value !== null && typeof value === 'object') {
       if (label?.toLowerCase().includes(q)) results.push(path)
-      for (const key of Object.keys(data)) {
-        walk(data[key], `${path}.${key}`, key)
-      }
     } else {
-      const display = data === null ? 'null' : typeof data === 'string' ? `"${data}"` : String(data)
+      const display = value === null ? 'null' : typeof value === 'string' ? `"${value}"` : String(value)
       if (display.toLowerCase().includes(q) || (label?.toLowerCase().includes(q) ?? false)) {
         results.push(path)
       }
     }
-  }
-  walk(parsedData.value, '$')
-  return results
+  })
+  return { paths: results, notice: jsonTreeTruncationNotice(walkResult) }
 })
+
+const matchPaths = computed(() => searchWalk.value.paths)
+const traversalNotice = computed(() => searchWalk.value.notice || operationNotice.value)
 
 watch(searchText, () => { currentMatchIndex.value = 0 })
 
@@ -247,20 +269,17 @@ function doCopyValue(path: string) {
 
 function expandAll() {
   const paths = new Set<string>()
-  function walk(data: any, path: string) {
+  const walkResult = walkJsonTreeBounded(parsedData.value, ({ path }) => {
     paths.add(path)
-    if (data && typeof data === 'object') {
-      for (const key of Object.keys(data)) {
-        walk(data[key], `${path}.${key}`)
-      }
-    }
-  }
-  walk(parsedData.value, '$')
+  })
   expandedPaths.value = paths
+  operationNotice.value = jsonTreeTruncationNotice(walkResult)
+  if (operationNotice.value) showToast(operationNotice.value, 'info')
 }
 
 function collapseAll() {
   expandedPaths.value = new Set(['$'])
+  operationNotice.value = ''
 }
 
 // --- Context Menu ---
@@ -323,13 +342,12 @@ function ctxCopyPath() {
 function ctxExpandChildren() {
   const base = ctxMenu.value.path
   const data = ctxMenu.value.data
-  function walk(d: any, p: string) {
-    expandedPaths.value.add(p)
-    if (d && typeof d === 'object') {
-      for (const key of Object.keys(d)) walk(d[key], `${p}.${key}`)
-    }
-  }
-  walk(data, base)
+  const walkResult = walkJsonTreeBounded(data, ({ path }) => {
+    const rebasedPath = path === '$' ? base : `${base}${path.slice(1)}`
+    expandedPaths.value.add(rebasedPath)
+  })
+  operationNotice.value = jsonTreeTruncationNotice(walkResult)
+  if (operationNotice.value) showToast(operationNotice.value, 'info')
   closeContextMenu()
 }
 
@@ -360,6 +378,13 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   gap: 4px;
+}
+.json-tree-viewer__notice {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--nv-border-subtle);
+  color: var(--nv-text-secondary);
+  background: var(--nv-bg-secondary);
+  font-size: 0.75rem;
 }
 .json-tree-viewer__match-count {
   font-size: 0.6875rem;

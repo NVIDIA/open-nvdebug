@@ -1,3 +1,20 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 <template>
   <div class="chart-container">
     <Doughnut v-if="hasData" :data="chartData" :options="chartOptions" />
@@ -11,18 +28,28 @@ import { Doughnut } from 'vue-chartjs'
 import { Chart as ChartJS, ArcElement, Tooltip, Legend } from 'chart.js'
 import EmptyState from '@/components/common/EmptyState.vue'
 import { resolveServiceColor, useThemeColors } from '@/composables/useThemeColors'
+import { useThemeStore } from '@/stores/theme'
 import { toHex6 } from '@/utils/color'
 
 ChartJS.register(ArcElement, Tooltip, Legend)
 
-const colors = useThemeColors()
+const themeStore = useThemeStore()
+// Re-resolve CSS variables whenever the theme changes: a one-time snapshot
+// leaves dark-theme borders painted on the light theme (and vice versa).
+const colors = computed(() => {
+  void themeStore.theme
+  return useThemeColors()
+})
 
 const props = defineProps<{
   services: Array<{ service: string; total_collectors: number }>
 }>()
 
 const hasData = computed(() => props.services.some(s => s.total_collectors > 0))
-const serviceColors = computed(() => props.services.map(s => toHex6(resolveServiceColor(s.service))))
+const serviceColors = computed(() => {
+  void themeStore.theme
+  return props.services.map(s => toHex6(resolveServiceColor(s.service)))
+})
 
 const chartData = computed(() => ({
   labels: props.services.map(s => s.service),
@@ -31,7 +58,7 @@ const chartData = computed(() => ({
     backgroundColor: serviceColors.value.map(color => color + 'b3'),
     hoverBackgroundColor: serviceColors.value,
     borderWidth: 2,
-    borderColor: colors.bgPrimary || '#1a1a1a',
+    borderColor: colors.value.bgPrimary || '#1a1a1a',
     hoverOffset: 6,
   }],
 }))
@@ -44,10 +71,10 @@ const chartOptions = computed(() => ({
     legend: {
       position: 'bottom' as const,
       labels: {
-        color: colors.textSecondary,
+        color: colors.value.textSecondary,
         usePointStyle: true,
         pointStyleWidth: 8,
-        font: { size: colors.chartFontSize },
+        font: { size: colors.value.chartFontSize },
         padding: 16,
       },
     },

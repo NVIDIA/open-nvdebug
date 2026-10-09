@@ -1,3 +1,18 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 import { describe, it, expect } from 'vitest'
 import { detectAnomalies, getAnomalySummary } from '@/composables/useAnomalyDetection'
 import type { Manifest } from '@/types/manifest'
@@ -23,7 +38,7 @@ function makeManifest(overrides: Partial<Manifest> = {}): Manifest {
       total_log_size: 0,
       total_runtime: 120,
       overall_collection_pct: 100,
-      status_counts: { success: 0, error: 0, partial: 0, skipped: 0, not_ran: 0 },
+      status_counts: { success: 0, degraded: 0, error: 0, partial: 0, skipped: 0, not_ran: 0 },
     },
     ...overrides,
   }
@@ -34,7 +49,7 @@ function makeDut(
   collectors: Array<{ id: string; time: number; status: string; files?: number; group?: string }>,
   logSize = 1024 * 1024,
 ) {
-  const statusCounts = { success: 0, error: 0, partial: 0, skipped: 0, not_ran: 0 }
+  const statusCounts = { success: 0, degraded: 0, error: 0, partial: 0, skipped: 0, not_ran: 0 }
   for (const c of collectors) {
     const key = c.status as keyof typeof statusCounts
     if (key in statusCounts) statusCounts[key]++
@@ -150,6 +165,29 @@ describe('useAnomalyDetection', () => {
     expect(missing.length).toBe(1)
   })
 
+  it('detects missing files on a degraded usable result', () => {
+    const dut = makeDut('DUT_1', [
+      { id: 'R001', time: 5, status: 'degraded', files: 0 },
+    ])
+    const anomalies = detectAnomalies(makeManifest({ duts: [dut] }))
+
+    expect(anomalies.filter(a => a.type === 'missing_files')).toEqual([
+      expect.objectContaining({ dutId: 'DUT_1', collectorId: 'R001' }),
+    ])
+  })
+
+  it('includes degraded results in the failure-rate denominator', () => {
+    const dut = makeDut('DUT_1', [
+      { id: 'R001', time: 5, status: 'error' },
+      { id: 'R002', time: 5, status: 'degraded' },
+      { id: 'R003', time: 5, status: 'degraded' },
+      { id: 'R004', time: 5, status: 'degraded' },
+    ])
+    const anomalies = detectAnomalies(makeManifest({ duts: [dut] }))
+
+    expect(anomalies.filter(a => a.type === 'high_failure_rate')).toEqual([])
+  })
+
   it('detects cross-DUT status inconsistency', () => {
     const duts = [
       makeDut('DUT_A', [{ id: 'R10', time: 2, status: 'success' }]),
@@ -162,6 +200,20 @@ describe('useAnomalyDetection', () => {
     expect(inconsistent.length).toBe(1)
     expect(inconsistent[0].dutId).toBe('DUT_C')
     expect(inconsistent[0].collectorId).toBe('R10')
+  })
+
+  it('detects a degraded result against successful peers', () => {
+    const duts = [
+      makeDut('DUT_A', [{ id: 'R10', time: 2, status: 'success' }]),
+      makeDut('DUT_B', [{ id: 'R10', time: 2, status: 'degraded' }]),
+    ]
+    const inconsistent = detectAnomalies(makeManifest({ duts }))
+      .filter(a => a.type === 'cross_dut_inconsistency')
+
+    expect(inconsistent).toEqual([
+      expect.objectContaining({ dutId: 'DUT_B', collectorId: 'R10' }),
+    ])
+    expect(inconsistent[0].description).toContain('was degraded')
   })
 
   it('detects abnormal log size', () => {

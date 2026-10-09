@@ -13,14 +13,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 """
 Spreadsheet utility functions for the NVDebug tool.
 
 Provides utilities for auto-detecting and working with collector definition
-spreadsheets including the Telemetry Catalog.
+spreadsheets including the Telemetry Catalog. Frozen executables deliberately
+retain the source workflow's relocatable catalog lookup instead of requiring a
+catalog beside the binary.
 """
 
+import base64
+import gzip
+import io
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -34,14 +41,117 @@ from .frozen_path import get_base_path, is_frozen
 
 _logger = logging.getLogger(__name__)
 
+# Excel stores at most 32,767 characters per cell. Large collector fields
+# (notably the Stages JSON for command-heavy collectors like S18) exceed this
+# and get silently truncated on write, producing unparseable JSON. To keep the
+# catalog self-sufficient — the generated YAML is NOT shipped to customers, so
+# the spreadsheet must round-trip on its own — oversized cells are stored
+# gzip+base64 encoded behind a sentinel prefix.
+EXCEL_CELL_CHAR_LIMIT = 32767
+_GZIP_CELL_PREFIX = "gzip+base64:"
+MAX_DECODED_CELL_BYTES = 16 * 1024 * 1024
+
+
+def encode_long_cell(text: str, limit: int = EXCEL_CELL_CHAR_LIMIT) -> str:
+    """
+    Encode long cell.
+
+    A GZIP header normally embeds the current time. These values are stored
+    inside the tracked XLSX catalog, so that timestamp made identical YAML
+    inputs produce different workbook bytes on every build. GzipFile with an
+    empty filename also emits the portable "unknown OS" byte (255), avoiding a
+    second platform-dependent header field.
+
+    Args:
+        text: Text supplied as text in the format accepted by this function.
+        limit: Numeric limit used while the operation performs bounded
+            accounting.
+
+    Returns:
+        The canonical long cell text.
+
+    Raises:
+        ValueError: If cell content exceeds the ``MAX_DECODED_CELL_BYTES``-byte
+            decode ceiling; or the supplied input cannot be used to encode long
+            cell.
+    """
+    if not isinstance(text, str) or len(text) <= limit:
+        return text
+    raw_text = text.encode("utf-8")
+    if len(raw_text) > MAX_DECODED_CELL_BYTES:
+        raise ValueError(
+            f"Cell content exceeds the {MAX_DECODED_CELL_BYTES}-byte decode ceiling"
+        )
+    # A GZIP header normally embeds the current time. These values are stored
+    # inside the tracked XLSX catalog, so that timestamp made identical YAML
+    # inputs produce different workbook bytes on every build. GzipFile with
+    # an empty filename also emits the portable "unknown OS" byte (255),
+    # avoiding a second platform-dependent header field.
+    compressed = io.BytesIO()
+    with gzip.GzipFile(
+        filename="", mode="wb", fileobj=compressed, mtime=0
+    ) as gzip_stream:
+        gzip_stream.write(raw_text)
+    encoded = _GZIP_CELL_PREFIX + base64.b64encode(compressed.getvalue()).decode(
+        "ascii"
+    )
+    if len(encoded) > limit:
+        raise ValueError(
+            f"Cell content is {len(text)} chars and {len(encoded)} chars even "
+            f"after compression, exceeding Excel's {limit}-char cell limit. "
+            "Split the collector definition into smaller pieces."
+        )
+    return encoded
+
+
+def decode_long_cell(value: str) -> str:
+    """
+    Decode long cell.
+
+    The implementation uses ``value`` to decode long cell. Parsing or I/O must
+    finish before the validated representation is made available to the caller.
+    Filesystem effects remain confined to the caller-selected paths and the
+    owning resource lifecycle. If the function cannot decode long cell, its
+    exception reaches the caller instead of being converted into a successful
+    result.
+
+    Args:
+        value: Text supplied as value in the format accepted by this function.
+
+    Returns:
+        The canonical long cell text.
+
+    Raises:
+        ValueError: If encoded catalog cell exceeds the Excel cell limit; or
+            decoded catalog cell exceeds ``MAX_DECODED_CELL_BYTES`` bytes.
+    """
+    if isinstance(value, str) and value.startswith(_GZIP_CELL_PREFIX):
+        encoded = value[len(_GZIP_CELL_PREFIX) :]
+        if len(value) > EXCEL_CELL_CHAR_LIMIT:
+            raise ValueError("Encoded catalog cell exceeds the Excel cell limit")
+        raw = base64.b64decode(encoded, validate=True)
+        with gzip.GzipFile(fileobj=io.BytesIO(raw), mode="rb") as stream:
+            decoded = stream.read(MAX_DECODED_CELL_BYTES + 1)
+        if len(decoded) > MAX_DECODED_CELL_BYTES:
+            raise ValueError(
+                f"Decoded catalog cell exceeds {MAX_DECODED_CELL_BYTES} bytes"
+            )
+        return decoded.decode("utf-8")
+    return value
+
 
 def _config_search_dirs() -> list[Path]:
-    """Return candidate config directories, ordered by priority.
+    """
+    Return candidate config directories, ordered by priority.
 
     Search order:
-      1. CWD/config (original behaviour)
-      2. Directory containing the binary + /config (frozen mode)
-      3. get_base_path()/config (frozen extraction dir)
+
+    1. CWD/config (original behaviour).
+    2. Directory containing the binary + /config (frozen mode).
+    3. get_base_path()/config (frozen extraction dir).
+
+    Returns:
+        The validated ``dirs``.
     """
     dirs = [Path("config")]
     if is_frozen():
@@ -58,16 +168,28 @@ def auto_detect_spreadsheet(
     spreadsheet: Optional[Path], suppress_print: bool = False
 ) -> Optional[Path]:
     """
-    Auto-detect the latest Telemetry Catalog spreadsheet in config directory.
+    Select an explicit catalog or discover the latest catalog version.
 
-    Uses version number parsing (e.g., v4.0 > v3.15) to find the highest version.
+    CLI and environment selections take precedence over version-based discovery.
+    Both source and frozen runtimes accept renamed or locally edited catalogs
+    without comparing their contents with a release manifest. Workbook validation
+    belongs to the consumers of the selected path.
 
     Args:
-        spreadsheet: Optional path to a spreadsheet
-        suppress_print: Whether to suppress print statements
+        spreadsheet: Explicit catalog path, or ``None`` to consult the environment
+            and then the standard configuration directories.
+        suppress_print: Whether to suppress the automatic-discovery message.
+
+    Returns:
+        The selected catalog path, or ``None`` when discovery finds no catalog.
+        Explicit paths are returned without checking their existence or contents.
     """
     if spreadsheet:
         return spreadsheet
+
+    environment_spreadsheet = os.environ.get("NVDEBUG_SPREADSHEET", "").strip()
+    if environment_spreadsheet:
+        return Path(environment_spreadsheet).expanduser()
 
     try:
         import re
@@ -125,26 +247,44 @@ def auto_detect_spreadsheet(
         return None
 
 
-def validate_spreadsheet_requirement(spreadsheet: Optional[Path]) -> None:
+def validate_spreadsheet_requirement(
+    spreadsheet: Optional[Path],
+    *,
+    json_output: bool = False,
+) -> None:
     """
-    Validate that a valid spreadsheet is available (always required in spreadsheet-only mode).
+    Validate spreadsheet requirement.
+
+    The implementation uses ``spreadsheet`` to validate spreadsheet requirement.
+    Every required invariant is checked before a successful value is returned;
+    invalid input follows the function's explicit exception path.
 
     Args:
-        spreadsheet: Optional path to a spreadsheet
+        spreadsheet: filesystem location used as the spreadsheet for this
+            operation.
+        json_output: Whether stdout is reserved for machine-readable output.
+
+    Raises:
+        SystemExit: If the function cannot validate spreadsheet requirement
+            safely.
     """
     if not spreadsheet or not spreadsheet.exists():
-        show_spreadsheet_requirement_message()
-        import sys
-
-        sys.exit(1)
+        if json_output:
+            create_sanitized_console().print_error(
+                "A Telemetry Catalog spreadsheet is required. Provide "
+                "--spreadsheet or install one in the config directory."
+            )
+        else:
+            show_spreadsheet_requirement_message()
+        raise SystemExit(2)
 
 
 def show_spreadsheet_requirement_message() -> None:
     """
     Display a beautiful rich console message about spreadsheet requirements.
 
-    Args:
-        None
+    The implementation uses current instance state to display a beautiful rich
+    console message about spreadsheet requirements.
     """
     sanitized_console = create_sanitized_console()
 

@@ -1,3 +1,20 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 <template>
   <div style="min-height: calc(100vh - 88px);">
     <!-- Sidebar -->
@@ -58,11 +75,15 @@
         <span class="ea-sev-badge ea-sev-badge--high">{{ severityCounts.high }} high</span>
         <span class="ea-sev-badge ea-sev-badge--medium">{{ severityCounts.medium }} medium</span>
         <span class="ea-sev-badge ea-sev-badge--low">{{ severityCounts.low }} low</span>
-        <span style="color: var(--nv-text-secondary); margin-left: 8px;">{{ clusters.length }} clusters from {{ filteredErrors.length }} errors</span>
+        <span style="color: var(--nv-text-secondary); margin-left: 8px;">{{ clusters.length }} clusters from {{ clusterResult.processedErrors }} errors</span>
       </div>
 
       <!-- Clustered view -->
       <div v-if="viewMode === 'clustered'">
+        <div v-if="clusterResult.omittedErrors > 0" class="ea-limit-notice nv-glass--accent">
+          Clustering is limited to the first {{ clusterResult.processedErrors.toLocaleString() }} errors to keep this report responsive.
+          {{ clusterResult.omittedErrors.toLocaleString() }} additional errors remain available in <strong>All Errors</strong> and can be narrowed with the DUT filter.
+        </div>
         <div v-if="clusters.length === 0" class="ea-empty-state nv-glass" style="border-radius: 12px;">
           <div class="ea-empty-state__icon">
             <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="var(--nv-success)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -82,12 +103,28 @@
               <span class="ea-empty-state__stat-label">Passed</span>
             </div>
             <div class="ea-empty-state__stat">
+              <span class="ea-empty-state__stat-value" style="color: var(--nv-warning);">{{ collectionBreakdown.degraded }}</span>
+              <span class="ea-empty-state__stat-label">Degraded</span>
+            </div>
+            <div class="ea-empty-state__stat">
               <span class="ea-empty-state__stat-value" style="color: var(--nv-warning);">{{ collectionBreakdown.partial }}</span>
               <span class="ea-empty-state__stat-label">Partial</span>
             </div>
             <div class="ea-empty-state__stat">
               <span class="ea-empty-state__stat-value" style="color: var(--nv-skipped, var(--nv-text-tertiary));">{{ collectionBreakdown.skipped }}</span>
               <span class="ea-empty-state__stat-label">Skipped</span>
+            </div>
+            <div class="ea-empty-state__stat">
+              <span class="ea-empty-state__stat-value" style="color: var(--nv-warning);">{{ collectionBreakdown.cancelled }}</span>
+              <span class="ea-empty-state__stat-label">Cancelled</span>
+            </div>
+            <div class="ea-empty-state__stat">
+              <span class="ea-empty-state__stat-value" style="color: var(--nv-info);">{{ collectionBreakdown.running }}</span>
+              <span class="ea-empty-state__stat-label">Running</span>
+            </div>
+            <div class="ea-empty-state__stat">
+              <span class="ea-empty-state__stat-value" style="color: var(--nv-text-tertiary);">{{ collectionBreakdown.pending }}</span>
+              <span class="ea-empty-state__stat-label">Pending</span>
             </div>
             <div class="ea-empty-state__stat">
               <span class="ea-empty-state__stat-value" style="color: var(--nv-text-tertiary);">{{ collectionBreakdown.notRan }}</span>
@@ -125,7 +162,7 @@
             </div>
 
             <div class="ea-cluster__entries">
-              <div v-for="(err, i) in cluster.entries" :key="i" class="ea-entry" @click="router.push(`/dut/${err.dut_id}/${err.collector_group}/${err.collector_id}`)">
+              <div v-for="(err, i) in cluster.entries" :key="i" class="ea-entry" @click="router.push(collectorDetailRoute(err.dut_id, err.collector_group, err.collector_id))">
                 <span class="ea-entry__dut">{{ err.dut_id }}</span>
                 <span class="ea-entry__cid">{{ err.collector_id }}</span>
                 <span class="ea-entry__msg"><ReasonDisplay :text="err.message" :compact="true" /></span>
@@ -142,7 +179,7 @@
           :data="filteredErrors"
           :searchable="true"
           :fill-viewport="true"
-          @row-click="(row: Record<string, any>) => router.push(`/dut/${row.dut_id}/${row.collector_group}/${row.collector_id}`)"
+          @row-click="(row: Record<string, any>) => router.push(collectorDetailRoute(row.dut_id, row.collector_group, row.collector_id))"
         >
           <template #cell-collector_group="{ value }">
             <ServiceBadge :service="value" />
@@ -166,7 +203,9 @@ import ServiceBadge from '@/components/common/ServiceBadge.vue'
 import Breadcrumbs from '@/components/common/Breadcrumbs.vue'
 import AnalysisNav from '@/components/common/AnalysisNav.vue'
 import ReasonDisplay from '@/components/common/ReasonDisplay.vue'
-import { clusterErrors, type ErrorCluster } from '@/composables/useErrorClustering'
+import { clusterErrorsWithStats, type ErrorCluster } from '@/composables/useErrorClustering'
+import { summarizeCollectorLifecycleCounts } from '@/utils/collectorLifecycle'
+import { collectorDetailRoute } from '@/utils/reportRoutes'
 
 const router = useRouter()
 const manifestStore = useManifestStore()
@@ -214,12 +253,14 @@ const filteredErrors = computed(() => {
   return base.filter(e => e.dut_id === dutFilter.value)
 })
 
-const clusters = computed<ErrorCluster[]>(() => {
-  const source = dutFilter.value
+const clusterSource = computed(() => {
+  return dutFilter.value
     ? manifestStore.errors.filter(e => e.dut_id === dutFilter.value)
     : manifestStore.errors
-  return clusterErrors(source)
 })
+
+const clusterResult = computed(() => clusterErrorsWithStats(clusterSource.value))
+const clusters = computed<ErrorCluster[]>(() => clusterResult.value.clusters)
 
 const severityCounts = computed(() => {
   const counts = { critical: 0, high: 0, medium: 0, low: 0 }
@@ -231,19 +272,38 @@ const collectionBreakdown = computed(() => {
   const targetDuts = dutFilter.value
     ? manifestStore.duts.filter(d => d.id === dutFilter.value)
     : manifestStore.duts
-  let success = 0, partial = 0, skipped = 0, notRan = 0, error = 0
-  for (const dut of targetDuts) {
-    success += dut.status_summary.success
-    partial += dut.status_summary.partial
-    skipped += dut.status_summary.skipped
-    notRan += dut.status_summary.not_ran ?? 0
-    error += dut.status_summary.error
+  const counts = {
+    success: 0,
+    degraded: 0,
+    error: 0,
+    partial: 0,
+    skipped: 0,
+    cancelled: 0,
+    running: 0,
+    pending: 0,
   }
-  return { success, partial, skipped, notRan, error, total: success + partial + skipped + error }
+  let notRan = 0
+  for (const dut of targetDuts) {
+    const summary = summarizeCollectorLifecycleCounts(dut.status_summary)
+    for (const status of Object.keys(counts) as Array<keyof typeof counts>) {
+      counts[status] += summary.counts[status]
+    }
+    notRan += dut.status_summary.not_ran ?? 0
+  }
+  const lifecycle = summarizeCollectorLifecycleCounts(counts)
+  return {
+    ...lifecycle.counts,
+    lifecycle,
+    notRan,
+    total: lifecycle.completedCount,
+  }
 })
 
 const emptyStateExplanation = computed(() => {
   const b = collectionBreakdown.value
+  if (b.lifecycle.state === 'in_progress') {
+    return `Collection is in progress: ${b.running} running, ${b.pending} pending; no collectors have completed.`
+  }
   if (b.total === 0 && b.notRan > 0) {
     return `All ${b.notRan} collectors were not executed. No errors are expected since nothing ran.`
   }
@@ -255,9 +315,14 @@ const emptyStateExplanation = computed(() => {
   }
   const parts: string[] = []
   if (b.success > 0) parts.push(`${b.success} succeeded`)
+  if (b.degraded > 0) parts.push(`${b.degraded} degraded`)
   if (b.skipped > 0) parts.push(`${b.skipped} skipped`)
   if (b.partial > 0) parts.push(`${b.partial} partial`)
-  return `${b.total} collector${b.total > 1 ? 's' : ''} executed: ${parts.join(', ')}. No error-level failures detected.`
+  if (b.cancelled > 0) parts.push(`${b.cancelled} cancelled`)
+  const active = b.lifecycle.activeCount > 0
+    ? ` ${b.running} running, ${b.pending} pending.`
+    : ''
+  return `${b.total} collector${b.total > 1 ? 's' : ''} completed: ${parts.join(', ')}. No error-level failures detected.${active}`
 })
 </script>
 
@@ -267,6 +332,14 @@ const emptyStateExplanation = computed(() => {
   padding: 0;
   overflow: hidden;
   border-radius: var(--nv-radius-lg);
+}
+.ea-limit-notice {
+  margin-bottom: 12px;
+  padding: 10px 14px;
+  border: 1px solid var(--nv-warning);
+  border-radius: var(--nv-radius-md);
+  color: var(--nv-text-secondary);
+  font-size: 0.75rem;
 }
 .ea-cluster--critical { border-left: 3px solid var(--nv-error); }
 .ea-cluster--high { border-left: 3px solid var(--nv-warning); }

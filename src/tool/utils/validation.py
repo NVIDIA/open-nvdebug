@@ -22,23 +22,45 @@ proper configuration and prevent invalid operations.
 """
 
 import os
+import re
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import yaml
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.text import Text
 
 from ..core.config_manager import ConfigurationManager
 from .console_output import create_sanitized_console
+from .logging import ensure_secure_log_directory
+from .redfish_topology_profile import (
+    RedfishTopologyProfileError,
+    validate_redfish_request_uri,
+)
 from .resources import find_config_files
+from .run_limits import MAX_DUTS
 
-MAX_DUTS = 500  # Maximum number of DUTs in a single collection run
+_PYDANTIC_INPUT_VALUE_RE = re.compile(
+    r"(input_value=)(.*?)(?=, input_type=|\]|$)", re.DOTALL
+)
 
 
 def _is_present_config_value(value: Any) -> bool:
-    """Return True for real configured values, ignoring mock placeholder attrs."""
+    """
+    Return True for real configured values, ignoring mock placeholder attrs.
+
+    The implementation uses ``value`` to produce True for real configured
+    values, ignoring mock placeholder attrs.
+
+    Args:
+        value: Value evaluated while performing true for real configured values,
+            ignoring mock placeholder attrs.
+
+    Returns:
+        Whether the true for real configured values, ignoring mock placeholder
+        attrs operation succeeds.
+    """
     if type(value).__module__.startswith("unittest.mock"):
         return False
     return bool(value)
@@ -48,12 +70,20 @@ def validate_dut_count(dut_configs: list, max_duts: int = MAX_DUTS) -> None:
     """
     Raise ValueError if too many DUTs configured.
 
+    The implementation uses ``dut_configs`` and ``max_duts`` to raise ValueError
+    if too many DUTs configured. If the function cannot raise ValueError if too
+    many DUTs configured, its exception reaches the caller instead of being
+    converted into a successful result.
+
     Args:
-        dut_configs: List of DUT configurations
-        max_duts: Maximum allowed number of DUTs
+        dut_configs: DUT configs governing raise ValueError if too many DUTs
+            configured.
+        max_duts: Upper bound enforced for max duts; the consuming boundary
+            rejects or truncates values that exceed it.
 
     Raises:
-        ValueError: If the number of DUTs exceeds max_duts
+        ValueError: If the supplied input cannot be used to raise ValueError if
+            too many DUTs configured.
     """
     if len(dut_configs) > max_duts:
         raise ValueError(
@@ -63,28 +93,49 @@ def validate_dut_count(dut_configs: list, max_duts: int = MAX_DUTS) -> None:
         )
 
 
-def validate_redfish_uri(uri: str, expected_host: str = None) -> bool:
+def validate_redfish_uri(
+    uri: str,
+    expected_host: str = None,
+    expected_port: Optional[int] = None,
+) -> bool:
     """
     Validate that a Redfish URI is safe to follow.
 
     Rejects:
-    - Absolute URLs pointing to different hosts (SSRF via nextLink)
-    - Non-http(s) schemes (file://, gopher://, etc.)
-    - URIs with path traversal (../)
+
+    - Absolute URLs pointing to different hosts (SSRF via nextLink).
+    - Non-http(s) schemes (file://, gopher://, etc.).
+    - URIs with path traversal (../).
 
     Accepts:
-    - Relative URIs starting with / (standard Redfish paths)
-    - Absolute URLs matching expected_host
+
+    - Relative URIs starting with / (standard Redfish paths).
+    - Absolute URLs matching expected_host and, when supplied, expected_port.
+
+    Args:
+        uri: Validated remote resource identifier used for URI.
+        expected_host: Optional expected host; ``None`` selects the function's
+            default behavior.
+        expected_port: Optional expected port; ``None`` selects the function's
+            default behavior.
+
+    Returns:
+        The normalized Redfish URI returned by the shared host and scheme
+        validator.
     """
     from urllib.parse import urlparse
 
     if not uri or not isinstance(uri, str):
         return False
 
-    # Relative URIs are safe (they'll be resolved against the BMC host)
+    # Relative request targets must obey the same path/query grammar enforced
+    # at the transport boundary. This rejects network-path references,
+    # traversal (including percent-encoded forms), fragments, controls, and
+    # malformed escapes while retaining standard Redfish pagination queries.
     if uri.startswith("/"):
-        # Check for path traversal
-        if "/../" in uri or uri.endswith("/.."):
+        try:
+            validate_redfish_request_uri(uri, context="Redfish response URI")
+        except (RedfishTopologyProfileError, TypeError, ValueError):
             return False
         return True
 
@@ -94,20 +145,43 @@ def validate_redfish_uri(uri: str, expected_host: str = None) -> bool:
     except Exception:
         return False
 
-    # Only allow http/https schemes
-    if parsed.scheme and parsed.scheme.lower() not in ("http", "https"):
+    # Accessing hostname/port can raise for malformed bracketed hosts,
+    # non-numeric ports, and ports outside the TCP range. Reject those
+    # authorities even when the caller did not request an explicit port bind.
+    try:
+        parsed_host = parsed.hostname
+        parsed_port = parsed.port
+    except ValueError:
+        return False
+    if parsed_port is not None and not 1 <= parsed_port <= 65535:
         return False
 
-    # If it has a host, it must match expected_host
-    if parsed.hostname and expected_host:
-        if parsed.hostname.lower() != expected_host.lower():
+    # Only allow fully-qualified HTTP(S) URLs whose host is explicitly bound.
+    if parsed.scheme.lower() not in ("http", "https") or not parsed_host:
+        return False
+
+    if not isinstance(expected_host, str) or not expected_host:
+        return False
+    if parsed_host.lower() != expected_host.lower():
+        return False
+
+    if expected_port is not None:
+        if type(expected_port) is not int or not 1 <= expected_port <= 65535:
+            return False
+        effective_port = parsed_port
+        if effective_port is None:
+            effective_port = 443 if parsed.scheme.lower() == "https" else 80
+        if effective_port != expected_port:
             return False
 
-    # Reject if it has a host but no expected_host to compare against
-    if parsed.hostname and not expected_host:
+    try:
+        validate_redfish_request_uri(
+            parsed.path + (f"?{parsed.query}" if parsed.query else ""),
+            context="absolute Redfish response URI",
+        )
+    except (RedfishTopologyProfileError, TypeError, ValueError):
         return False
-
-    return True
+    return not parsed.fragment and parsed.username is None and parsed.password is None
 
 
 def validate_dut_config_requirements(
@@ -119,14 +193,20 @@ def validate_dut_config_requirements(
     """
     Validate that proper DUT configuration is provided.
 
+    Check if we have any configuration method dut_config can be either a Path
+    object (from file) or a DUTConfig object (from CLI).
+
     Args:
-        dut_config: Path to DUT config file (can be auto-detected) or DUTConfig object
-        local: Whether running in local mode
-        cli_credentials: Dictionary of CLI credential arguments
-        ansible_inventory: Path to Ansible inventory file
+        dut_config: filesystem location used as the DUT config for this
+            operation.
+        local: Whether local is enabled or required for this operation.
+        cli_credentials: Sensitive value supplied through the approved input
+            boundary and never logged.
+        ansible_inventory: Optional filesystem location used as the ansible
+            inventory for this operation.
 
     Returns:
-        Tuple of (is_valid, list_of_errors)
+        A tuple containing ``comparison flag`` and ``errors`` in that order.
     """
     errors = []
 
@@ -196,20 +276,23 @@ def validate_connection_parameters(
     dut_config: Optional[Union[Path, Any]] = None,
 ) -> Tuple[bool, List[str]]:
     """
-    Validate that at least one set of connection parameters (BMC or Host IP) is provided when not in local mode.
+    Validate connection parameters.
 
-    This can come from CLI arguments or from a DUT config file.
-
-    Note: This only validates the presence of connection parameters, not their validity.
-    Preflight checks will handle testing the actual connections.
+    The implementation uses ``cli_credentials``, ``local``, and ``dut_config``
+    to validate connection parameters. Every required invariant is checked
+    before a successful value is returned; invalid input follows the function's
+    explicit exception path. Filesystem effects remain confined to the
+    caller-selected paths and the owning resource lifecycle.
 
     Args:
-        cli_credentials (Dict[str, Any]): Dictionary of CLI credential arguments.
-        local (bool): Whether running in local mode.
-        dut_config (Optional[Union[Path, Any]]): DUT config file path or DUTConfig object.
+        cli_credentials: Sensitive value supplied through the approved input
+            boundary and never logged.
+        local: Whether local is enabled or required for this operation.
+        dut_config: Optional filesystem location used as the DUT config for this
+            operation.
 
-        Returns:
-            Tuple of (is_valid, list_of_errors)
+    Returns:
+        A tuple containing ``outcome flag`` and ``errors`` in that order.
     """
     errors = []
 
@@ -231,8 +314,16 @@ def validate_connection_parameters(
         if hasattr(dut_config, "exists") and dut_config.exists():
             # It's a Path object - load and check the file
             try:
-                with open(dut_config, "r") as f:
-                    config_data = yaml.safe_load(f)
+                # Import locally to avoid a module-load cycle while still using
+                # the same bounded, duplicate-key-rejecting loader as the main
+                # DUT configuration path.
+                from ..config import load_yaml_strict
+
+                with open(dut_config, "r", encoding="utf-8") as f:
+                    config_data = load_yaml_strict(f) or {}
+                if not isinstance(config_data, dict):
+                    errors.append("DUT config must contain a YAML mapping")
+                    config_data = {}
 
                 # Check for IP addresses in DUT config
                 # First check DUT_Defaults (global defaults)
@@ -323,22 +414,24 @@ def validate_credentials_completeness(
     """
     Validate that credentials are complete when provided via CLI.
 
-    Note: This only validates CLI credentials completeness. DUT config file credentials
-    are validated by the connection parameters validation.
+    Note: This only validates CLI credentials completeness. DUT config file
+    credentials are validated by the connection parameters validation.
 
     When a DUT config file is provided and we are not in CLI mode, partial CLI
-    credentials are allowed (merged with file). In CLI mode (DUT built from CLI args
-    only), all three BMC (or Host) credentials are required when any is provided.
+    credentials are allowed (merged with file). In CLI mode (DUT built from CLI
+    args only), all three BMC (or Host) credentials are required when any is
+    provided.
 
     Args:
-        cli_credentials: Dictionary of CLI credential arguments
-        local: Whether running in local mode
-        dut_config: Optional DUT config file path or list of DUTConfig. If provided
-                    and not cli_mode, partial CLI credentials are allowed.
-        cli_mode: If True, DUT was built from CLI only — require complete credentials.
+        cli_credentials: Sensitive value supplied through the approved input
+            boundary and never logged.
+        local: Whether local is enabled or required for this operation.
+        dut_config: Optional filesystem location used as the DUT config for this
+            operation.
+        cli_mode: Whether CLI mode is enabled or required for this operation.
 
     Returns:
-        Tuple of (is_valid, list_of_errors)
+        A tuple containing ``outcome flag`` and ``errors`` in that order.
     """
     errors = []
 
@@ -353,8 +446,10 @@ def validate_credentials_completeness(
     bmc_ip = cli_credentials.get("bmc_ip")
     bmc_user = cli_credentials.get("bmc_user")
     bmc_ssh_user = cli_credentials.get("bmc_ssh_user")
+    bmc_rf_user = cli_credentials.get("bmc_rf_user")
     bmc_pass = cli_credentials.get("bmc_pass")
     bmc_ssh_pass = cli_credentials.get("bmc_ssh_pass")
+    bmc_rf_pass = cli_credentials.get("bmc_rf_pass")
     bmc_ssh_key_path = cli_credentials.get("bmc_ssh_key_path")
     bmc_ssh_passwordless = cli_credentials.get("bmc_ssh_passwordless")
     host_ip = cli_credentials.get("host_ip")
@@ -370,17 +465,27 @@ def validate_credentials_completeness(
     hmc_ssh_key_path = cli_credentials.get("hmc_ssh_key_path")
     hmc_ssh_passwordless = cli_credentials.get("hmc_ssh_passwordless")
 
-    bmc_has_user = bool(bmc_ssh_user or bmc_user)
-    bmc_has_auth = bool(
+    bmc_ssh_has_user = bool(bmc_ssh_user or bmc_user)
+    bmc_ssh_has_auth = bool(
         bmc_ssh_key_path or bmc_ssh_passwordless or bmc_ssh_pass or bmc_pass
     )
+    bmc_rf_has_user = bool(bmc_rf_user or bmc_user)
+    bmc_rf_has_auth = bool(bmc_rf_pass or bmc_pass)
+    bmc_has_user = bmc_ssh_has_user or bmc_rf_has_user
+    bmc_has_auth = bmc_ssh_has_auth or bmc_rf_has_auth
     host_has_auth = bool(host_ssh_key_path or host_ssh_passwordless or host_pass)
     hmc_has_user = bool(hmc_ssh_user or hmc_user)
     hmc_has_auth = bool(
         hmc_ssh_key_path or hmc_ssh_passwordless or hmc_ssh_pass or hmc_pass
     )
 
-    bmc_complete = bool(bmc_ip and bmc_has_user and bmc_has_auth)
+    bmc_complete = bool(
+        bmc_ip
+        and (
+            (bmc_ssh_has_user and bmc_ssh_has_auth)
+            or (bmc_rf_has_user and bmc_rf_has_auth)
+        )
+    )
     host_complete = bool(host_ip and host_user and host_has_auth)
     hmc_complete = bool(hmc_ip and hmc_has_user and hmc_has_auth)
     # If at least one set (BMC, Host, or HMC) is complete, allow collection to continue
@@ -395,8 +500,10 @@ def validate_credentials_completeness(
                     bmc_ip,
                     bmc_user,
                     bmc_ssh_user,
+                    bmc_rf_user,
                     bmc_pass,
                     bmc_ssh_pass,
+                    bmc_rf_pass,
                     bmc_ssh_key_path,
                     bmc_ssh_passwordless,
                 ]
@@ -408,15 +515,21 @@ def validate_credentials_completeness(
             if not bmc_ip:
                 missing_bmc.append("--bmc-ip")
             if not bmc_has_user:
-                missing_bmc.append("--bmc-user or --bmc-ssh-user")
+                missing_bmc.append("--bmc-user, --bmc-ssh-user, or --bmc-rf-user")
             if not bmc_has_auth:
                 missing_bmc.append(
-                    "--bmc-pass, --bmc-ssh-pass, --bmc-ssh-key-path, or --bmc-ssh-passwordless"
+                    "--bmc-pass, --bmc-ssh-pass, --bmc-rf-pass, "
+                    "--bmc-ssh-key-path, or --bmc-ssh-passwordless"
+                )
+            if not missing_bmc and not bmc_complete:
+                missing_bmc.append(
+                    "a matching username and authentication option for the "
+                    "same BMC SSH or Redfish transport"
                 )
             if missing_bmc:
                 errors.append(
                     f"Incomplete BMC credentials. Missing: {', '.join(missing_bmc)}.\n"
-                    "  • Please provide BMC IP, a BMC/SSH username, and either a password, SSH key path, or passwordless SSH"
+                    "  • Please provide BMC IP, a BMC/SSH/Redfish username, and either a password, SSH key path, or passwordless SSH"
                 )
 
         if (
@@ -486,12 +599,19 @@ def validate_collector_ids(
     """
     Validate that specified collector IDs exist and are valid.
 
+    The implementation uses ``collector_ids`` and ``config_manager`` to validate
+    that specified collector IDs exist and are valid. Every required invariant
+    is checked before a successful value is returned; invalid input follows the
+    function's explicit exception path.
+
     Args:
-        collector_ids: Comma or space separated collector IDs
-        config_manager: Configuration manager instance
+        collector_ids: Text supplied as collector identifiers in the format
+            accepted by this function.
+        config_manager: Config manager governing that specified collector IDs
+            exist and are valid.
 
     Returns:
-        Tuple of (is_valid, list_of_errors)
+        A tuple containing ``outcome flag`` and ``errors`` in that order.
     """
     errors = []
 
@@ -532,12 +652,19 @@ def validate_collector_groups(
     """
     Validate that specified collector groups exist and are valid.
 
+    The implementation uses ``collector_groups`` and ``config_manager`` to
+    validate that specified collector groups exist and are valid. Every required
+    invariant is checked before a successful value is returned; invalid input
+    follows the function's explicit exception path.
+
     Args:
-        collector_groups: List of collector group names
-        config_manager: Configuration manager instance
+        collector_groups: Entries supplied as ``collector_groups`` without
+            transferring container ownership.
+        config_manager: Config manager governing that specified collector groups
+            exist and are valid.
 
     Returns:
-        Tuple of (is_valid, list_of_errors)
+        A tuple containing ``outcome flag`` and ``errors`` in that order.
     """
     errors = []
 
@@ -567,14 +694,18 @@ def validate_collector_mutual_exclusion(
     collector_ids: Optional[str], collector_groups: Optional[List[str]]
 ) -> Tuple[bool, List[str]]:
     """
-    Validate that collector IDs and groups are not used inappropriately together.
+    Validate collector mutual exclusion.
+
+    Parse collector IDs to check for group conflicts.
 
     Args:
-        collector_ids: Comma or space separated collector IDs
-        collector_groups: List of collector group names
+        collector_ids: Text supplied as collector identifiers in the format
+            accepted by this function.
+        collector_groups: Entries supplied as ``collector_groups`` without
+            transferring container ownership.
 
     Returns:
-        Tuple of (is_valid, list_of_errors)
+        A tuple containing ``outcome flag`` and ``errors`` in that order.
     """
     errors = []
 
@@ -628,11 +759,17 @@ def validate_collection_level(collection_level: str) -> Tuple[bool, List[str]]:
     """
     Validate that the collection level is valid.
 
+    The implementation uses ``collection_level`` to validate that the collection
+    level is valid. Every required invariant is checked before a successful
+    value is returned; invalid input follows the function's explicit exception
+    path.
+
     Args:
-        collection_level: Collection level string
+        collection_level: Text supplied as collection level in the format
+            accepted by this function.
 
     Returns:
-        Tuple of (is_valid, list_of_errors)
+        A tuple containing ``comparison flag`` and ``errors`` in that order.
     """
     errors = []
 
@@ -648,26 +785,72 @@ def validate_collection_level(collection_level: str) -> Tuple[bool, List[str]]:
     return len(errors) == 0, errors
 
 
-def validate_output_directory(output_dir: Path) -> Tuple[bool, List[str]]:
+def validate_output_directory(
+    output_dir: Path,
+    *,
+    shared_read: bool = False,
+    repair_existing_permissions: bool = False,
+    allow_sticky_run_parent: bool = False,
+    allow_external_path_owners: bool = False,
+) -> Tuple[bool, List[str]]:
     """
     Validate that the output directory is accessible and writable.
 
+    The secure directory creator applies an exact mode to every missing path
+    component before a write probe runs. Timestamped collection callers can
+    also repair recoverable trusted-owner permissions in parent-to-child order,
+    preserving automation compatibility without accepting replaceable path
+    components.
+
     Args:
-        output_dir: Output directory path
+        output_dir: filesystem location used as the output dir for this
+            operation.
+        shared_read: Whether newly created components must remain traversable
+            and readable by a separate read-only report server.
+        repair_existing_permissions: Whether safely recoverable trusted-owner
+            permissions should be secured before the write probe.
+        allow_sticky_run_parent: Whether a trusted sticky shared directory may
+            be validated as the parent of a private timestamped run directory.
+        allow_external_path_owners: Whether the collection output boundary may
+            trust safe or sticky existing components owned by another UID.
 
     Returns:
-        Tuple of (is_valid, list_of_errors)
+        A tuple containing ``comparison flag`` and ``errors`` in that order.
     """
     errors = []
+    permission_repairs: list[tuple[Path, int, int]] = []
 
     try:
-        # Check if directory exists or can be created
-        output_dir.mkdir(parents=True, exist_ok=True)
+        # Create missing components through the same no-follow, descriptor-
+        # pinned policy used by collection startup.
+        ensure_secure_log_directory(
+            os.fspath(output_dir),
+            shared_read=shared_read,
+            repair_existing_permissions=(shared_read or repair_existing_permissions),
+            allow_sticky_run_parent=allow_sticky_run_parent,
+            permission_repairs=permission_repairs,
+            allow_external_path_owners=allow_external_path_owners,
+        )
+        if permission_repairs:
+            console = create_sanitized_console()
+            for component_path, previous_mode, repaired_mode in permission_repairs:
+                console.print_warning(
+                    "Warning: secured existing output-path permissions and "
+                    f"continued: '{component_path}' "
+                    f"({previous_mode:04o} -> {repaired_mode:04o})"
+                )
 
-        # Check if directory is writable
-        test_file = output_dir / ".test_write"
-        test_file.write_text("test")
-        test_file.unlink()
+        # Probe through an exclusively created private file so a trusted sticky
+        # shared output base such as /tmp remains usable without touching a
+        # caller- or attacker-selected name.
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=output_dir,
+            prefix=".nvdebug-write-test-",
+        ) as test_file:
+            test_file.write("test")
+            test_file.flush()
 
     except PermissionError:
         errors.append(
@@ -696,24 +879,51 @@ def run_comprehensive_validation(
     config_manager: Optional[ConfigurationManager] = None,
     ansible_inventory: Optional[Path] = None,
     cli_mode: bool = False,
+    output_shared_read: bool = False,
+    output_repair_existing_permissions: bool = False,
+    output_allow_sticky_run_parent: bool = False,
+    output_allow_external_path_owners: bool = False,
 ) -> Tuple[bool, List[str]]:
     """
     Run comprehensive validation for the collect command.
 
+    The implementation uses ``dut_config``, ``local``, ``cli_credentials``,
+    ``collector_ids``, and ``collector_groups`` to run comprehensive validation
+    for the collect command. Terminal status is emitted only after comprehensive
+    validation for the collect command and its owned cleanup have completed.
+
     Args:
-        dut_config: Path to DUT config file or list of DUT configs
-        local: Whether running in local mode
-        cli_credentials: Dictionary of CLI credential arguments
-        collector_ids: Comma or space separated collector IDs
-        collector_groups: List of collector group names
-        collection_level: Collection level string
-        output_dir: Output directory path
-        config_manager: Configuration manager instance (optional)
-        ansible_inventory: Optional ansible inventory path
-        cli_mode: If True, DUT(s) were built from CLI only; require complete credentials.
+        dut_config: filesystem location used as the DUT config for this
+            operation.
+        local: Whether local is enabled or required for this operation.
+        cli_credentials: Sensitive value supplied through the approved input
+            boundary and never logged.
+        collector_ids: Text supplied as collector identifiers in the format
+            accepted by this function.
+        collector_groups: Entries supplied as ``collector_groups`` without
+            transferring container ownership.
+        collection_level: Text supplied as collection level in the format
+            accepted by this function.
+        output_dir: filesystem location used as the output dir for this
+            operation.
+        config_manager: Optional Config manager governing comprehensive
+            validation for the collect command.
+        ansible_inventory: Optional filesystem location used as the ansible
+            inventory for this operation.
+        cli_mode: Whether CLI mode is enabled or required for this operation.
+        output_shared_read: Whether validation should create an explicitly
+            selected output namespace for read-only report-server access.
+        output_repair_existing_permissions: Whether validation should secure
+            recoverable trusted-owner output permissions before writing.
+        output_allow_sticky_run_parent: Whether the collection lifecycle will
+            create a private timestamped run leaf beneath a trusted sticky
+            shared output parent.
+        output_allow_external_path_owners: Whether the collection output
+            boundary may trust safe or sticky existing components owned by
+            another UID.
 
     Returns:
-        Tuple of (is_valid, list_of_errors)
+        A tuple containing ``comparison flag`` and ``all errors`` in that order.
     """
     all_errors = []
 
@@ -740,7 +950,13 @@ def run_comprehensive_validation(
     all_errors.extend(errors)
 
     # Validate output directory
-    is_valid, errors = validate_output_directory(output_dir)
+    is_valid, errors = validate_output_directory(
+        output_dir,
+        shared_read=output_shared_read,
+        repair_existing_permissions=output_repair_existing_permissions,
+        allow_sticky_run_parent=output_allow_sticky_run_parent,
+        allow_external_path_owners=output_allow_external_path_owners,
+    )
     all_errors.extend(errors)
 
     # Validate collector IDs if config manager is available
@@ -765,8 +981,12 @@ def display_validation_errors(errors: List[str]) -> None:
     """
     Display validation errors in a visually appealing format using Rich console.
 
+    The implementation uses ``errors`` to display validation errors in a
+    visually appealing format using Rich console.
+
     Args:
-        errors: List of error messages
+        errors: Entries supplied as ``errors`` without transferring container
+            ownership.
     """
     from rich.panel import Panel
     from rich.rule import Rule
@@ -851,13 +1071,23 @@ def display_validation_errors(errors: List[str]) -> None:
 
 def display_dut_config_error(error_message: str) -> None:
     """
-    Display DUT configuration errors in a visually appealing format using Rich console.
+    Display DUT config error.
+
+    Pydantic embeds rejected values in validation text before the run's
+    exact-value sanitizer exists. Strip every such value structurally because
+    any configuration field can be credential-bearing.
 
     Args:
-        error_message: The error message to display
+        error_message: Text supplied as error message in the format accepted by
+            this function.
     """
 
     console = create_sanitized_console()
+
+    # Pydantic embeds rejected values in validation text before the run's
+    # exact-value sanitizer exists. Strip every such value structurally because
+    # any configuration field can be credential-bearing.
+    error_message = _PYDANTIC_INPUT_VALUE_RE.sub(r"\1<redacted>", str(error_message))
 
     # Create the main error panel with enhanced styling
     error_panel = Panel(

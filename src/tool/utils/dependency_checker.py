@@ -15,7 +15,7 @@
 # limitations under the License.
 
 """
-Dependency Checker for NVDebug Tool
+Dependency Checker for NVDebug Tool.
 
 This module provides functionality to check dependencies for collectors,
 including commands, files, services, and platform-specific requirements.
@@ -23,20 +23,63 @@ including commands, files, services, and platform-specific requirements.
 
 import inspect
 import os
+import re
+import shlex
 import subprocess
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional
+
+from .command_safety import (
+    TRUSTED_IPMITOOL_NOT_FOUND_MESSAGE,
+    TRUSTED_IPMITOOL_PATHS,
+    TRUSTED_PRIVILEGED_PATH,
+    build_remote_cmd,
+    build_trusted_ipmitool_remote_command,
+    build_trusted_remote_executable_probe,
+    resolve_trusted_ipmitool_path,
+)
+from .secret_env import scrubbed_subprocess_environment
+
+
+class _PrivilegedCommandContextError(ValueError):
+    """
+    Reject a privileged executable probe without its required Host route.
+
+    Direct prerequisite calls retain their ValueError contract. Collector-level
+    checks distinguish this unsupported context from malformed declarations and
+    report an unavailable dependency without executing a local privileged probe.
+    """
+
+
+def _run_subprocess(*args, **kwargs):
+    """
+    Run a dependency probe without exposing CLI-bound secrets.
+
+    After applying local validation, the function forwards ``args`` and
+    ``kwargs`` to ``subprocess.run`` and preserves its return and exception
+    contract. Terminal status is emitted only after dependency probe without
+    exposing CLI-bound secrets and its owned cleanup have completed.
+
+    Args:
+        args: Additional positional values forwarded in caller-provided order.
+        kwargs: Additional named values forwarded without changing their keys.
+
+    Returns:
+        The completed subprocess result produced with a scrubbed child
+        environment.
+    """
+    kwargs["env"] = scrubbed_subprocess_environment(kwargs.get("env"))
+    return subprocess.run(*args, **kwargs)
 
 
 class DependencyType(Enum):
     """
     Types of dependencies that can be checked.
 
-    Attributes:
-        COMMAND: Command dependency
-        FILE: File dependency
-        SERVICE: Service dependency
+    Its serialized members form a shared vocabulary for configuration, runtime
+    state, logs, and reports. Renaming or renumbering a member is therefore a
+    compatibility change.
     """
 
     COMMAND = "command"
@@ -52,13 +95,19 @@ class FallbackCheck:
     """
     Configuration for a fallback check.
 
+    The coherent record keeps ``type``, ``name``, ``success_indicators``,
+    ``optional``, and ``timeout`` together so consumers observe one fallback
+    check state. Consumers receive the fields as one unit instead of assembling
+    partial state.
+
     Attributes:
-        type: Type of the fallback check
-        name: Name of the fallback check
-        success_indicators: Success indicators for the fallback check
-        optional: Whether the fallback check is optional
-        timeout: Timeout for the fallback check
-        description: Description of the fallback check
+        type: Canonical text used as type.
+        name: Canonical text used as name.
+        success_indicators: Collection of success indicators entries retained by
+            this record.
+        optional: Whether optional applies to this record.
+        timeout: Numeric timeout retained by this record.
+        description: Canonical text used as description.
     """
 
     type: str  # "command", "file", "service"
@@ -74,9 +123,14 @@ class PlatformServiceConfig:
     """
     Configuration for platform-specific service checks.
 
+    The coherent record keeps ``default`` and ``platform_configs`` together so
+    consumers observe one platform service config state. Consumers receive the
+    fields as one unit instead of assembling partial state.
+
     Attributes:
-        default: Default configuration for the platform
-        platform_configs: Platform-specific configurations
+        default: Mapping that retains the default fields for this record.
+        platform_configs: Mapping that retains the platform configs fields for
+            this record.
     """
 
     default: Dict[str, Any]
@@ -88,15 +142,23 @@ class DependencyResult:
     """
     Result of a dependency check.
 
+    The coherent record keeps ``name``, ``type``, ``available``, ``version``,
+    and ``error_message`` together so consumers observe one dependency state.
+    Consumers receive the fields as one unit instead of assembling partial
+    state.
+
     Attributes:
-        name: Name of the dependency
-        type: Type of the dependency
-        available: Whether the dependency is available
-        version: Version of the dependency
-        error_message: Error message for the dependency
-        install_instructions: Installation instructions for the dependency
-        fallback_results: Fallback results for the dependency
-        platform: Platform where the dependency was checked
+        name: Canonical text used as name.
+        type: Type retained as part of the record's public state.
+        available: Whether available applies to this record.
+        version: Canonical text used as version.
+        error_message: Canonical text used as error message.
+        install_instructions: Canonical text used as install instructions.
+        fallback_results: Collection of fallback results entries retained by
+            this record.
+        platform: Canonical text used as platform.
+        probe_failed: Whether lookup itself failed, rather than establishing
+            that the dependency is unavailable.
     """
 
     name: str
@@ -107,6 +169,7 @@ class DependencyResult:
     install_instructions: Optional[str] = None
     fallback_results: Optional[List["DependencyResult"]] = None  # For fallback groups
     platform: Optional[str] = None  # Platform where check was performed
+    probe_failed: bool = False
 
 
 @dataclass
@@ -114,15 +177,26 @@ class DependencyCheckResult:
     """
     Result of checking all dependencies for a collector.
 
+    The coherent record keeps ``collector_id``, ``collector_name``,
+    ``all_required_available``, ``required_dependencies``, and
+    ``optional_dependencies`` together so consumers observe one dependency check
+    state. Consumers receive the fields as one unit instead of assembling
+    partial state.
+
     Attributes:
-        collector_id: ID of the collector
-        collector_name: Name of the collector
-        all_required_available: Whether all required dependencies are available
-        required_dependencies: Required dependencies
-        optional_dependencies: Optional dependencies
-        missing_required: Missing required dependencies
-        missing_optional: Missing optional dependencies
-        warnings: Warnings
+        collector_id: Canonical text used as collector identifier.
+        collector_name: Canonical text used as collector name.
+        all_required_available: Whether all required available applies to this
+            record.
+        required_dependencies: Collection of required dependencies entries
+            retained by this record.
+        optional_dependencies: Collection of optional dependencies entries
+            retained by this record.
+        missing_required: Collection of missing required entries retained by
+            this record.
+        missing_optional: Collection of missing optional entries retained by
+            this record.
+        warnings: Collection of warnings entries retained by this record.
     """
 
     collector_id: str
@@ -139,16 +213,24 @@ class DependencyChecker:
     """
     Main dependency checker class with DUT awareness.
 
-    Attributes:
-        dut_manager: DUT manager for remote command execution
+    The type coordinates ``set_dut_manager``, ``check_command``,
+    ``_check_command_local``, ``_check_command_on_dut``, and ``check_file`` and
+    retains the state those operations share between calls. Resource ownership
+    remains inside the instance until the matching close, exit, or cleanup
+    operation completes.
     """
 
     def __init__(self, dut_manager=None) -> None:
         """
         Initialize the dependency checker.
 
+        The initializer records ``_cache`` and ``dut_manager`` for later
+        operations and establishes the instance invariants before any public
+        method runs.
+
         Args:
-            dut_manager: DUT manager for remote command execution
+            dut_manager: Optional DUT manager; ``None`` selects the function's
+                default behavior.
         """
         self._cache: Dict[str, DependencyResult] = {}
         self.dut_manager = dut_manager
@@ -157,8 +239,13 @@ class DependencyChecker:
         """
         Set the DUT manager for remote command execution.
 
+        The implementation uses ``dut_manager`` to set the DUT manager for
+        remote command execution. It updates ``dut_manager`` on the instance as
+        part of that state transition.
+
         Args:
-            dut_manager: DUT manager for remote command execution
+            dut_manager: DUT manager consumed while the function attempts to set
+                the DUT manager for remote command execution.
         """
         self.dut_manager = dut_manager
 
@@ -168,10 +255,21 @@ class DependencyChecker:
         """
         Check if a command is available (locally or on DUT if specified).
 
+        The implementation uses ``command``, ``dut_id``, and ``check_local`` to
+        check if a command is available (locally or on DUT if specified). Every
+        required invariant is checked before a successful value is returned;
+        invalid input follows the function's explicit exception path.
+
         Args:
-            command: Command to check
-            dut_id: ID of the DUT to check
-            check_local: Whether to check locally
+            command: Text supplied as command in the format accepted by this
+                function.
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+            check_local: Whether check local is enabled or required for this
+                operation.
+
+        Returns:
+            A ``DependencyResult`` representing command.
         """
         # If check_local is True, always check locally regardless of dut_id
         if check_local:
@@ -201,8 +299,17 @@ class DependencyChecker:
         """
         Check if a command is available locally.
 
+        The implementation uses ``command`` to check if a command is available
+        locally. Every required invariant is checked before a successful value
+        is returned; invalid input follows the function's explicit exception
+        path.
+
         Args:
-            command: Command to check
+            command: Text supplied as command in the format accepted by this
+                function.
+
+        Returns:
+            A ``DependencyResult`` representing command local.
         """
         cache_key = f"command:{command}"
 
@@ -210,14 +317,31 @@ class DependencyChecker:
             return self._cache[cache_key]
 
         try:
-            result = subprocess.run(
+            if command == "ipmitool":
+                resolved_path = resolve_trusted_ipmitool_path()
+                dependency_result = DependencyResult(
+                    type=DependencyType.COMMAND,
+                    name=command,
+                    available=resolved_path is not None,
+                    version=None,
+                    error_message=(
+                        None
+                        if resolved_path is not None
+                        else TRUSTED_IPMITOOL_NOT_FOUND_MESSAGE
+                    ),
+                )
+                self._cache[cache_key] = dependency_result
+                return dependency_result
+
+            result = _run_subprocess(
                 ["which", command],
                 capture_output=True,
                 text=True,
                 timeout=10,
             )
 
-            if result.returncode == 0:
+            resolved_path = (result.stdout or "").strip()
+            if result.returncode == 0 and resolved_path:
                 dependency_result = DependencyResult(
                     type=DependencyType.COMMAND,
                     name=command,
@@ -231,7 +355,11 @@ class DependencyChecker:
                     name=command,
                     available=False,
                     version=None,
-                    error_message=f"Command '{command}' not found in PATH",
+                    error_message=(
+                        f"Command '{command}' not found in PATH"
+                        if result.returncode != 0
+                        else f"Command '{command}' lookup returned no resolved path"
+                    ),
                 )
 
             self._cache[cache_key] = dependency_result
@@ -249,19 +377,40 @@ class DependencyChecker:
             return dependency_result
 
     async def _check_command_on_dut(
-        self, dut_id: str, command: str, use_bmc: bool = False
+        self,
+        dut_id: str,
+        command: str,
+        use_bmc: bool = False,
+        *,
+        use_sudo: bool = False,
     ) -> DependencyResult:
         """
         Check if a command is available on a specific DUT.
 
+        Fallback to local check if no DUT manager available.
+
         Args:
-            dut_id: ID of the DUT to check
-            command: Command to check
-            use_bmc: Whether to use BMC connection
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+            command: Text supplied as command in the format accepted by this
+                function.
+            use_bmc: Whether use BMC is enabled or required for this operation.
+            use_sudo: Check Host executable access with the same privilege as
+                the collector. Privileged results use a separate cache entry.
+
+        Returns:
+            A ``DependencyResult`` representing command on DUT.
+
+        Raises:
+            ValueError: If privileged lookup is requested on the BMC transport.
         """
         cache_key = f"dut_command:{dut_id}:{command}"
         if use_bmc:
             cache_key = f"dut_bmc_command:{dut_id}:{command}"
+        if use_sudo:
+            if use_bmc:
+                raise ValueError("Privileged executable probes require a Host target")
+            cache_key += ":sudo"
 
         if cache_key in self._cache:
             return self._cache[cache_key]
@@ -271,19 +420,41 @@ class DependencyChecker:
             return self._check_command_local(command)
 
         try:
-            # Use DUT manager to execute 'which' command on the remote DUT
+            # ipmitool has a stricter contract than generic dependencies: only
+            # project-reviewed absolute locations may be selected. Other
+            # dependencies use the shared trusted system PATH rather than the
+            # remote login account's potentially restricted PATH.
+            is_ipmitool = command == "ipmitool"
+            if is_ipmitool:
+                probe_command = build_trusted_ipmitool_remote_command(["-V"])
+            else:
+                local_privileged = False
+                get_dut = getattr(self.dut_manager, "get_dut", None)
+                if use_sudo and callable(get_dut):
+                    credentials = getattr(get_dut(dut_id), "credentials", None)
+                    local_privileged = (
+                        credentials is not None and not credentials.host_ip
+                    )
+                probe_command = build_trusted_remote_executable_probe(
+                    command, local_privileged=local_privileged
+                )
             if use_bmc:
                 # For SSH collectors, use BMC connection
                 exit_code, stdout, stderr = await self.dut_manager.execute_bmc_command(
-                    dut_id, f"which {command}", timeout=30
+                    dut_id, probe_command, timeout=30
                 )
             else:
                 # For host collectors, use host connection
                 exit_code, stdout, stderr = await self.dut_manager.execute_host_command(
-                    dut_id, f"which {command}", timeout=30
+                    dut_id,
+                    probe_command,
+                    timeout=30,
+                    **({"use_sudo": True} if use_sudo else {}),
                 )
 
-            if exit_code == 0:
+            resolved_path = (stdout or "").strip()
+            command_available = exit_code == 0 and (is_ipmitool or bool(resolved_path))
+            if command_available:
                 dependency_result = DependencyResult(
                     type=DependencyType.COMMAND,
                     name=command,
@@ -292,17 +463,55 @@ class DependencyChecker:
                     error_message=None,
                     platform=dut_id,
                 )
-            else:
+            elif exit_code == 0:
                 dependency_result = DependencyResult(
                     type=DependencyType.COMMAND,
                     name=command,
                     available=False,
                     version=None,
-                    error_message=f"Command '{command}' not found on DUT {dut_id}: {stderr}",
+                    error_message=(
+                        f"Command '{command}' lookup returned no resolved path "
+                        f"on DUT {dut_id}"
+                    ),
                     platform=dut_id,
+                    probe_failed=True,
+                )
+            else:
+                diagnostic = (
+                    stderr
+                    or stdout
+                    or (
+                        TRUSTED_IPMITOOL_NOT_FOUND_MESSAGE
+                        if is_ipmitool
+                        else "no diagnostic output"
+                    )
+                ).strip()
+                if exit_code == 126:
+                    error_message = (
+                        f"Command '{command}' exists on DUT {dut_id} but is not "
+                        f"executable: {diagnostic}"
+                    )
+                elif exit_code == 127:
+                    error_message = (
+                        f"Command '{command}' not found on DUT {dut_id}: {diagnostic}"
+                    )
+                else:
+                    error_message = (
+                        f"Command '{command}' lookup failed on DUT {dut_id} "
+                        f"with exit code {exit_code}: {diagnostic}"
+                    )
+                dependency_result = DependencyResult(
+                    type=DependencyType.COMMAND,
+                    name=command,
+                    available=False,
+                    version=None,
+                    error_message=error_message,
+                    platform=dut_id,
+                    probe_failed=exit_code not in (126, 127),
                 )
 
-            self._cache[cache_key] = dependency_result
+            if not dependency_result.probe_failed:
+                self._cache[cache_key] = dependency_result
             return dependency_result
 
         except Exception as e:
@@ -313,17 +522,166 @@ class DependencyChecker:
                 version=None,
                 error_message=f"Error checking command '{command}' on DUT {dut_id}: {str(e)}",
                 platform=dut_id,
+                probe_failed=True,
             )
-            self._cache[cache_key] = dependency_result
             return dependency_result
+
+    async def check_command_requirement(
+        self,
+        dependency: Dict[str, Any],
+        *,
+        dut_id: Optional[str] = None,
+        use_bmc: bool = False,
+        check_local: bool = False,
+    ) -> DependencyResult:
+        """
+        Accept any authored executable name for one command prerequisite.
+
+        Probe the canonical name followed by at most seven alternatives without
+        running the producer. A transport or privilege failure stops lookup and
+        remains distinguishable from confirmed unavailability. Privileged Host
+        probes use the DUT manager, including its local execution route.
+
+        Args:
+            dependency: Command declaration with a name, optional alternatives,
+                and an optional boolean use_sudo policy.
+            dut_id: Target identity for Host or BMC lookup.
+            use_bmc: Select the BMC transport instead of the Host transport.
+            check_local: Check the invoking machine without a DUT transport.
+
+        Returns:
+            One prerequisite result retaining the individual lookup results.
+
+        Raises:
+            ValueError: If executable alternatives or privilege policy are
+                malformed, or privileged lookup has no Host execution context.
+
+        Side Effects:
+            Performs bounded executable probes through the existing dependency
+            cache and transport. Never launches a diagnostic collection.
+        """
+        name = dependency.get("name")
+        alternatives = dependency.get("alternatives", [])
+        use_sudo = dependency.get("use_sudo", False)
+        if (
+            not isinstance(name, str)
+            or not isinstance(alternatives, list)
+            or len(alternatives) > 7
+            or not isinstance(use_sudo, bool)
+        ):
+            raise ValueError("Invalid command prerequisite declaration")
+        names = [name, *alternatives]
+        for candidate in names:
+            build_trusted_remote_executable_probe(candidate)
+        if use_sudo and (
+            check_local or use_bmc or not dut_id or self.dut_manager is None
+        ):
+            raise _PrivilegedCommandContextError(
+                "Privileged command prerequisites require a Host context"
+            )
+
+        results = []
+        for candidate in names:
+            if check_local or not dut_id:
+                result = self.check_command(candidate, check_local=True)
+            else:
+                result = await self._check_command_on_dut(
+                    dut_id,
+                    candidate,
+                    use_bmc=use_bmc,
+                    **({"use_sudo": True} if use_sudo else {}),
+                )
+            results.append(result)
+            if result.available or result.probe_failed:
+                return DependencyResult(
+                    name=name,
+                    type=DependencyType.COMMAND,
+                    available=result.available,
+                    error_message=result.error_message,
+                    fallback_results=results,
+                    platform=result.platform,
+                    probe_failed=result.probe_failed,
+                )
+        return DependencyResult(
+            name=name,
+            type=DependencyType.COMMAND,
+            available=False,
+            error_message=(
+                "No executable available under any supported name: "
+                + ", ".join(names)
+                + ". "
+                + "; ".join(
+                    result.error_message for result in results if result.error_message
+                )
+            ),
+            fallback_results=results,
+            platform=dut_id,
+        )
+
+    async def _check_command_requirement_for_context(
+        self,
+        dependency: Dict[str, Any],
+        *,
+        dut_id: str = None,
+        use_bmc: bool = False,
+        check_local: bool = False,
+    ) -> DependencyResult:
+        """
+        Report unavailable privilege context while retaining declaration errors.
+
+        The strict prerequisite helper validates names and privilege policy
+        before probing. An unavailable Host route becomes a dependency result,
+        allowing required and optional checks to continue without widening local
+        or BMC privileges. Malformed declarations still raise ValueError.
+
+        Args:
+            dependency: Command declaration, including alternatives and use_sudo.
+            dut_id: DUT identity for a remote prerequisite probe.
+            use_bmc: Whether the requested execution context is the BMC.
+            check_local: Whether the collector requires an invoking-machine probe.
+
+        Returns:
+            Probe result, or unavailable result when privilege context is absent.
+
+        Raises:
+            ValueError: If command names or privilege declarations are malformed.
+
+        Side Effects:
+            Performs the existing bounded probe only in a supported context.
+        """
+        try:
+            return await self.check_command_requirement(
+                dependency,
+                dut_id=dut_id,
+                use_bmc=use_bmc,
+                check_local=check_local,
+            )
+        except _PrivilegedCommandContextError as error:
+            return DependencyResult(
+                name=dependency["name"],
+                type=DependencyType.COMMAND,
+                available=False,
+                error_message=str(error),
+                platform=dut_id,
+            )
 
     def check_file(self, file_path: str, dut_id: str = None) -> DependencyResult:
         """
         Check if a file exists (locally or on DUT if specified).
 
+        The implementation uses ``file_path`` and ``dut_id`` to check if a file
+        exists (locally or on DUT if specified). Every required invariant is
+        checked before a successful value is returned; invalid input follows the
+        function's explicit exception path.
+
         Args:
-            file_path: Path to the file to check
-            dut_id: ID of the DUT to check
+            file_path: filesystem location used as the file path for this
+                operation.
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+
+        Returns:
+            A ``DependencyResult`` representing file.
         """
         cache_key = f"file:{file_path}"
         if dut_id:
@@ -389,10 +747,17 @@ class DependencyChecker:
         """
         Check if a file exists on a specific DUT.
 
+        Fallback to local check if no DUT manager available.
+
         Args:
-            dut_id: ID of the DUT to check
-            file_path: Path to the file to check
-            use_bmc: Whether to use BMC connection
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+            file_path: filesystem location used as the file path for this
+                operation.
+            use_bmc: Whether use BMC is enabled or required for this operation.
+
+        Returns:
+            A ``DependencyResult`` representing file on DUT.
         """
         cache_key = f"dut_file:{dut_id}:{file_path}"
         if use_bmc:
@@ -407,13 +772,14 @@ class DependencyChecker:
 
         try:
             # Use test -f command to check if file exists
+            probe_command = build_remote_cmd("test -f {path}", path=file_path)
             if use_bmc:
                 exit_code, stdout, stderr = await self.dut_manager.execute_bmc_command(
-                    dut_id, f"test -f {file_path}", timeout=30
+                    dut_id, probe_command, timeout=30
                 )
             else:
                 exit_code, stdout, stderr = await self.dut_manager.execute_host_command(
-                    dut_id, f"test -f {file_path}", timeout=30
+                    dut_id, probe_command, timeout=30
                 )
 
             if exit_code == 0:
@@ -456,10 +822,22 @@ class DependencyChecker:
         """
         Check if a systemd service is active on a specific DUT via SSH.
 
+        The implementation uses ``dut_id``, ``service_name``, and ``use_bmc`` to
+        check if a systemd service is active on a specific DUT via SSH. Every
+        required invariant is checked before a successful value is returned;
+        invalid input follows the function's explicit exception path. Owned
+        asynchronous work is awaited before return, so completion does not leave
+        an unobserved task behind.
+
         Args:
-            dut_id: ID of the DUT to check
-            service_name: Name of the systemd service
-            use_bmc: Whether to use BMC connection (for SSH/BMC collectors)
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+            service_name: Stable service name used for lookup and
+                operator-facing diagnostics.
+            use_bmc: Whether use BMC is enabled or required for this operation.
+
+        Returns:
+            A ``DependencyResult`` representing service on DUT.
         """
         cache_key = f"dut_service:{dut_id}:{service_name}"
         if use_bmc:
@@ -472,13 +850,20 @@ class DependencyChecker:
             return self.check_service(service_name)
 
         try:
+            probe_command = build_remote_cmd(
+                "systemctl is-active {service}", service=service_name
+            )
             if use_bmc:
                 exit_code, stdout, stderr = await self.dut_manager.execute_bmc_command(
-                    dut_id, f"systemctl is-active {service_name}", timeout=30
+                    dut_id,
+                    probe_command,
+                    timeout=30,
                 )
             else:
                 exit_code, stdout, stderr = await self.dut_manager.execute_host_command(
-                    dut_id, f"systemctl is-active {service_name}", timeout=30
+                    dut_id,
+                    probe_command,
+                    timeout=30,
                 )
 
             is_active = exit_code == 0 and stdout.strip() == "active"
@@ -512,8 +897,17 @@ class DependencyChecker:
         """
         Check if a service is running.
 
+        The implementation uses ``service_name`` to check if a service is
+        running. Every required invariant is checked before a successful value
+        is returned; invalid input follows the function's explicit exception
+        path.
+
         Args:
-            service_name: Name of the service to check
+            service_name: Stable service name used for lookup and
+                operator-facing diagnostics.
+
+        Returns:
+            A ``DependencyResult`` representing service.
         """
         cache_key = f"service:{service_name}"
 
@@ -521,7 +915,7 @@ class DependencyChecker:
             return self._cache[cache_key]
 
         try:
-            result = subprocess.run(
+            result = _run_subprocess(
                 ["systemctl", "is-active", service_name],
                 capture_output=True,
                 text=True,
@@ -570,12 +964,26 @@ class DependencyChecker:
         """
         Check if a command is available and meets minimum version requirement.
 
+        The implementation uses ``command``, ``min_version``, ``version_cmd``,
+        ``dut_id``, and ``use_bmc`` to check if a command is available and meets
+        minimum version requirement. Every required invariant is checked before
+        a successful value is returned; invalid input follows the function's
+        explicit exception path. Owned asynchronous work is awaited before
+        return, so completion does not leave an unobserved task behind.
+
         Args:
-            command: Command to check
-            min_version: Minimum version required
-            version_cmd: Command to check the version
-            dut_id: Optional DUT ID - if provided, runs on DUT; otherwise runs locally
-            use_bmc: Whether to use BMC connection (only used if dut_id is provided)
+            command: Text supplied as command in the format accepted by this
+                function.
+            min_version: Text supplied as min version in the format accepted by
+                this function.
+            version_cmd: Text supplied as version cmd in the format accepted by
+                this function.
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+            use_bmc: Whether use BMC is enabled or required for this operation.
+
+        Returns:
+            A ``DependencyResult`` representing command version.
         """
         # If dut_id is provided and we have a DUT manager, run on DUT
         if dut_id and self.dut_manager:
@@ -592,23 +1000,48 @@ class DependencyChecker:
                 if not cmd_check.available:
                     return cmd_check
 
-                # Execute version command on the DUT
+                # Execute version command on the DUT. ipmitool retains the
+                # same allowlisted selection contract as availability probes.
+                trusted_version_command = version_cmd
+                if command == "ipmitool":
+                    version_arguments = shlex.split(version_cmd)
+                    if not version_arguments or version_arguments[0] not in {
+                        "ipmitool",
+                        *TRUSTED_IPMITOOL_PATHS,
+                    }:
+                        dependency_result = DependencyResult(
+                            name=command,
+                            type=DependencyType.COMMAND_VERSION,
+                            available=False,
+                            error_message=(
+                                "ipmitool version command must start with an "
+                                "approved executable"
+                            ),
+                            platform=dut_id,
+                        )
+                        self._cache[cache_key] = dependency_result
+                        return dependency_result
+                    trusted_version_command = build_trusted_ipmitool_remote_command(
+                        version_arguments[1:]
+                    )
                 if use_bmc:
                     exit_code, stdout, stderr = (
                         await self.dut_manager.execute_bmc_command(
-                            dut_id, version_cmd, timeout=30
+                            dut_id, trusted_version_command, timeout=30
                         )
                     )
                 else:
                     exit_code, stdout, stderr = (
                         await self.dut_manager.execute_host_command(
-                            dut_id, version_cmd, timeout=30
+                            dut_id, trusted_version_command, timeout=30
                         )
                     )
 
                 if exit_code == 0:
                     version_output = stdout.strip()
-                    if self._compare_versions(version_output, min_version):
+                    if version_output and self._compare_versions(
+                        version_output, min_version
+                    ):
                         dependency_result = DependencyResult(
                             name=command,
                             type=DependencyType.COMMAND_VERSION,
@@ -622,7 +1055,10 @@ class DependencyChecker:
                             type=DependencyType.COMMAND_VERSION,
                             available=False,
                             version=version_output,
-                            error_message=f"Version {version_output} is below minimum required {min_version}",
+                            error_message=(
+                                f"Version output {version_output!r} is below minimum "
+                                f"required {min_version} or could not be parsed"
+                            ),
                             platform=dut_id,
                         )
                 else:
@@ -655,21 +1091,43 @@ class DependencyChecker:
             return cmd_result
 
         try:
-            # Execute version command - parse string commands safely with shlex
-            import shlex
-
             if isinstance(version_cmd, str):
                 cmd_list = shlex.split(version_cmd)
             else:
-                cmd_list = version_cmd
-            result = subprocess.run(
+                cmd_list = list(version_cmd)
+            if command == "ipmitool":
+                if not cmd_list or cmd_list[0] not in {
+                    "ipmitool",
+                    *TRUSTED_IPMITOOL_PATHS,
+                }:
+                    return DependencyResult(
+                        name=command,
+                        type=DependencyType.COMMAND_VERSION,
+                        available=False,
+                        error_message=(
+                            "ipmitool version command must start with an approved "
+                            "executable"
+                        ),
+                    )
+                ipmitool_path = resolve_trusted_ipmitool_path()
+                if ipmitool_path is None:
+                    return DependencyResult(
+                        name=command,
+                        type=DependencyType.COMMAND_VERSION,
+                        available=False,
+                        error_message=TRUSTED_IPMITOOL_NOT_FOUND_MESSAGE,
+                    )
+                cmd_list = [ipmitool_path, *cmd_list[1:]]
+            result = _run_subprocess(
                 cmd_list, capture_output=True, text=True, timeout=30
             )
 
             if result.returncode == 0:
                 version_output = result.stdout.strip()
                 # Simple version comparison (can be enhanced)
-                if self._compare_versions(version_output, min_version):
+                if version_output and self._compare_versions(
+                    version_output, min_version
+                ):
                     dependency_result = DependencyResult(
                         name=command,
                         type=DependencyType.COMMAND_VERSION,
@@ -682,7 +1140,10 @@ class DependencyChecker:
                         type=DependencyType.COMMAND_VERSION,
                         available=False,
                         version=version_output,
-                        error_message=f"Version {version_output} is below minimum required {min_version}",
+                        error_message=(
+                            f"Version output {version_output!r} is below minimum "
+                            f"required {min_version} or could not be parsed"
+                        ),
                     )
             else:
                 dependency_result = DependencyResult(
@@ -710,10 +1171,29 @@ class DependencyChecker:
         """
         Check platform-specific service with fallback logic.
 
+        A fallback command with ``success_indicators`` proves availability only
+        when at least one governed regular expression matches its bounded
+        standard output. An optional fallback may fail without aborting later
+        fallback checks, but its failure is not evidence that the required
+        service is available.
+
+        The implementation uses ``dependency_config``, ``platform``, and
+        ``dut_id`` to check platform-specific service with fallback logic. Every
+        required invariant is checked before a successful value is returned;
+        invalid input follows the function's explicit exception path. Owned
+        asynchronous work is awaited before return, so completion does not leave
+        an unobserved task behind.
+
         Args:
-            dependency_config: Configuration for the platform-specific service
-            platform: Platform to check
-            dut_id: ID of the DUT to check
+            dependency_config: Dependency config governing platform-specific
+                service with fallback logic.
+            platform: Text supplied as platform in the format accepted by this
+                function.
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+
+        Returns:
+            A ``DependencyResult`` representing platform service.
         """
         service_name = dependency_config.get("name", "unknown")
         platform_config = dependency_config.get("platform_config", {})
@@ -741,9 +1221,12 @@ class DependencyChecker:
                 if file_path and dut_id and self.dut_manager:
                     # Check if file exists on the DUT
                     try:
+                        probe_command = build_remote_cmd(
+                            "test -f {path}", path=file_path
+                        )
                         exit_code, stdout, stderr = (
                             await self.dut_manager.execute_host_command(
-                                dut_id, f"test -f {file_path}", timeout=30
+                                dut_id, probe_command, timeout=30
                             )
                         )
                         if exit_code == 0:
@@ -765,7 +1248,6 @@ class DependencyChecker:
             elif fallback_type == "command":
                 cmd = fallback.get("cmd")
                 success_indicators = fallback.get("success_indicators", [])
-                optional = fallback.get("optional", False)
 
                 if cmd and dut_id and self.dut_manager:
                     try:
@@ -777,24 +1259,30 @@ class DependencyChecker:
                         )
 
                         if exit_code == 0:
-                            # If command succeeded and we have success indicators, validate output
-                            if success_indicators and stdout:
-                                output_lower = stdout.lower()
+                            # Authored indicators are regular expressions, as
+                            # they are at the collector execution boundary. A
+                            # zero exit code alone cannot satisfy that stronger
+                            # semantic contract.
+                            if success_indicators:
+                                output = stdout or ""
                                 for indicator in success_indicators:
-                                    if indicator.lower() in output_lower:
+                                    if not isinstance(indicator, str):
+                                        continue
+                                    try:
+                                        matched = re.search(
+                                            indicator,
+                                            output,
+                                            flags=re.IGNORECASE,
+                                        )
+                                    except re.error:
+                                        matched = None
+                                    if matched:
                                         return DependencyResult(
                                             name=cmd,
                                             type=DependencyType.COMMAND,
                                             available=True,
                                             error_message="",
                                         )
-                                # If no indicators matched but command succeeded, still consider it available
-                                return DependencyResult(
-                                    name=cmd,
-                                    type=DependencyType.COMMAND,
-                                    available=True,
-                                    error_message="",
-                                )
                             else:
                                 # Command succeeded, no indicators to check
                                 return DependencyResult(
@@ -803,23 +1291,11 @@ class DependencyChecker:
                                     available=True,
                                     error_message="",
                                 )
-                        elif optional:
-                            # Optional commands are considered available even if they fail
-                            return DependencyResult(
-                                name=cmd,
-                                type=DependencyType.COMMAND,
-                                available=True,
-                                error_message="",
-                            )
                     except Exception:
-                        if optional:
-                            # Optional commands are considered available even if they fail
-                            return DependencyResult(
-                                name=cmd,
-                                type=DependencyType.COMMAND,
-                                available=True,
-                                error_message="",
-                            )
+                        # Optional fallback failures are intentionally ignored
+                        # so later alternatives can still prove availability.
+                        # They never satisfy a required dependency by themselves.
+                        continue
 
         # If all fallback checks fail, return the original service check result
         return main_result
@@ -830,8 +1306,18 @@ class DependencyChecker:
         """
         Check a group of dependencies with fallback logic.
 
+        After applying local validation, the function forwards
+        ``dependency_config`` to ``DependencyResult`` and preserves its return
+        and exception contract. Every required invariant is checked before a
+        successful value is returned; invalid input follows the function's
+        explicit exception path.
+
         Args:
-            dependency_config: Configuration for the group of dependencies
+            dependency_config: Dependency config governing group of dependencies
+                with fallback logic.
+
+        Returns:
+            A ``DependencyResult`` representing fallback group.
         """
         group_name = dependency_config.get("name", "fallback_group")
         fallback_checks = dependency_config.get("fallback_checks", [])
@@ -896,12 +1382,19 @@ class DependencyChecker:
         """
         Validate command output against success indicators.
 
+        Check if any success indicator is present in output.
+
         Args:
-            command: Command to check
-            success_indicators: Success indicators to check against
+            command: Text supplied as command in the format accepted by this
+                function.
+            success_indicators: Entries supplied as ``success_indicators``
+                without transferring container ownership.
+
+        Returns:
+            A ``DependencyResult`` representing command output.
         """
         try:
-            result = subprocess.run(
+            result = _run_subprocess(
                 command.split(), capture_output=True, text=True, timeout=30
             )
 
@@ -950,11 +1443,26 @@ class DependencyChecker:
         """
         Check all dependencies for a collector with enhanced fallback support.
 
+        After applying local validation, the function forwards ``collector_id``,
+        ``collector_name``, ``dependencies``, and ``platform`` to
+        ``DependencyCheckResult`` and preserves its return and exception
+        contract. Every required invariant is checked before a successful value
+        is returned; invalid input follows the function's explicit exception
+        path. Owned asynchronous work is awaited before return, so completion
+        does not leave an unobserved task behind.
+
         Args:
-            collector_id: ID of the collector
-            collector_name: Name of the collector
-            dependencies: Dependencies to check
-            platform: Platform to check
+            collector_id: Stable collector identifier used to correlate
+                configuration, logs, and results.
+            collector_name: Stable collector name used for lookup and
+                operator-facing diagnostics.
+            dependencies: Mapping supplying fields for all dependencies for a
+                collector with enhanced fallback support.
+            platform: Text supplied as platform in the format accepted by this
+                function.
+
+        Returns:
+            A ``DependencyCheckResult`` representing dependencies.
         """
         required_deps = dependencies.get("required", [])
         optional_deps = dependencies.get("optional", [])
@@ -976,7 +1484,12 @@ class DependencyChecker:
                 dep_name = dep.get("name", "unknown")
 
                 if dep_type == "command":
-                    result = self.check_command(dep_name)
+                    if "alternatives" in dep or "use_sudo" in dep:
+                        result = await self._check_command_requirement_for_context(
+                            dep, check_local=True
+                        )
+                    else:
+                        result = self.check_command(dep_name)
                 elif dep_type == "command_version":
                     min_version = dep.get("min_version")
                     version_cmd = dep.get("version_cmd", f"{dep_name} --version")
@@ -1020,7 +1533,12 @@ class DependencyChecker:
                 dep_name = dep.get("name", "unknown")
 
                 if dep_type == "command":
-                    result = self.check_command(dep_name)
+                    if "alternatives" in dep or "use_sudo" in dep:
+                        result = await self._check_command_requirement_for_context(
+                            dep, check_local=True
+                        )
+                    else:
+                        result = self.check_command(dep_name)
                 elif dep_type == "command_version":
                     min_version = dep.get("min_version")
                     version_cmd = dep.get("version_cmd", f"{dep_name} --version")
@@ -1070,9 +1588,21 @@ class DependencyChecker:
         """
         Check all dependencies for all collectors on a specific DUT.
 
+        The implementation uses ``collector_definitions`` and ``dut_id`` to
+        check all dependencies for all collectors on a specific DUT. Every
+        required invariant is checked before a successful value is returned;
+        invalid input follows the function's explicit exception path. Owned
+        asynchronous work is awaited before return, so completion does not leave
+        an unobserved task behind.
+
         Args:
-            collector_definitions: Collector definitions
-            dut_id: ID of the DUT to check
+            collector_definitions: Optional collector definitions; ``None``
+                selects the function's default behavior.
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+
+        Returns:
+            A mapping containing all dependencies for DUT.
         """
         if not collector_definitions or not dut_id:
             return {}
@@ -1132,13 +1662,27 @@ class DependencyChecker:
         dut_id: str,
     ) -> DependencyCheckResult:
         """
-        Check dependencies for a collector using DUT-aware methods (for all collector types).
+        Check dependencies DUT aware.
+
+        After applying local validation, the function forwards ``collector_id``,
+        ``collector_name``, ``dependencies``, and ``dut_id`` to
+        ``DependencyCheckResult`` and preserves its return and exception
+        contract. Every required invariant is checked before a successful value
+        is returned; invalid input follows the function's explicit exception
+        path. Owned asynchronous work is awaited before return, so completion
+        does not leave an unobserved task behind.
 
         Args:
-            collector_id: ID of the collector
-            collector_name: Name of the collector
-            dependencies: Dependencies to check
-            dut_id: ID of the DUT to check
+            collector_id: Stable collector identifier used to correlate
+                configuration, logs, and results.
+            collector_name: Stable collector name used for lookup and
+                operator-facing diagnostics.
+            dependencies: Mapping supplying fields for dependencies DUT aware.
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+
+        Returns:
+            A ``DependencyCheckResult`` representing dependencies DUT aware.
         """
         required_deps = dependencies.get("required", [])
         optional_deps = dependencies.get("optional", [])
@@ -1170,7 +1714,15 @@ class DependencyChecker:
 
                 if dep_type == "command":
                     # Use appropriate connection based on collector type
-                    if self.dut_manager:
+                    if "alternatives" in dep or "use_sudo" in dep:
+                        result = await self._check_command_requirement_for_context(
+                            dep,
+                            dut_id=dut_id,
+                            use_bmc=collector_id.startswith("S"),
+                            check_local=dep.get("check_local", False)
+                            or collector_id.startswith("I"),
+                        )
+                    elif self.dut_manager:
                         use_bmc = collector_id.startswith(
                             "S"
                         )  # SSH collectors use BMC connection
@@ -1257,7 +1809,15 @@ class DependencyChecker:
 
                 if dep_type == "command":
                     # Use appropriate connection based on collector type
-                    if self.dut_manager:
+                    if "alternatives" in dep or "use_sudo" in dep:
+                        result = await self._check_command_requirement_for_context(
+                            dep,
+                            dut_id=dut_id,
+                            use_bmc=collector_id.startswith("S"),
+                            check_local=dep.get("check_local", False)
+                            or collector_id.startswith("I"),
+                        )
+                    elif self.dut_manager:
                         use_bmc = collector_id.startswith(
                             "S"
                         )  # SSH collectors use BMC connection
@@ -1338,25 +1898,42 @@ class DependencyChecker:
         """
         Try to get version of a command.
 
+        The implementation uses ``command`` to try to get version of a command.
+
         Args:
-            command: Command to get the version of
+            command: Text supplied as command in the format accepted by this
+                function.
+
+        Returns:
+            The canonical command version text, or ``None`` when the requested
+            value is unavailable.
         """
         version_commands = {
             "nvidia-smi": "nvidia-smi --version",
-            "ipmitool": "ipmitool -V",
             "nvme": "nvme --version",
             "dmidecode": "dmidecode --version",
             "lshw": "lshw -version",
             "opensm": "opensm --version",
         }
 
-        if command in version_commands:
+        if command == "ipmitool" or command in version_commands:
             try:
-                result = subprocess.run(
-                    version_commands[command].split(),
+                environment = None
+                if command == "ipmitool":
+                    ipmitool_path = resolve_trusted_ipmitool_path()
+                    if ipmitool_path is None:
+                        return None
+                    version_arguments = [ipmitool_path, "-V"]
+                    environment = scrubbed_subprocess_environment()
+                    environment["PATH"] = TRUSTED_PRIVILEGED_PATH
+                else:
+                    version_arguments = version_commands[command].split()
+                result = _run_subprocess(
+                    version_arguments,
                     capture_output=True,
                     text=True,
                     timeout=10,
+                    env=environment,
                 )
                 if result.returncode == 0:
                     return result.stdout.strip().split("\n")[0]
@@ -1369,9 +1946,18 @@ class DependencyChecker:
         """
         Enhanced version comparison with better parsing.
 
+        Extract version numbers using regex to handle various formats Handles:
+        "4.8.0", "v4.8.0", "version 4.8.0", "sos 4.8.0-1", etc.
+
         Args:
-            version1: First version to compare
-            version2: Second version to compare
+            version1: Text supplied as version1 in the format accepted by this
+                function.
+            version2: Text supplied as version2 in the format accepted by this
+                function.
+
+        Returns:
+            Whether the enhanced version comparison with better parsing
+            operation succeeds.
         """
         try:
             import re
@@ -1382,8 +1968,7 @@ class DependencyChecker:
             v2_match = re.search(r"(\d+(?:\.\d+)*)", version2)
 
             if not v1_match or not v2_match:
-                # If we can't parse versions, log and assume OK
-                return True
+                return False
 
             v1_str = v1_match.group(1)
             v2_str = v2_match.group(1)
@@ -1399,15 +1984,13 @@ class DependencyChecker:
 
             return v1_parts >= v2_parts
         except Exception:
-            # If version comparison fails, log the issue but assume it's OK
-            # This prevents dependency failures due to version parsing issues
-            return True
+            return False
 
     def clear_cache(self) -> None:
         """
         Clear the dependency cache.
 
-        Args:
-            None
+        The implementation uses current instance state to clear the dependency
+        cache.
         """
         self._cache.clear()

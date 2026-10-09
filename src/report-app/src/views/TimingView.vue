@@ -1,3 +1,20 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 <template>
   <div style="min-height: calc(100vh - 88px);">
     <!-- Left Sidebar Navigation -->
@@ -33,12 +50,18 @@
           </div>
 
           <!-- Row 2: Status cards -->
-          <div class="nv-grid nv-grid--cards" style="margin-bottom: 24px; grid-template-columns: repeat(4, 1fr);">
+          <div class="nv-grid nv-grid--cards" style="margin-bottom: 24px; grid-template-columns: repeat(5, 1fr);">
             <StatCard
               label="Passed Collectors"
               :value="statusBreakdown.success"
               :subtitle="`of ${totalCollectors} total`"
               color="emerald"
+            />
+            <StatCard
+              label="Degraded Collectors"
+              :value="statusBreakdown.degraded"
+              :subtitle="`of ${totalCollectors} total`"
+              color="amber"
             />
             <StatCard
               label="Failed Collectors"
@@ -340,12 +363,13 @@ const totalCollectors = computed(() => {
 })
 
 const statusBreakdown = computed(() => {
-  const counts = { success: 0, error: 0, partial: 0, skipped: 0 }
+  const counts = { success: 0, degraded: 0, error: 0, partial: 0, skipped: 0 }
   if (!timing.value) return counts
   for (const dut of timing.value.per_dut) {
     for (const c of dut.collectors) {
       const s = (c.status || '').toLowerCase()
       if (s === 'success' || s === 'complete' || s === 'passed') counts.success++
+      else if (s === 'degraded') counts.degraded++
       else if (s === 'error' || s === 'failed') counts.error++
       else if (s === 'partial') counts.partial++
       else if (s === 'skipped') counts.skipped++
@@ -530,7 +554,10 @@ function coveragePct(dutId: string, service: string): number {
   if (!dut) return 0
   const collectors = dut.collectors.filter(c => c.group === service)
   if (collectors.length === 0) return 0
-  const succeeded = collectors.filter(c => c.status === 'success' || c.status === 'complete' || c.status === 'passed').length
+  const succeeded = collectors.filter(c => {
+    const status = (c.status || '').toLowerCase()
+    return status === 'success' || status === 'degraded' || status === 'complete' || status === 'passed'
+  }).length
   return Math.round((succeeded / collectors.length) * 100)
 }
 
@@ -552,6 +579,12 @@ function displayService(service: string): string {
 </script>
 
 <style scoped>
+/* Offset sidebar-nav scroll targets below the 52px fixed navbar
+   (same approach as ResourcesView's .resource-section). */
+section[id] {
+  scroll-margin-top: 72px;
+}
+
 .timing-nav-header {
   padding: 4px 8px;
   border-radius: var(--nv-radius-sm);

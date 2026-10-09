@@ -1,3 +1,20 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 <template>
   <div class="nv-page" :class="{ 'fv-fullscreen': isFullscreen }">
     <!-- file:// mode without a picked directory: gate the file viewer before
@@ -63,7 +80,7 @@
 
         <!-- Action buttons (secondary — collapse into overflow on narrow screens) -->
         <div class="fv-actions fv-actions--secondary">
-          <button v-if="viewerType !== 'download'" class="fv-action-btn" :class="{ 'fv-action-btn--active': !wrapEnabled }" title="Toggle word wrap (W)" aria-label="Toggle word wrap" @click="toggleWrap">
+          <button v-if="supportsWordWrap" class="fv-action-btn" :class="{ 'fv-action-btn--active': !wrapEnabled }" title="Toggle word wrap (W)" aria-label="Toggle word wrap" @click="toggleWrap">
             <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 3h12M2 7h8.5a2.5 2.5 0 010 5H8l1.5-1.5M8 12.5L9.5 14M2 11h3"/></svg>
             <span class="fv-action-btn__label">Wrap</span>
           </button>
@@ -84,7 +101,7 @@
             <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><circle cx="3" cy="8" r="1.5"/><circle cx="8" cy="8" r="1.5"/><circle cx="13" cy="8" r="1.5"/></svg>
           </button>
           <div v-if="overflowOpen" class="fv-overflow-menu" @click="overflowOpen = false">
-            <button v-if="viewerType !== 'download'" class="fv-overflow-menu__item" @click="toggleWrap">
+            <button v-if="supportsWordWrap" class="fv-overflow-menu__item" @click="toggleWrap">
               {{ wrapEnabled ? '✓' : '\u00A0' }} Word Wrap
             </button>
             <button class="fv-overflow-menu__item" @click="showMeta = !showMeta">
@@ -125,19 +142,19 @@
 
             <span class="fv-meta-drawer__label">DUT</span>
             <span class="fv-meta-drawer__value">
-              <router-link v-if="fileRef.dut_id" :to="`/dut/${fileRef.dut_id}`" class="fv-meta-drawer__link">{{ fileRef.dut_id }}</router-link>
+              <router-link v-if="fileRef.dut_id" :to="dutRoute(fileRef.dut_id)" class="fv-meta-drawer__link">{{ fileRef.dut_id }}</router-link>
               <span v-else class="fv-meta-drawer__empty">&mdash;</span>
             </span>
 
             <span class="fv-meta-drawer__label">Group</span>
             <span class="fv-meta-drawer__value">
-              <router-link v-if="fileRef.dut_id && fileRef.collector_group" :to="`/dut/${fileRef.dut_id}/${fileRef.collector_group}`" class="fv-meta-drawer__link">{{ fileRef.collector_group }}</router-link>
+              <router-link v-if="fileRef.dut_id && fileRef.collector_group" :to="collectorGroupRoute(fileRef.dut_id, fileRef.collector_group)" class="fv-meta-drawer__link">{{ fileRef.collector_group }}</router-link>
               <span v-else>{{ fileRef.collector_group || '\u2014' }}</span>
             </span>
 
             <span class="fv-meta-drawer__label">Collector</span>
             <span class="fv-meta-drawer__value">
-              <router-link v-if="fileRef.dut_id && fileRef.collector_id" :to="`/dut/${fileRef.dut_id}/collector/${fileRef.collector_id}`" class="fv-meta-drawer__link">{{ fileRef.collector_id }}</router-link>
+              <router-link v-if="fileRef.dut_id && fileRef.collector_group && fileRef.collector_id" :to="collectorDetailRoute(fileRef.dut_id, fileRef.collector_group, fileRef.collector_id)" class="fv-meta-drawer__link">{{ fileRef.collector_id }}</router-link>
               <span v-else>{{ fileRef.collector_id || '\u2014' }}</span>
               <span v-if="fileRef.collector_name" style="color: var(--nv-text-tertiary); margin-left: 6px;">{{ fileRef.collector_name }}</span>
             </span>
@@ -193,6 +210,12 @@
             :height="viewerHeight"
           />
 
+          <ExecutionSummaryViewer
+            v-else-if="viewerType === 'execution-summary'"
+            :content="content"
+            :height="viewerHeight"
+          />
+
           <MonacoViewer
             v-else
             :content="content"
@@ -240,12 +263,15 @@ import { wordWrap } from '@/composables/useViewerPrefs'
 import type { FileEntry } from '@/types/manifest'
 import MonacoViewer from '@/components/viewers/MonacoViewer.vue'
 import LogViewer from '@/components/viewers/LogViewer.vue'
+import ExecutionSummaryViewer from '@/components/viewers/ExecutionSummaryViewer.vue'
 import JsonTreeViewer from '@/components/viewers/JsonTreeViewer.vue'
 import DownloadCard from '@/components/viewers/DownloadCard.vue'
 import HexViewer from '@/components/viewers/HexViewer.vue'
 import ErrorBoundary from '@/components/common/ErrorBoundary.vue'
 import PageLoader from '@/components/common/PageLoader.vue'
 import Breadcrumbs from '@/components/common/Breadcrumbs.vue'
+import type { RouteLocationRaw } from 'vue-router'
+import { collectorDetailRoute, collectorGroupRoute, dutRoute } from '@/utils/reportRoutes'
 
 const route = useRoute()
 const router = useRouter()
@@ -290,19 +316,21 @@ const viewerType = computed(() => {
   return getViewerType(fileRef.value)
 })
 
+const supportsWordWrap = computed(() => viewerType.value === 'monaco' || viewerType.value === 'json-tree')
+
 const viewerHeight = computed(() => isFullscreen.value ? 'calc(100vh - 80px)' : 'calc(100vh - 260px)')
 
 const needsPicker = computed(() => fileSystemStore.needsDirectoryPicker)
 
 const breadcrumbs = computed(() => {
-  const items: { label: string; to?: string }[] = [{ label: 'Home', to: '/' }]
+  const items: { label: string; to?: RouteLocationRaw }[] = [{ label: 'Home', to: '/' }]
   if (fileRef.value?.dut_id) {
-    items.push({ label: fileRef.value.dut_id, to: `/dut/${fileRef.value.dut_id}` })
+    items.push({ label: fileRef.value.dut_id, to: dutRoute(fileRef.value.dut_id) })
   }
   if (fileRef.value?.collector_group) {
     items.push({
       label: fileRef.value.collector_group,
-      to: fileRef.value.dut_id ? `/dut/${fileRef.value.dut_id}/${fileRef.value.collector_group}` : undefined
+      to: fileRef.value.dut_id ? collectorGroupRoute(fileRef.value.dut_id, fileRef.value.collector_group) : undefined
     })
   }
   items.push({ label: fileName.value })
@@ -468,7 +496,7 @@ function onKeydown(e: KeyboardEvent) {
   if (!e.ctrlKey && !e.metaKey && !e.altKey) {
     if (upper === 'C' && isViewable) { copyContents(); return }
     if (upper === 'D') { e.preventDefault(); downloadFile(); return }
-    if (upper === 'W' && isViewable) { toggleWrap(); return }
+    if (upper === 'W' && supportsWordWrap.value) { toggleWrap(); return }
     if (upper === 'F') { toggleFullscreen(); return }
     if (upper === 'I') { showMeta.value = !showMeta.value; return }
   }

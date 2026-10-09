@@ -1,18 +1,40 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * Client-side export utilities — generates Blobs for download.
  */
 
+import { serializeCsv } from '@/utils/csv'
+
+export function downloadCsv(
+  rows: readonly (readonly unknown[])[],
+  filename = 'export.csv',
+): void {
+  downloadBlob(
+    serializeCsv(rows),
+    filename,
+    'text/csv;charset=utf-8',
+  )
+}
+
 export function exportCsv(columns: string[], rows: Record<string, any>[]): void {
-  const header = columns.join(',')
-  const body = rows.map(row =>
-    columns.map(col => {
-      const val = String(row[col] ?? '')
-      return val.includes(',') || val.includes('"') || val.includes('\n')
-        ? `"${val.replace(/"/g, '""')}"`
-        : val
-    }).join(',')
-  ).join('\n')
-  downloadBlob(`${header}\n${body}`, 'export.csv', 'text/csv')
+  downloadCsv([
+    columns,
+    ...rows.map(row => columns.map(column => row[column])),
+  ])
 }
 
 export function exportJson(data: any, filename = 'export.json'): void {

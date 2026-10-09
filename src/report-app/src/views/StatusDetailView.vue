@@ -1,3 +1,20 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 <template>
   <div class="nv-page">
     <Breadcrumbs :items="[{ label: 'Home', to: '/' }, { label: pageTitle }]" />
@@ -10,7 +27,7 @@
         :columns="columns"
         :data="filteredCollectors"
         :searchable="true"
-        @row-click="(row) => router.push(`/dut/${row.dut_id}/${row.group}/${row.id}`)"
+        @row-click="(row) => router.push(collectorDetailRoute(row.dut_id, row.group, row.id))"
       >
         <template #cell-status="{ value }">
           <StatusBadge :status="value" />
@@ -34,6 +51,8 @@ import DataTable from '@/components/common/DataTable.vue'
 import StatusBadge from '@/components/common/StatusBadge.vue'
 import Breadcrumbs from '@/components/common/Breadcrumbs.vue'
 import ReasonDisplay from '@/components/common/ReasonDisplay.vue'
+import { normalizeCollectorStatus } from '@/utils/collectorLifecycle'
+import { collectorDetailRoute } from '@/utils/reportRoutes'
 
 const route = useRoute()
 const router = useRouter()
@@ -59,10 +78,11 @@ const filteredCollectors = computed(() => {
   for (const dut of manifestStore.duts) {
     for (const group of dut.collector_groups) {
       for (const c of group.collectors) {
-        if (isAll.value || c.status === statusType.value) {
+        const status = normalizeCollectorStatus(c.status)
+        if (isAll.value || status === normalizeCollectorStatus(statusType.value)) {
           result.push({
             dut_id: dut.id, group: group.name, id: c.id, name: c.name,
-            execution_time: c.execution_time, status: c.status, reason: c.reason || '',
+            execution_time: c.execution_time, status, reason: c.reason || '',
           })
         }
       }

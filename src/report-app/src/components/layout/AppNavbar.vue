@@ -1,3 +1,20 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 <template>
   <nav class="nv-navbar" role="navigation" aria-label="Main navigation">
     <button
@@ -21,6 +38,17 @@
         <span class="nv-navbar__brand-name">NVIDIA</span>
         <span v-if="!isMobile" class="nv-navbar__brand-label">NVDebug Reports</span>
       </router-link>
+    </div>
+
+    <div
+      v-if="!isMobile && reportIdentity"
+      class="nv-navbar__identity"
+      data-testid="run-identity"
+      :title="`Run identity ${reportIdentity.fullHash}`"
+    >
+      <span>v{{ reportIdentity.version }}</span>
+      <span>{{ reportIdentity.level }} / {{ reportIdentity.profile }}</span>
+      <code>{{ reportIdentity.shortHash }}</code>
     </div>
 
     <div v-if="!isMobile" class="nv-navbar__nav" role="menubar" aria-label="Page navigation">
@@ -91,6 +119,10 @@
           </router-link>
 
           <span class="navbar-dropdown__section">Infrastructure</span>
+          <router-link to="/resources" class="navbar-dropdown__item" @click="showAnalysis = false">
+            <span class="navbar-dropdown__icon">&#128200;</span>
+            Resource Usage
+          </router-link>
           <router-link to="/preflight-summary" class="navbar-dropdown__item" @click="showAnalysis = false">
             <span class="navbar-dropdown__icon">&#9989;</span>
             Preflight Summary
@@ -207,6 +239,7 @@
         <router-link to="/firmware-compare" class="nv-navbar__mobile-link" @click="mobileMenuOpen = false">Firmware Comparison</router-link>
         <router-link to="/compare-runs" class="nv-navbar__mobile-link" @click="mobileMenuOpen = false">Run Comparison</router-link>
         <span class="nv-navbar__mobile-section">Infrastructure</span>
+        <router-link to="/resources" class="nv-navbar__mobile-link" @click="mobileMenuOpen = false">Resource Usage</router-link>
         <router-link to="/preflight-summary" class="nv-navbar__mobile-link" @click="mobileMenuOpen = false">Preflight Summary</router-link>
         <router-link to="/dependencies" class="nv-navbar__mobile-link" @click="mobileMenuOpen = false">Dependency Graph</router-link>
         <router-link to="/heatmap" class="nv-navbar__mobile-link" @click="mobileMenuOpen = false">Health Heatmap</router-link>
@@ -248,8 +281,20 @@ const mobileMenuOpen = ref(false)
 const analysisDropdownRef = ref<HTMLElement>()
 const mobileMenuRef = ref<HTMLElement>()
 
-const ANALYSIS_PATHS = ['/anomalies', '/co-failure', '/error-timeline', '/errors', '/service-health', '/coverage', '/efficiency', '/stage-profiling', '/compare', '/firmware-compare', '/compare-runs', '/preflight-summary', '/dependencies', '/heatmap', '/correlate', '/diff', '/timing/gantt', '/split']
+const ANALYSIS_PATHS = ['/anomalies', '/co-failure', '/error-timeline', '/errors', '/service-health', '/coverage', '/efficiency', '/stage-profiling', '/resources', '/compare', '/firmware-compare', '/compare-runs', '/preflight-summary', '/dependencies', '/heatmap', '/correlate', '/diff', '/timing/gantt', '/split']
 const isAnalysisRoute = computed(() => ANALYSIS_PATHS.some(p => route.path.startsWith(p)))
+const reportIdentity = computed(() => {
+  const identity = manifestStore.runIdentity
+  if (!identity) return null
+
+  return {
+    version: identity.tool.version,
+    level: identity.invocation.resolved_level,
+    profile: identity.invocation.resolved_profile,
+    shortHash: identity.identity_sha256.slice(0, 12),
+    fullHash: identity.identity_sha256,
+  }
+})
 
 function onClickOutside(e: MouseEvent) {
   if (showAnalysis.value && analysisDropdownRef.value && !analysisDropdownRef.value.contains(e.target as Node)) {
@@ -299,6 +344,25 @@ onUnmounted(() => {
   align-items: center;
   gap: 2px;
   margin-left: 16px;
+}
+
+.nv-navbar__identity {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--nv-text-tertiary);
+  font-size: 0.625rem;
+  white-space: nowrap;
+}
+.nv-navbar__identity > span + span::before,
+.nv-navbar__identity > code::before {
+  content: '\00b7';
+  margin-right: 6px;
+  color: var(--nv-glass-border-highlight);
+}
+.nv-navbar__identity code {
+  color: var(--nv-text-secondary);
+  font-family: var(--nv-font-mono);
 }
 
 .navbar-link {

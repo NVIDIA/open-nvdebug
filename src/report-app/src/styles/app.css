@@ -1,3 +1,20 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 @import "tailwindcss";
 @import "./tokens.css";
 @import "./print.css";
@@ -205,11 +222,30 @@ a:hover {
 .nv-btn--primary:hover {
   background: var(--nv-accent-hover);
   border-color: var(--nv-accent-hover);
+  /* Re-declare: the global `a:hover` rule otherwise wins on router-links
+     styled as primary buttons, turning text the same green as the background. */
+  color: #000000;
   box-shadow: 0 4px 16px rgba(118, 185, 0, 0.35);
 }
 .nv-btn--primary:active {
   background: var(--nv-accent-active);
 }
+.nv-btn--view {
+  color: var(--nv-action-view);
+  background: var(--nv-info-muted);
+  border-color: color-mix(in srgb, var(--nv-action-view) 50%, transparent);
+}
+.nv-btn--view:hover {
+  color: var(--nv-action-view);
+  background: color-mix(in srgb, var(--nv-info) 22%, var(--nv-bg-elevated));
+  border-color: var(--nv-action-view);
+}
+.nv-btn--row-action {
+  min-height: 28px;
+  padding: 5px 10px;
+  font-size: 0.75rem;
+}
+.nv-btn--row-action svg { flex-shrink: 0; }
 .nv-btn--danger {
   background: var(--nv-error-muted);
   border-color: transparent;
@@ -357,11 +393,16 @@ a:hover {
 /* Status-specific badge aliases */
 .nv-badge--pass    { background: var(--nv-success-muted); color: var(--nv-success); border-color: rgba(118, 185, 0, 0.20); }
 .nv-badge--fail    { background: var(--nv-error-muted);   color: var(--nv-error);   border-color: rgba(220, 53, 40, 0.20); }
-.nv-badge--skip    { background: var(--nv-bg-tertiary);   color: var(--nv-text-secondary); }
+.nv-badge--skip    { background: var(--nv-skipped-muted); color: var(--nv-skipped); border-color: color-mix(in srgb, var(--nv-skipped) 25%, transparent); }
 .nv-badge--na      { background: var(--nv-bg-tertiary);   color: var(--nv-text-secondary); }
 .nv-badge--partial { background: var(--nv-warning-muted); color: var(--nv-warning-fg, var(--nv-warning)); }
+.nv-badge--degraded { background: var(--nv-warning-muted); color: var(--nv-warning-fg, var(--nv-warning)); }
 .nv-badge--skipped { background: var(--nv-skipped-muted); color: var(--nv-skipped); }
 .nv-badge--complete { background: var(--nv-success-muted); color: var(--nv-success); }
+.nv-badge--running,
+.nv-badge--pending,
+.nv-badge--cancelled,
+.nv-badge--incomplete { background: var(--nv-warning-muted); color: var(--nv-warning-fg, var(--nv-warning)); }
 .nv-badge--not_ran { background: var(--nv-bg-tertiary);   color: var(--nv-text-secondary); }
 .nv-badge--unknown { background: var(--nv-bg-tertiary);   color: var(--nv-text-secondary); }
 
@@ -579,10 +620,13 @@ a:hover {
   min-width: 2px;
   position: relative;
 }
-.nv-progress__segment--success { background: linear-gradient(90deg, var(--nv-success), var(--nv-accent-hover)); }
-.nv-progress__segment--error   { background: linear-gradient(90deg, var(--nv-error), #ec6358); }
-.nv-progress__segment--warning { background: linear-gradient(90deg, var(--nv-warning-fg, var(--nv-warning)), var(--nv-warning)); }
-.nv-progress__segment--skipped { background: linear-gradient(90deg, var(--nv-skipped), #fb923c); }
+.nv-progress__segment--success { background: var(--nv-success); }
+.nv-progress__segment--error   { background: var(--nv-error); }
+.nv-progress__segment--warning { background: var(--nv-warning); }
+.nv-progress__segment--skipped { background: var(--nv-skipped); }
+.nv-progress__segment--cancelled { background: var(--nv-warning-fg, var(--nv-warning)); }
+.nv-progress__segment--running { background: var(--nv-info); }
+.nv-progress__segment--pending { background: var(--nv-text-tertiary); }
 .nv-progress__segment--neutral { background: var(--nv-text-tertiary); }
 
 /* ══════════════════════════════════════════════
@@ -818,12 +862,30 @@ a:hover {
 .nv-modal--md { max-width: 600px; }
 .nv-modal--lg { max-width: 900px; }
 .nv-modal--xl { max-width: 1200px; }
+/* Fullscreen must cover the whole viewport: the app navbar is fixed at the
+   top, so any gap lets it show through and appear to overlap the modal. */
+.nv-modal-overlay--fullscreen {
+  padding: 0;
+}
 .nv-modal--fullscreen {
   max-width: none;
   max-height: none;
-  height: calc(100vh - 52px);
-  width: calc(100vw - 52px);
-  border-radius: var(--nv-radius-lg);
+  /* 100% of the inset:0 overlay, not 100vw/vh: viewport units include the
+     classic-scrollbar gutter and mobile browser chrome, which would clip. */
+  height: 100%;
+  width: 100%;
+  border-radius: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.nv-modal--fullscreen .nv-modal__header {
+  flex-shrink: 0;
+}
+.nv-modal--fullscreen .nv-modal__body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
 }
 .nv-modal__body {
   padding: var(--nv-space-5);
@@ -1022,6 +1084,13 @@ a:hover {
   -webkit-backdrop-filter: var(--nv-glass-blur);
   border-bottom: 1px solid var(--nv-glass-border);
   flex-wrap: wrap;
+}
+.nv-log__preview-notice {
+  padding: var(--nv-space-2) var(--nv-space-3);
+  color: var(--nv-warning-fg, var(--nv-warning));
+  background: var(--nv-warning-muted);
+  border-bottom: 1px solid var(--nv-glass-border);
+  font-size: var(--nv-text-xs);
 }
 .nv-log__content {
   font-family: var(--nv-font-mono);
@@ -1377,56 +1446,6 @@ kbd {
 .nv-gantt--fullscreen .nv-log__content {
   max-height: calc(100vh - 52px) !important;
   height: calc(100vh - 52px) !important;
-}
-
-/* ── Print Styles ── */
-.no-print { }
-
-@media print {
-  * {
-    -webkit-print-color-adjust: exact !important;
-    print-color-adjust: exact !important;
-    color-adjust: exact !important;
-  }
-
-  body {
-    background: #fff !important;
-    color: #000 !important;
-    font-size: 11pt;
-  }
-
-  .nv-navbar, .nv-sidebar, .no-print,
-  .nv-btn, .nv-input, .charts-section,
-  details:not(.print-keep) { display: none !important; }
-
-  .nv-app-main {
-    margin-top: 0 !important;
-    overflow: visible !important;
-  }
-
-  .nv-page { padding: 0 !important; }
-
-  .nv-glass, .nv-glass--subtle, .nv-glass--elevated, .nv-glass--accent,
-  .nv-card, .nv-stat {
-    backdrop-filter: none !important;
-    -webkit-backdrop-filter: none !important;
-    background: #fff !important;
-    border: 1px solid #ccc !important;
-    box-shadow: none !important;
-    break-inside: avoid;
-  }
-
-  .print-only-full {
-    page-break-after: avoid;
-  }
-
-  table { font-size: 10pt; }
-  a { text-decoration: none; color: inherit !important; }
-
-  @page {
-    margin: 1.5cm;
-    size: A4 landscape;
-  }
 }
 
 /* ══════════════════════════════════════════════

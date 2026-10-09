@@ -18,9 +18,6 @@
 Constants for NVDebug Tool.
 
 This module defines global constants used throughout the tool.
-
-Attributes:
-    ASCII_HEADER (str): ASCII art header for tool output.
 """
 
 # ASCII Art Header

@@ -1,3 +1,20 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 <template>
   <div :class="['dt-root', { 'dt-root--fill': fillViewport }, `dt-density--${density}`]" ref="rootRef">
     <!-- Toolbar: search + actions -->
@@ -92,6 +109,10 @@
               v-for="(col, ci) in visibleColumns"
               :key="col.key"
               @click="col.sortable !== false && toggleSort(col.key)"
+              @keydown.enter.self="col.sortable !== false && toggleSort(col.key)"
+              @keydown.space.self.prevent="col.sortable !== false && toggleSort(col.key)"
+              :tabindex="col.sortable !== false ? 0 : undefined"
+              :aria-sort="sortKey === col.key ? (sortDir === 'asc' ? 'ascending' : 'descending') : undefined"
               :data-sortable="col.sortable !== false ? '' : undefined"
               :class="['dt-th', { 'dt-th--sorted': sortKey === col.key, 'dt-th--sticky': ci === 0 && stickyFirstCol }]"
             >
@@ -126,6 +147,7 @@
                 </div>
               </div>
             </th>
+            <th v-if="hasRowAction" scope="col" class="dt-action-column">Details</th>
           </tr>
         </thead>
         <tbody>
@@ -133,14 +155,35 @@
             v-for="(row, i) in displayedRows"
             :key="i"
             @click="onRowClick($event, row)"
-            :class="{ 'dt-row--focused': focusedRowIndex === i }"
-            data-clickable
+            :class="{
+              'dt-row--focused': focusedRowIndex === i,
+              'dt-row--flash': flashRowId !== '' && rowKeyValue(row) === flashRowId,
+            }"
+            :data-row-key="rowKey ? rowKeyValue(row) : undefined"
+            :data-clickable="hasRowAction ? '' : undefined"
           >
             <td v-for="(col, ci) in visibleColumns" :key="col.key" :class="{ 'dt-td--sticky': ci === 0 && stickyFirstCol }">
               <slot :name="'cell-' + col.key" :row="row" :value="row[col.key]">
-                <span v-if="searchText && shouldHighlight(cellText(row, col))" v-html="highlightMatch(cellText(row, col))"></span>
-                <template v-else>{{ cellText(row, col) }}</template>
+                <template v-for="text in [cellText(row, col)]" :key="`${ci}:${text}`">
+                  <template v-if="searchText && shouldHighlight(text)">
+                    <template v-for="(part, partIndex) in highlightParts(text)" :key="partIndex">
+                      <mark v-if="part.highlighted" class="dt-highlight">{{ part.text }}</mark>
+                      <template v-else>{{ part.text }}</template>
+                    </template>
+                  </template>
+                  <template v-else>{{ text }}</template>
+                </template>
               </slot>
+            </td>
+            <td v-if="hasRowAction" class="dt-action-column">
+              <button
+                type="button"
+                class="nv-btn nv-btn--view nv-btn--row-action dt-row-action"
+                :aria-label="`View details${rowLabel(row) ? ` for ${rowLabel(row)}` : ''}`"
+                @click.stop="emit('row-click', row)"
+              >
+                View details <span aria-hidden="true">&rarr;</span>
+              </button>
             </td>
           </tr>
         </tbody>
@@ -193,11 +236,15 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, onUnmounted, reactive } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted, reactive, nextTick, inject, getCurrentInstance } from 'vue'
+import { routerKey, routeLocationKey } from 'vue-router'
+import { readTableState, saveTableState } from '@/services/tableState'
 import Fuse from 'fuse.js'
 import { naturalCompare } from '@/utils/naturalSort'
 import { showToast } from '@/composables/useToast'
 import { copyToClipboard } from '@/utils/clipboard'
+import { serializeTsvCell } from '@/utils/csv'
+import { downloadCsv } from '@/services/exportService'
 import EmptyState from '@/components/common/EmptyState.vue'
 
 export interface Column {
@@ -214,36 +261,57 @@ const props = withDefaults(defineProps<{
   pageSize?: number
   fillViewport?: boolean
   stickyFirstCol?: boolean
+  /** Column key used to identify rows for highlight deep-links. */
+  rowKey?: string
+  /** Row identity (matched against rowKey) to scroll to and flash. */
+  highlightRowId?: string
+  /** Distinguish tables with identical columns on the same route. */
+  stateKey?: string
 }>(), {
   searchable: false,
   pageSize: 0,
   fillViewport: false,
   stickyFirstCol: false,
+  rowKey: '',
+  highlightRowId: '',
+  stateKey: '',
 })
 
 const emit = defineEmits<{
   'row-click': [row: Record<string, any>]
 }>()
 
+const hasRowAction = Boolean(getCurrentInstance()?.vnode.props?.onRowClick)
+const stateOwner = inject(routerKey, null)
+const tableRoute = inject(routeLocationKey, null)
+// Capture this route before navigation changes it during the exit transition.
+const tableStateKey = JSON.stringify([tableRoute?.path, props.stateKey || props.columns.map(col => col.key)])
+const savedState = readTableState(stateOwner, tableStateKey)
+
+function rowLabel(row: Record<string, any>): string {
+  return String(row[props.rowKey] ?? row.id ?? row.name ?? '')
+}
+
 function onRowClick(event: MouseEvent, row: Record<string, any>) {
   const target = event.target as HTMLElement
   if (target.closest('a, button, input, select, textarea, [data-no-row-click]')) return
+  if (!hasRowAction) return
   emit('row-click', row)
 }
 
-const searchText = ref('')
-const sortKey = ref('')
-const sortDir = ref<'asc' | 'desc'>('asc')
-const currentPage = ref(0)
+const searchText = ref(savedState?.searchText ?? '')
+const sortKey = ref(savedState?.sortKey ?? '')
+const sortDir = ref<'asc' | 'desc'>(savedState?.sortDir ?? 'asc')
+const currentPage = ref(savedState?.currentPage ?? 0)
 const rootRef = ref<HTMLElement>()
 const availableHeight = ref(600)
-const density = ref<'compact' | 'comfortable' | 'spacious'>('comfortable')
+const density = ref<'compact' | 'comfortable' | 'spacious'>(savedState?.density ?? 'comfortable')
 const showColMenu = ref(false)
-const visibleColKeys = reactive(new Set<string>())
-const activeColumnFilters = reactive(new Map<string, string>())
+const visibleColKeys = reactive(new Set<string>(savedState?.visibleColumns))
+const activeColumnFilters = reactive(new Map<string, string>(savedState?.columnFilters))
 const columnFilterMenuKey = ref('')
 const focusedRowIndex = ref(-1)
-const selectedPageSize = ref(props.pageSize)
+const selectedPageSize = ref(savedState?.pageSize ?? props.pageSize)
 
 // Initialize visible columns
 watch(() => props.columns, (cols) => {
@@ -338,13 +406,31 @@ function shouldHighlight(text: string): boolean {
   return text.toLowerCase().includes(searchText.value.toLowerCase())
 }
 
-function highlightMatch(text: string): string {
-  if (!searchText.value) return text
+interface HighlightPart {
+  text: string
+  highlighted: boolean
+}
+
+function highlightParts(text: string): HighlightPart[] {
+  if (!searchText.value) return [{ text, highlighted: false }]
   const escaped = searchText.value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  return text.replace(
-    new RegExp(`(${escaped})`, 'gi'),
-    '<mark class="dt-highlight">$1</mark>'
-  )
+  const matcher = new RegExp(escaped, 'gi')
+  const parts: HighlightPart[] = []
+  let cursor = 0
+
+  for (const match of text.matchAll(matcher)) {
+    const matchIndex = match.index ?? cursor
+    if (matchIndex > cursor) {
+      parts.push({ text: text.slice(cursor, matchIndex), highlighted: false })
+    }
+    parts.push({ text: match[0], highlighted: true })
+    cursor = matchIndex + match[0].length
+  }
+
+  if (cursor < text.length) {
+    parts.push({ text: text.slice(cursor), highlighted: false })
+  }
+  return parts
 }
 
 // Keyboard navigation
@@ -356,23 +442,24 @@ function onSearchKeydown(e: KeyboardEvent) {
 }
 
 function onTableKeydown(e: KeyboardEvent) {
+  if ((e.target as HTMLElement).closest('a, button, input, select, textarea, th')) return
   if (e.key === 'ArrowDown') {
     e.preventDefault()
     focusedRowIndex.value = Math.min(focusedRowIndex.value + 1, displayedRows.value.length - 1)
   } else if (e.key === 'ArrowUp') {
     e.preventDefault()
     focusedRowIndex.value = Math.max(focusedRowIndex.value - 1, 0)
-  } else if (e.key === 'Enter' && focusedRowIndex.value >= 0) {
+  } else if (e.key === 'Enter' && hasRowAction && focusedRowIndex.value >= 0) {
     emit('row-click', displayedRows.value[focusedRowIndex.value])
   }
 }
 
 // Export
 async function exportToClipboard() {
-  const header = visibleColumns.value.map(c => c.label).join('\t')
+  const header = visibleColumns.value.map(c => serializeTsvCell(c.label)).join('\t')
   const rows = sortedRows.value.map(row =>
     visibleColumns.value.map(c => {
-      return cellText(row, c)
+      return serializeTsvCell(cellText(row, c))
     }).join('\t')
   )
   try {
@@ -384,28 +471,14 @@ async function exportToClipboard() {
 }
 
 function exportToCsv() {
-  const header = visibleColumns.value.map(c => csvEscape(c.label)).join(',')
   const rows = sortedRows.value.map(row =>
-    visibleColumns.value.map(c => csvEscape(cellText(row, c))).join(',')
+    visibleColumns.value.map(c => cellText(row, c))
   )
-  const csv = [header, ...rows].join('\n')
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = 'export.csv'
-  a.click()
-  URL.revokeObjectURL(url)
+  downloadCsv([
+    visibleColumns.value.map(c => c.label),
+    ...rows,
+  ])
   showToast(`Downloaded ${rows.length} rows as CSV`, 'success')
-}
-
-function csvEscape(val: any): string {
-  if (val == null) return ''
-  const s = String(val)
-  if (s.includes(',') || s.includes('"') || s.includes('\n')) {
-    return `"${s.replace(/"/g, '""')}"`
-  }
-  return s
 }
 
 let resizeObserver: ResizeObserver | null = null
@@ -422,6 +495,16 @@ onMounted(() => {
 onUnmounted(() => {
   window.removeEventListener('resize', measureHeight)
   resizeObserver?.disconnect()
+  saveTableState(stateOwner, tableStateKey, {
+    searchText: searchText.value,
+    sortKey: sortKey.value,
+    sortDir: sortDir.value,
+    currentPage: currentPage.value,
+    pageSize: selectedPageSize.value,
+    density: density.value,
+    visibleColumns: [...visibleColKeys],
+    columnFilters: [...activeColumnFilters],
+  })
 })
 
 const fuseInstance = computed(() => {
@@ -476,6 +559,7 @@ const sortedRows = computed(() => {
 const effectivePageSize = computed(() => selectedPageSize.value)
 const totalFiltered = computed(() => sortedRows.value.length)
 const totalPages = computed(() => effectivePageSize.value > 0 ? Math.max(1, Math.ceil(totalFiltered.value / effectivePageSize.value)) : 1)
+watch(totalPages, pages => { currentPage.value = Math.min(currentPage.value, pages - 1) }, { immediate: true })
 const rangeStart = computed(() => totalFiltered.value === 0 ? 0 : currentPage.value * effectivePageSize.value + 1)
 const rangeEnd = computed(() => Math.min((currentPage.value + 1) * effectivePageSize.value, totalFiltered.value))
 
@@ -486,12 +570,62 @@ const displayedRows = computed(() => {
   }
   return sortedRows.value
 })
+
+// Highlight deep-link: jump to the page containing the target row, scroll it
+// into view, and flash it briefly (same pattern as LogCorrelationView).
+const flashRowId = ref('')
+let flashTimer: ReturnType<typeof setTimeout> | undefined
+let lastHighlightHandled = ''
+
+function rowKeyValue(row: Record<string, any>): string {
+  return props.rowKey ? String(row[props.rowKey] ?? '') : ''
+}
+
+watch(
+  [() => props.highlightRowId, sortedRows],
+  async ([id]) => {
+    if (!props.rowKey) return
+    if (!id) {
+      // Reset so a later return to the same ?highlight= value replays.
+      lastHighlightHandled = ''
+      return
+    }
+    if (id === lastHighlightHandled) return
+    const index = sortedRows.value.findIndex(row => rowKeyValue(row) === id)
+    if (index < 0) return
+    lastHighlightHandled = id
+    if (effectivePageSize.value > 0) {
+      currentPage.value = Math.floor(index / effectivePageSize.value)
+    }
+    flashRowId.value = id
+    if (flashTimer) clearTimeout(flashTimer)
+    flashTimer = setTimeout(() => { flashRowId.value = '' }, 2000)
+    await nextTick()
+    rootRef.value
+      ?.querySelector(`[data-row-key="${CSS.escape(id)}"]`)
+      ?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  },
+  { immediate: true },
+)
+
+onUnmounted(() => {
+  if (flashTimer) clearTimeout(flashTimer)
+})
 </script>
 
 <style scoped>
+.dt-action-column { width: 1%; white-space: nowrap; }
 .dt-root {
   display: flex;
   flex-direction: column;
+}
+
+tbody tr.dt-row--flash {
+  animation: dt-row-flash 2s var(--nv-ease);
+}
+@keyframes dt-row-flash {
+  0%, 60% { background: color-mix(in srgb, var(--nv-accent) 18%, transparent); }
+  100% { background: transparent; }
 }
 .dt-root--fill {
   flex: 1;

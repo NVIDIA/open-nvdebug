@@ -1,3 +1,20 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 <template>
   <div style="min-height: calc(100vh - 88px);">
     <div class="nv-sidebar"><AnalysisNav /></div>
@@ -72,7 +89,7 @@
           <tbody>
             <tr v-for="dut in manifestStore.duts" :key="dut.id">
               <td class="hm-table__dut-cell">
-                <router-link :to="`/dut/${dut.id}`" style="color: var(--nv-accent); text-decoration: none;">{{ dut.id }}</router-link>
+                <router-link :to="dutRoute(dut.id)" style="color: var(--nv-accent); text-decoration: none;">{{ dut.id }}</router-link>
               </td>
               <template v-for="(group, gi) in groupedColumns" :key="'b' + gi">
                 <td
@@ -86,8 +103,8 @@
                   <span v-if="getCellStatus(dut.id, col.id) === 'error'" class="hm-table__error-icon">!</span>
                 </td>
               </template>
-              <td class="hm-table__summary-cell" :style="{ color: passRateColor(dutPassRate(dut.id)) }">
-                {{ dutPassRate(dut.id) }}%
+              <td class="hm-table__summary-cell" :style="{ color: passRateColor(dutLifecycle(dut.id)) }">
+                {{ formatCollectorPassRate(dutLifecycle(dut.id)) }}
               </td>
             </tr>
 
@@ -99,15 +116,15 @@
                   v-for="col in group.cols"
                   :key="col.id"
                   class="hm-table__cell hm-table__cell--summary"
-                  :title="`${col.id}: ${colPassRate(col.id)}% pass rate across DUTs`"
+                  :title="`${col.id}: ${formatCollectorPassRate(colLifecycle(col.id))} pass rate across DUTs`"
                 >
-                  <span :style="{ color: passRateColor(colPassRate(col.id)), fontWeight: 600, fontSize: '0.625rem' }">
-                    {{ colPassRate(col.id) }}%
+                  <span :style="{ color: passRateColor(colLifecycle(col.id)), fontWeight: 600, fontSize: '0.625rem' }">
+                    {{ formatCollectorPassRate(colLifecycle(col.id)) }}
                   </span>
                 </td>
               </template>
-              <td class="hm-table__summary-cell hm-table__summary-cell--grand" :style="{ color: passRateColor(grandPassRate) }">
-                {{ grandPassRate }}%
+              <td class="hm-table__summary-cell hm-table__summary-cell--grand" :style="{ color: passRateColor(grandLifecycle) }">
+                {{ formatCollectorPassRate(grandLifecycle) }}
               </td>
             </tr>
           </tbody>
@@ -135,15 +152,28 @@ import { computed, ref, reactive } from 'vue'
 import { useRouter } from 'vue-router'
 import { useManifestStore } from '@/stores/manifest'
 import { STATUS_COLORS, SERVICE_COLORS } from '@/types/colors'
+import {
+  ACTIVE_COLLECTOR_STATUSES,
+  TERMINAL_COLLECTOR_STATUSES,
+  formatCollectorPassRate,
+  normalizeCollectorStatus,
+  summarizeCollectorStatuses,
+} from '@/utils/collectorLifecycle'
+import type { CollectorLifecycleSummary } from '@/utils/collectorLifecycle'
 import Breadcrumbs from '@/components/common/Breadcrumbs.vue'
 import AnalysisNav from '@/components/common/AnalysisNav.vue'
+import { collectorDetailRoute, dutRoute } from '@/utils/reportRoutes'
 
 const manifestStore = useManifestStore()
 const router = useRouter()
 
 const serviceFilter = ref('')
 const hideNotRan = ref(true)
-const statusOptions = ['success', 'error', 'partial', 'skipped', 'not_ran']
+const statusOptions = [
+  ...TERMINAL_COLLECTOR_STATUSES,
+  ...ACTIVE_COLLECTOR_STATUSES,
+  'not_ran',
+]
 const visibleStatuses = reactive(new Set(statusOptions))
 
 const visibleStatusOptions = computed(() =>
@@ -160,7 +190,8 @@ const statusCounts = computed(() => {
   for (const dut of manifestStore.duts) {
     for (const g of dut.collector_groups) {
       for (const c of g.collectors) {
-        counts[c.status] = (counts[c.status] ?? 0) + 1
+        const status = normalizeCollectorStatus(c.status)
+        counts[status] = (counts[status] ?? 0) + 1
       }
     }
   }
@@ -198,7 +229,12 @@ function isGlobalNotRan(collectorId: string): boolean {
   for (const dut of manifestStore.duts) {
     for (const g of dut.collector_groups) {
       for (const c of g.collectors) {
-        if (c.id === collectorId && String(c.status) !== 'not_ran') return false
+        if (
+          c.id === collectorId &&
+          normalizeCollectorStatus(c.status) !== 'not_ran'
+        ) {
+          return false
+        }
       }
     }
   }
@@ -226,7 +262,11 @@ const statusMap = computed(() => {
     const dutMap = new Map<string, { status: string; name: string; duration: number }>()
     for (const g of dut.collector_groups) {
       for (const c of g.collectors) {
-        dutMap.set(c.id, { status: c.status, name: c.name, duration: c.execution_time })
+        dutMap.set(c.id, {
+          status: normalizeCollectorStatus(c.status),
+          name: c.name,
+          duration: c.execution_time,
+        })
       }
     }
     map.set(dut.id, dutMap)
@@ -252,49 +292,46 @@ function getCellTooltip(dutId: string, collectorId: string): string {
 }
 
 function navigateToCollector(dutId: string, group: string, collectorId: string) {
-  router.push(`/dut/${dutId}/${group}/${collectorId}`)
+  router.push(collectorDetailRoute(dutId, group, collectorId))
 }
 
 const flatColumns = computed(() => groupedColumns.value.flatMap(g => g.cols))
 
-function dutPassRate(dutId: string): number {
+function dutLifecycle(dutId: string): CollectorLifecycleSummary {
   const dutMap = statusMap.value.get(dutId)
-  if (!dutMap) return 0
-  let pass = 0, total = 0
+  if (!dutMap) return summarizeCollectorStatuses([])
+  const statuses: string[] = []
   for (const col of flatColumns.value) {
     const info = dutMap.get(col.id)
-    if (!info || String(info.status) === 'not_ran') continue
-    total++
-    if (info.status === 'success') pass++
+    if (info) statuses.push(info.status)
   }
-  return total === 0 ? 0 : Math.round((pass / total) * 100)
+  return summarizeCollectorStatuses(statuses)
 }
 
-function colPassRate(collectorId: string): number {
-  let pass = 0, total = 0
+function colLifecycle(collectorId: string): CollectorLifecycleSummary {
+  const statuses: string[] = []
   for (const dut of manifestStore.duts) {
     const info = statusMap.value.get(dut.id)?.get(collectorId)
-    if (!info || String(info.status) === 'not_ran') continue
-    total++
-    if (info.status === 'success') pass++
+    if (info) statuses.push(info.status)
   }
-  return total === 0 ? 0 : Math.round((pass / total) * 100)
+  return summarizeCollectorStatuses(statuses)
 }
 
-const grandPassRate = computed(() => {
-  let pass = 0, total = 0
+const grandLifecycle = computed(() => {
+  const statuses: string[] = []
   for (const dut of manifestStore.duts) {
     for (const col of flatColumns.value) {
       const info = statusMap.value.get(dut.id)?.get(col.id)
-      if (!info || String(info.status) === 'not_ran') continue
-      total++
-      if (info.status === 'success') pass++
+      if (info) statuses.push(info.status)
     }
   }
-  return total === 0 ? 0 : Math.round((pass / total) * 100)
+  return summarizeCollectorStatuses(statuses)
 })
 
-function passRateColor(pct: number): string {
+function passRateColor(summary: CollectorLifecycleSummary): string {
+  if (summary.state === 'in_progress') return 'var(--nv-info)'
+  const pct = summary.passRate
+  if (pct === null) return 'var(--nv-text-tertiary)'
   if (pct >= 90) return 'var(--nv-success)'
   if (pct >= 70) return 'var(--nv-warning)'
   return 'var(--nv-error)'

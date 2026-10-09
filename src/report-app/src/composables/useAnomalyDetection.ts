@@ -1,3 +1,18 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 import {
   median as ssMedian,
   medianAbsoluteDeviation as ssMad,
@@ -180,7 +195,10 @@ export function detectAnomalies(manifest: Manifest): Anomaly[] {
   for (const dut of manifest.duts) {
     for (const g of dut.collector_groups) {
       for (const c of g.collectors) {
-        if ((c.status === 'success' || c.status === 'partial') && c.files.length === 0) {
+        if (
+          (c.status === 'success' || c.status === 'degraded' || c.status === 'partial') &&
+          c.files.length === 0
+        ) {
           pushAnomaly({
             type: 'missing_files',
             severity: 'warning',
@@ -200,8 +218,9 @@ export function detectAnomalies(manifest: Manifest): Anomaly[] {
   // 4. High failure rate per DUT
   // ──────────────────────────────────────────────────
   for (const dut of manifest.duts) {
-    const total = dut.status_summary.success + dut.status_summary.error +
-      dut.status_summary.partial + dut.status_summary.skipped
+    const total = dut.status_summary.success + (dut.status_summary.degraded ?? 0) +
+      dut.status_summary.error + dut.status_summary.partial +
+      dut.status_summary.skipped
     if (total <= 0) continue
     const failRate = dut.status_summary.error / total
     if (failRate > HIGH_FAIL_RATE) {
@@ -275,23 +294,20 @@ export function detectAnomalies(manifest: Manifest): Anomaly[] {
 
     for (const [collectorId, dutStatuses] of collectorStatusMap) {
       if (dutStatuses.size < 2) continue
-      const statuses = [...dutStatuses.values()]
-      const hasSuccess = statuses.includes('success')
-      const hasError = statuses.includes('error')
-      if (!hasSuccess || !hasError) continue
-
-      const failedDuts = [...dutStatuses.entries()].filter(([, s]) => s === 'error').map(([d]) => d)
       const passedDuts = [...dutStatuses.entries()].filter(([, s]) => s === 'success').map(([d]) => d)
+      const issueDuts = [...dutStatuses.entries()]
+        .filter(([, s]) => s === 'degraded' || s === 'partial' || s === 'error')
+      if (passedDuts.length === 0 || issueDuts.length === 0) continue
 
-      for (const fd of failedDuts) {
+      for (const [issueDut, issueStatus] of issueDuts) {
         pushAnomaly({
           type: 'cross_dut_inconsistency',
           severity: 'warning',
           title: `Inconsistent: ${collectorId}`,
-          description: `${collectorId} failed on ${fd} but succeeded on ${passedDuts.slice(0, 3).join(', ')}${passedDuts.length > 3 ? ` +${passedDuts.length - 3} more` : ''}.`,
-          dutId: fd,
+          description: `${collectorId} was ${issueStatus} on ${issueDut} but succeeded on ${passedDuts.slice(0, 3).join(', ')}${passedDuts.length > 3 ? ` +${passedDuts.length - 3} more` : ''}.`,
+          dutId: issueDut,
           collectorId,
-          value: failedDuts.length,
+          value: issueDuts.length,
           threshold: 0,
         })
       }

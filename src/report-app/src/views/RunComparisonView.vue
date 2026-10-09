@@ -1,3 +1,20 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 <template>
   <div style="min-height: calc(100vh - 88px);">
     <div class="nv-sidebar"><AnalysisNav /></div>
@@ -140,6 +157,10 @@ import Breadcrumbs from '@/components/common/Breadcrumbs.vue'
 import AnalysisNav from '@/components/common/AnalysisNav.vue'
 import type { Manifest } from '@/types/manifest'
 import { naturalCompare } from '@/utils/naturalSort'
+import {
+  parseComparisonManifestFile,
+  parseComparisonReportFile,
+} from '@/utils/comparisonManifest'
 
 const manifestStore = useManifestStore()
 const comparisonManifest = ref<Manifest | null>(null)
@@ -161,7 +182,7 @@ const deltaColumns: Column[] = [
 ]
 
 const STATUS_RANK: Record<string, number> = {
-  success: 0, partial: 1, skipped: 2, not_ran: 3, error: 4, failed: 4,
+  success: 0, degraded: 1, partial: 2, skipped: 3, not_ran: 4, error: 5, failed: 5,
 }
 
 function buildStatusMap(manifest: Manifest): Map<string, { status: string; duration: number | null }> {
@@ -183,8 +204,8 @@ function computeVerdict(statusA: string | null, statusB: string | null): 'regres
   if (!statusA && statusB) return 'new'
   if (statusA && !statusB) return 'removed'
   if (!statusA || !statusB) return 'same'
-  const rA = STATUS_RANK[statusA] ?? 3
-  const rB = STATUS_RANK[statusB] ?? 3
+  const rA = STATUS_RANK[statusA] ?? 4
+  const rB = STATUS_RANK[statusB] ?? 4
   if (rB > rA) return 'regression'
   if (rB < rA) return 'improvement'
   return 'same'
@@ -246,13 +267,14 @@ async function onDirectorySelected(event: Event) {
     const relPath = (file as any).webkitRelativePath as string
     if (relPath.endsWith('manifest.json') || (relPath.includes('reports/') && relPath.endsWith('manifest.json'))) {
       try {
-        const text = await file.text()
-        const parsed = JSON.parse(text) as Manifest
+        const parsed = await parseComparisonManifestFile(file)
         comparisonManifest.value = parsed
         checkSchemaCompat(parsed)
         return
-      } catch {
-        loadError.value = 'Failed to parse manifest.json'
+      } catch (error) {
+        loadError.value = error instanceof Error
+          ? `Failed to load manifest.json: ${error.message}`
+          : 'Failed to load manifest.json'
         return
       }
     }
@@ -263,15 +285,18 @@ async function onDirectorySelected(event: Event) {
     const relPath = (file as any).webkitRelativePath as string
     if (relPath.endsWith('index.html') && relPath.includes('reports/')) {
       try {
-        const html = await file.text()
-        const match = html.match(/window\.__MANIFEST__\s*=\s*({[\s\S]*?});?\s*<\/script>/)
-        if (match) {
-          const parsed = JSON.parse(match[1]) as Manifest
+        const parsed = await parseComparisonReportFile(file)
+        if (parsed) {
           comparisonManifest.value = parsed
           checkSchemaCompat(parsed)
           return
         }
-      } catch { /* ignore */ }
+      } catch (error) {
+        loadError.value = error instanceof Error
+          ? `Failed to load embedded manifest: ${error.message}`
+          : 'Failed to load embedded manifest'
+        return
+      }
     }
   }
 

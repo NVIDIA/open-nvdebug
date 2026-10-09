@@ -17,17 +17,19 @@
 """
 Utils module for NVDebug Tool.
 
-This module provides utility functions and classes for the NVDebug tool including:
-    - Console output and sanitization
-    - Constants and enumerations
-    - Dependency checking
-    - File and JSON utilities
-    - Logging setup
-    - Resource management
-    - YAML processing
-    - Variable substitution
-    - Timing management
-    - URI configuration
+This module provides utility functions and classes for the NVDebug tool
+including:
+
+- Console output and sanitization.
+- Constants and enumerations.
+- Dependency checking.
+- File and JSON utilities.
+- Logging setup.
+- Resource management.
+- YAML processing.
+- Variable substitution.
+- Timing management.
+- URI configuration.
 """
 
 # Import all utility modules and their public functions/classes
@@ -35,6 +37,7 @@ from . import (
     console_output,
     constants,
     dependency_checker,
+    dns_utils,
     enums,
     file_utils,
     json_utils,
@@ -52,6 +55,13 @@ from . import (
 from .console_output import SanitizedConsole as ConsoleOutput
 from .constants import *
 from .dependency_checker import DependencyChecker
+from .dns_utils import (
+    is_ip_literal,
+    resolve_hostname_to_ip,
+    reverse_lookup_hostname,
+    reverse_lookup_short_hostname,
+    short_hostname_from_fqdn,
+)
 from .enums import (
     CollectionLevel,
     CollectorServiceMapping,
@@ -80,6 +90,7 @@ __all__ = [
     "console_output",
     "constants",
     "dependency_checker",
+    "dns_utils",
     "enums",
     "file_utils",
     "json_utils",
@@ -111,9 +122,14 @@ __all__ = [
     "ensure_directory_exists",
     "get_collector_group_from_id",
     "get_main_preflight_names",
+    "is_ip_literal",
     "get_preflight_enum_from_service",
     "is_directory_empty",
     "process_value_for_json",
+    "resolve_hostname_to_ip",
+    "reverse_lookup_hostname",
+    "reverse_lookup_short_hostname",
     "safe_json_dump",
     "safe_json_dumps",
+    "short_hostname_from_fqdn",
 ]

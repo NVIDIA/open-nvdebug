@@ -1,3 +1,18 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 import { mount } from '@vue/test-utils'
 import { describe, expect, it, vi } from 'vitest'
 import VerticalExecutionTimeline from '@/components/charts/VerticalExecutionTimeline.vue'
@@ -119,5 +134,31 @@ describe('VerticalExecutionTimeline', () => {
 
     expect(scrollIntoView).toHaveBeenCalledWith({ behavior: 'smooth', block: 'center' })
     getElementById.mockRestore()
+  })
+
+  it('counts and warning-styles degraded collectors as issues', () => {
+    const wrapper = mount(VerticalExecutionTimeline, {
+      props: {
+        perDut: [{
+          dut_id: 'DUT_A',
+          duration: 10,
+          collectors: [{
+            id: 'R_DEGRADED',
+            name: 'Usable Payload',
+            group: 'redfish',
+            duration: 10,
+            start_time: '2026-05-13T20:00:00Z',
+            end_time: '2026-05-13T20:00:10Z',
+            status: 'degraded',
+            stage_timing: stageTiming,
+          }],
+        }],
+      },
+    })
+
+    expect(wrapper.text()).toContain('1 issues')
+    expect(wrapper.find('.vexec__dot--degraded').exists()).toBe(true)
+    expect(wrapper.find('.vexec__event--degraded').exists()).toBe(true)
+    expect(wrapper.find('.vexec__status--degraded').exists()).toBe(true)
   })
 })

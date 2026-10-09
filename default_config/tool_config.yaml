@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Open NVDebug Tool Configuration
 # This file contains tool-wide configuration settings overrides.
 
@@ -23,6 +38,26 @@
 # Maximum consecutive duplicate URLs before stopping pagination
 # --------------------------------------------------------------
 # max_duplicate_url_retries: 3
+
+# Run-owned Redfish request-capture boundary
+# These limits actively bound all generic and Redfish request capture across a
+# collection run, including zero-byte private objects, readers, and descriptors.
+# max_concurrent_private_spool_bytes counts live staged records, JSONL spools,
+# verified candidates, and publication staging and must be at least 2x
+# max_artifact_bytes. Sanitized artifacts remain rollback-pending until their
+# collector status durably adopts their path and digest.
+# --------------------------------------------------------------
+# redfish_request_capture:
+#   enabled: true
+#   max_record_bytes: 268435456
+#   max_artifact_bytes: 2147483648
+#   max_concurrent_private_spool_bytes: 8589934592
+#   max_concurrent_private_objects: 256
+#   max_concurrent_private_readers: 64
+#   max_concurrent_private_file_descriptors: 257
+#   worker_count: 16
+#   max_records: 100000
+#   min_free_space_reserve_bytes: 536870912
 
 # Output configuration
 #   directory: The directory to store the output, default is /tmp/nvdebug, you can set via cli --outdir
@@ -87,11 +122,19 @@
 #     SoftwareInventory: "/redfish/v1/UpdateService/SoftwareInventory"
 
 # Redfish session configuration
+#   authentication_mode: "auto" prefers advertised HTTPS token sessions and reuses
+#                        them for collection. "session" requires token support;
+#                        "basic" explicitly retains per-request Basic authentication.
+#                        Authentication rejection never triggers a Basic downgrade.
 #   connection_pool_limit: Total connection pool size for parallel operations
 #   connection_pool_limit_per_host: Connections per host (BMC-friendly)
 #   session_timeout: Session timeout in seconds
 #   keepalive_timeout: Keep connections alive for this duration
-#   ssl_verify: SSL certificate verification (false for BMC self-signed certs)
+#   *_max_bytes: Finite response/cache byte ceilings (positive signed 64-bit integers)
+#   tls_mode: Redfish server trust policy (system_ca, custom_ca, fingerprint, insecure)
+#   ca_file: CA bundle path required by custom_ca mode
+#   fingerprint_sha256: Certificate SHA-256 fingerprint required by fingerprint mode
+#   server_name: Optional TLS SNI/hostname override (useful through localhost tunnels)
 #   ttl_dns_cache: DNS cache TTL in seconds
 #   use_dns_cache: Enable DNS caching
 #   force_close: Keep connections alive (false recommended)
@@ -102,6 +145,7 @@
 # * Be sure to uncomment the entire redfish_session_config block to use it.
 # --------------------------------------------------------------
 # redfish_session_config:
+#   authentication_mode: "auto"
 #   # Connection pool settings
 #   connection_pool_limit: 20          # Total connection pool size
 #   connection_pool_limit_per_host: 8  # Connections per host (BMC-friendly)
@@ -110,8 +154,32 @@
 #   session_timeout: 300               # Session timeout in seconds (5 minutes)
 #   keepalive_timeout: 300             # Keep connections alive for this duration
 #
-#   # TCP Connector settings
-#   ssl_verify: false                   # SSL certificate verification (false for BMC self-signed certs)
+#   # Bounded response/cache profile. Raw binary attachments stream to private
+#   # disk staging and must fit both their byte ceiling and the free-space reserve.
+#   # Raise only the category required by a known platform response.
+#   structured_response_max_bytes: 67108864   # 64 MiB JSON/text response
+#   attachment_max_bytes: 2147483648           # 2 GiB streamed attachment
+#   error_response_max_bytes: 1048576         # 1 MiB HTTP error body
+#   # Retained oversized-error evidence is head/tail plus digests, never a raw
+#   # body. The per-response ceiling cannot exceed error_response_max_bytes or
+#   # the retry-wide aggregate; aggregate bytes and response count both cap a
+#   # request's retry history while preserving first and terminal evidence.
+#   error_evidence_max_bytes: 262144           # 256 KiB per response
+#   error_evidence_aggregate_max_bytes: 1048576 # 1 MiB across retries
+#   error_evidence_max_responses: 4            # retained responses per request
+#   preflight_response_max_bytes: 1048576     # 1 MiB credential probe
+#   cache_max_bytes: 33554432                 # 32 MiB aggregate cache
+#   cache_entry_max_bytes: 4194304            # 4 MiB per cache entry
+#
+#   # TLS trust settings. Server authentication is disabled by default for
+#   # compatibility with self-signed BMCs on trusted management networks.
+#   tls_mode: insecure                 # Compatibility default; no server authentication
+#   # tls_mode: system_ca              # Opt into operating-system CA roots
+#   # tls_mode: custom_ca              # Trust a private/manufacturer CA bundle
+#   # ca_file: /etc/nvdebug/redfish-ca.pem
+#   # tls_mode: fingerprint            # Pin one exact leaf certificate
+#   # fingerprint_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"  # synthetic example  # pragma: allowlist secret
+#   # server_name: bmc.example.com     # Optional when URL host differs (for example, a tunnel)
 #   ttl_dns_cache: 300                 # DNS cache TTL in seconds
 #   use_dns_cache: true                # Enable DNS caching
 #   force_close: false                 # Keep connections alive
@@ -123,6 +191,18 @@
 #   # Fallback session settings (more conservative)
 #   fallback_connection_pool_limit: 15
 #   fallback_connection_pool_limit_per_host: 6
+#
+# Limit precedence is explicit CLI > tool YAML > environment > defaults.
+# Environment uses nested names such as
+# REDFISH_SESSION_CONFIG__STRUCTURED_RESPONSE_MAX_BYTES=134217728.
+# CLI uses --redfish-structured-response-max-bytes (and equivalent category flags).
+
+# SSH host-key authentication is disabled by default for password-only
+# compatibility on trusted management networks. To opt into strict checking:
+# ssh_host_key_policy: "strict"
+# ssh_known_hosts_file: "/etc/nvdebug/known_hosts"
+# The accepted compatibility default can be stated as:
+# ssh_host_key_policy: "insecure"
 
 # Preflight credential validation configuration
 #   validate_credentials_in_preflight: Enable/disable credential validation during preflight checks
@@ -418,4 +498,3 @@ EXPAND_QUERY_SYSTEM_LEVEL: 1
 # Can be overridden per-DUT in dut_config.yaml under DUT_Defaults or individual duts.
 # --------------------------------------------------------------
 # EXTRA_LOG_COLLECTION: true
-

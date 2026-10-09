@@ -17,11 +17,12 @@
 Core module for the NVDebug Tool.
 
 This module contains core functionality including:
-    - DUTManager: Manages Device Under Test instances
-    - DUT: Device Under Test representation
-    - DUTCredentials: DUT authentication credentials
-    - DUTConnectionState: DUT connection state tracking
-    - AsyncSafeLogger: Thread-safe async logging
+
+- DUTManager: Manages Device Under Test instances.
+- DUT: Device Under Test representation.
+- DUTCredentials: DUT authentication credentials.
+- DUTConnectionState: DUT connection state tracking.
+- AsyncSafeLogger: Thread-safe async logging.
 """
 
 from .async_logger import AsyncSafeLogger

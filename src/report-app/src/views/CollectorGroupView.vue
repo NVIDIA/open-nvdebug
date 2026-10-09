@@ -1,3 +1,20 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 <template>
   <div style="min-height: calc(100vh - 88px);">
     <!-- Left Sidebar -->
@@ -10,7 +27,7 @@
       <div class="nv-sidebar__section">
         <h4 class="nv-sidebar__section-title nv-glass--accent" style="padding: 4px 8px; border-radius: var(--nv-radius-sm); margin-bottom: 8px;">Collector Groups</h4>
         <div v-for="g in dut?.collector_groups" :key="g.name" style="margin-bottom: 4px;">
-          <router-link :to="`/dut/${dutId}/${g.name}`" :class="['nv-sidebar__link', { 'nv-sidebar__link--active': g.name === groupName }]">
+          <router-link :to="collectorGroupRoute(dutId, g.name)" :class="['nv-sidebar__link', { 'nv-sidebar__link--active': g.name === groupName }]">
             <ServiceBadge :service="g.name" />
             <span class="nv-badge nv-badge--neutral" style="margin-left: auto;">{{ g.collectors.length }}</span>
           </router-link>
@@ -25,7 +42,7 @@
         <router-link
           v-for="c in sidebarCollectors"
           :key="c.id"
-          :to="`/dut/${dutId}/${groupName}/${c.id}`"
+          :to="collectorDetailRoute(dutId, groupName, c.id)"
           class="nv-sidebar__link"
           style="font-size: 0.6875rem; padding: 3px 0; display: flex; align-items: center; gap: 6px;"
         >
@@ -37,10 +54,23 @@
 
     <!-- Main Content -->
     <div class="nv-page" style="margin-left: 260px;">
-      <Breadcrumbs :items="[{ label: 'Home', to: '/' }, { label: dutId, to: `/dut/${dutId}` }, { label: groupName }]" />
+      <Breadcrumbs :items="[{ label: 'Home', to: '/' }, { label: dutId, to: dutRoute(dutId) }, { label: groupName }]" />
       <h2 class="nv-page__title" style="margin: 12px 0 16px;">
         <ServiceBadge :service="groupName" /> Collectors — {{ dutId }}
       </h2>
+
+      <div
+        v-if="groupMetadataVisible"
+        class="nv-glass nv-glass--subtle"
+        data-testid="collector-group-metadata"
+        style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 8px 12px; margin-bottom: 16px; font-size: 0.75rem; color: var(--nv-text-secondary);"
+      >
+        <span v-if="group?.access_path"><strong>Access path:</strong> {{ formatAccessPath(group.access_path) }}</span>
+        <template v-if="group?.component_labels?.length">
+          <strong>Components:</strong>
+          <span v-for="label in group.component_labels" :key="label" class="nv-badge nv-badge--neutral">{{ label }}</span>
+        </template>
+      </div>
 
       <!-- Group Preflight Checks -->
       <div v-if="groupPreflightChecks.length > 0" class="nv-glass nv-glass--subtle" style="padding: var(--nv-space-4); margin-bottom: 16px;">
@@ -90,8 +120,7 @@
           :columns="columns"
           :data="visibleCollectors"
           :searchable="true"
-          :fill-viewport="true"
-          @row-click="(row) => router.push(`/dut/${dutId}/${groupName}/${row.id}`)"
+          @row-click="(row) => router.push(collectorDetailRoute(dutId, groupName, row.id))"
         >
           <template #cell-status="{ value }">
             <StatusBadge :status="value" />
@@ -134,6 +163,8 @@ import DependencyTable from '@/components/common/DependencyTable.vue'
 import ReasonDisplay from '@/components/common/ReasonDisplay.vue'
 import { dedupFiles } from '@/utils/dedupFiles'
 import { formatDuration } from '@/utils/format'
+import { formatAccessPath } from '@/utils/reportMetadata'
+import { collectorDetailRoute, collectorGroupRoute, dutRoute } from '@/utils/reportRoutes'
 
 const route = useRoute()
 const router = useRouter()
@@ -150,25 +181,37 @@ const group = computed(() => {
   return d.collector_groups.find(g => g.name.toLowerCase() === gn)
 })
 
+const groupMetadataVisible = computed(() =>
+  group.value?.access_path !== undefined || Boolean(group.value?.component_labels?.length)
+)
+
 const showNotRan = ref(false)
 
 function statusDotColor(status: string): string {
   const map: Record<string, string> = {
-    success: 'var(--nv-success)', error: 'var(--nv-error)', partial: 'var(--nv-warning)',
+    success: 'var(--nv-success)', degraded: 'var(--nv-warning)', error: 'var(--nv-error)', partial: 'var(--nv-warning)',
     skipped: 'var(--nv-skipped)', not_ran: 'var(--nv-text-tertiary)',
   }
   return map[status] ?? 'var(--nv-text-tertiary)'
 }
 
 interface Column { key: string; label: string; formatter?: (value: unknown, row: Record<string, unknown>) => string }
-const columns: Column[] = [
+const hasCollectorComponentMetadata = computed(() =>
+  (group.value?.collectors ?? []).some(collector => Boolean(collector.component_label))
+)
+const hasCollectorAccessMetadata = computed(() =>
+  (group.value?.collectors ?? []).some(collector => collector.access_path !== undefined)
+)
+const columns = computed<Column[]>(() => [
   { key: 'id', label: 'ID' },
   { key: 'name', label: 'Name' },
+  ...(hasCollectorComponentMetadata.value ? [{ key: 'component_label', label: 'Component' }] : []),
+  ...(hasCollectorAccessMetadata.value ? [{ key: 'access_path', label: 'Access Path' }] : []),
   { key: 'status', label: 'Status' },
   { key: 'execution_time', label: 'Exec Time', formatter: value => formatDuration(Number(value ?? 0)) },
   { key: 'reason', label: 'Reason' },
   { key: 'files', label: 'Files' },
-]
+])
 
 const collectors = computed(() =>
   (group.value?.collectors ?? []).map(c => {
@@ -176,9 +219,14 @@ const collectors = computed(() =>
     return {
       id: c.id,
       name: c.name,
+      component_label: c.component_label ?? '',
+      access_path: c.access_path ? formatAccessPath(c.access_path) : '',
       status: c.status,
       execution_time: c.execution_time,
-      reason: c.status === 'success' ? '\u2014' : (c.reason || '\u2014'),
+      // Successful empty collections carry useful evidence (for example,
+      // "endpoint queried; no entries found"). Preserve that note instead of
+      // hiding every success reason behind an em dash.
+      reason: c.reason || '\u2014',
       files: uniqueFiles.length,
       _files: uniqueFiles,
     }

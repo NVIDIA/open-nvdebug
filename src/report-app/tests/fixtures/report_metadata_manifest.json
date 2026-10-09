@@ -1,0 +1,119 @@
+{
+  "schema_version": "2.0",
+  "version": "2.0",
+  "generated_at": "2026-08-04T20:00:00Z",
+  "tool_version": "2.2.0",
+  "tool_config": {
+    "collection_level": "L1",
+    "execution_mode": "RemoteClient",
+    "baseboard": "legacy-board"
+  },
+  "duts": [
+    {
+      "id": "DUT_METADATA",
+      "baseboard": "legacy-board",
+      "node_type": "legacy-node",
+      "bmc_ip": "192.0.2.10",
+      "platform_identity": {
+        "baseboard": "VR-NVL72",
+        "node_type": "compute",
+        "model": "DGX GB300",
+        "part_number": "699-2G530-0200-000",
+        "serial_number": "metadata-serial-001"
+      },
+      "security_mode": {
+        "status": "reported",
+        "value": "production",
+        "source": "dut_config.security_mode"
+      },
+      "system_info": {
+        "model": "Legacy model",
+        "part_number": "legacy-part",
+        "serial_number": "legacy-serial",
+        "firmware": []
+      },
+      "collector_groups": [
+        {
+          "name": "redfish",
+          "service_type": "redfish",
+          "access_path": "redfish",
+          "component_labels": ["BMC"],
+          "total_execution_time": 1.5,
+          "collectors": [
+            {
+              "id": "R_METADATA",
+              "name": "Metadata Collector",
+              "component_label": "BMC",
+              "access_path": "redfish",
+              "status": "success",
+              "execution_time": 1.5,
+              "start_time": "2026-08-04T20:00:01Z",
+              "end_time": "2026-08-04T20:00:02Z",
+              "reason": "",
+              "dependencies": [],
+              "collection_level": "L1",
+              "files": [
+                {
+                  "path": "DUT_METADATA/redfish/metadata.json",
+                  "size": 128,
+                  "type": "json",
+                  "collector_id": "R_METADATA",
+                  "component_label": "BMC",
+                  "access_path": "redfish"
+                }
+              ],
+              "stage_timing": {
+                "validation": 0.1,
+                "discovery": 0.2,
+                "execution": 1.0,
+                "post_processing": 0.2
+              }
+            }
+          ]
+        }
+      ],
+      "status_summary": {
+        "success": 1,
+        "error": 0,
+        "partial": 0,
+        "skipped": 0,
+        "cancelled": 0,
+        "not_ran": 0,
+        "running": 0,
+        "pending": 0
+      },
+      "overall_status": "success",
+      "execution_time": 1.5,
+      "log_size": 128
+    }
+  ],
+  "file_index": [
+    {
+      "dut_id": "DUT_METADATA",
+      "collector_group": "redfish",
+      "collector_id": "R_METADATA",
+      "collector_name": "Metadata Collector",
+      "component_label": "BMC",
+      "access_path": "redfish",
+      "path": "DUT_METADATA/redfish/metadata.json",
+      "size": 128,
+      "type": "json"
+    }
+  ],
+  "errors": [],
+  "collection_summary": {
+    "total_duts": 1,
+    "total_collectors_executed": 1,
+    "total_collectors_in_catalog": 1,
+    "total_collectors_filtered_out": 0,
+    "total_log_size": 128,
+    "total_runtime": 1.5,
+    "overall_collection_pct": 100,
+    "status_counts": {
+      "success": 1,
+      "error": 0,
+      "partial": 0,
+      "skipped": 0
+    }
+  }
+}
