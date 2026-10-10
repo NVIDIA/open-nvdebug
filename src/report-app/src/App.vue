@@ -1,5 +1,21 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 <template>
-  <Transition name="app-enter">
     <div v-if="appReady" id="app" :data-theme="themeStore.theme" style="min-height: 100vh; display: flex; flex-direction: column;">
       <AppNavbar
         @open-search="commandPaletteRef?.show()"
@@ -7,7 +23,16 @@
       />
 
       <div
-        v-if="fileSystemStore.integrityStatus && !fileSystemStore.integrityOk"
+        v-if="manifestStore.loadError"
+        class="nv-banner nv-banner--warning"
+        style="margin-top: 52px; margin-bottom: 0;"
+      >
+        <span>&#9888;&#65039;</span>
+        <span>{{ manifestStore.loadError }}</span>
+      </div>
+
+      <div
+        v-if="fileSystemStore.integrityStatus?.missing.length"
         class="nv-banner nv-banner--warning"
         style="margin-top: 52px; margin-bottom: 0;"
       >
@@ -43,11 +68,10 @@
       <Toast />
       <BackToTop />
     </div>
-  </Transition>
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, nextTick, onMounted, onUnmounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import AppNavbar from '@/components/layout/AppNavbar.vue'
 import DirectoryPicker from '@/components/layout/DirectoryPicker.vue'
@@ -64,6 +88,7 @@ import { useManifestStore } from '@/stores/manifest'
 import { useFileSystemStore } from '@/stores/fileSystem'
 import { useSearchStore } from '@/stores/search'
 import { useAnnotationsStore } from '@/stores/annotations'
+import { createReportLoadReporter, failReportStartup, finishReportStartup, yieldForPaint } from '@/services/reportStartup'
 
 const vueRouter = useRouter()
 const vueRoute = useRoute()
@@ -74,6 +99,7 @@ const searchStore = useSearchStore()
 const annotationsStore = useAnnotationsStore()
 
 const appReady = ref(false)
+let disposed = false
 const commandPaletteRef = ref<InstanceType<typeof CommandPalette>>()
 const quickFileOpenRef = ref<InstanceType<typeof QuickFileOpen>>()
 const shortcutHelpRef = ref<InstanceType<typeof ShortcutHelpModal>>()
@@ -123,17 +149,37 @@ function onGlobalKeydown(e: KeyboardEvent) {
   }
 }
 
-onMounted(() => {
-  themeStore.init()
-  manifestStore.loadFromWindow()
-  if (manifestStore.generatedAt) {
-    annotationsStore.init(manifestStore.generatedAt)
+onMounted(async () => {
+  try {
+    themeStore.init()
+    const reportProgress = createReportLoadReporter()
+    await manifestStore.loadInitial(reportProgress)
+    if (disposed) return
+    await vueRouter.isReady()
+    await reportProgress({ stage: 'rendering' })
+    if (disposed) return
+    if (manifestStore.loaded && fileSystemStore.mode === 'http') {
+      void fileSystemStore.checkHttpIntegrity(manifestStore.fileIndex).catch(() => {
+        console.error('[FileSystemStore] HTTP integrity check failed')
+      })
+    }
+    if (manifestStore.generatedAt) {
+      annotationsStore.init(manifestStore.generatedAt)
+    }
+    window.addEventListener('keydown', onGlobalKeydown)
+    appReady.value = true
+    await nextTick()
+    await yieldForPaint()
+    if (!disposed) finishReportStartup()
+  } catch {
+    if (!disposed) failReportStartup()
+    console.error('[ReportStartup] Could not initialize the report')
   }
-  window.addEventListener('keydown', onGlobalKeydown)
-  appReady.value = true
 })
 
 onUnmounted(() => {
+  disposed = true
+  fileSystemStore.cancelHttpIntegrityCheck()
   window.removeEventListener('keydown', onGlobalKeydown)
 })
 </script>
@@ -144,13 +190,6 @@ onUnmounted(() => {
   margin-top: 52px;
   padding-bottom: 36px;
   overflow-x: clip;
-}
-
-.app-enter-enter-active {
-  transition: opacity 0.35s ease;
-}
-.app-enter-enter-from {
-  opacity: 0;
 }
 
 .page-enter-active {

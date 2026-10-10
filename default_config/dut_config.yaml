@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Currently only supports same type of DUT with the same config file passed through -C option
 # Settings that are common among DUTs can be filled in DUT_Defaults.
 # DUT specific details like BMC IP, etc, can be overriden for each dut object
@@ -34,6 +49,33 @@ DUT_Defaults: &dut_defaults ## User should not modify this line or add anything 
   RF_User: ""
   RF_Pass: ""
 
+  # Redfish TLS server authentication is disabled by default for compatibility
+  # with lab/manufacturing BMCs using self-signed certificates. On a trusted
+  # management network, credentials alone are sufficient. To opt into the
+  # operating-system CA trust store, select:
+  # bmc_rf_tls_mode: "system_ca"
+  #
+  # For an internal CA, install or obtain its CA bundle through your approved
+  # provisioning channel and configure:
+  # bmc_rf_tls_mode: "custom_ca"
+  # bmc_rf_ca_file: "/path/to/approved-bmc-ca.pem"
+  #
+  # For a self-signed certificate, independently verify the certificate's
+  # SHA-256 fingerprint through the BMC management UI, provisioning records,
+  # or the system owner before configuring:
+  # bmc_rf_tls_mode: "fingerprint"
+  # bmc_rf_fingerprint_sha256: "<verified 64-hex SHA-256 certificate fingerprint>"
+  #
+  # When connecting through a tunnel or IP address, set the certificate name:
+  # bmc_rf_tls_server_name: "bmc.example.internal"
+  #
+  # "insecure" is the accepted compatibility default and can be stated explicitly:
+  # bmc_rf_tls_mode: "insecure"
+  #
+  # Legacy migration:
+  #   bmc_rf_verify_ssl: true  -> bmc_rf_tls_mode: "system_ca"
+  #   bmc_rf_verify_ssl: false -> bmc_rf_tls_mode: "insecure"
+
   # Port to be used for port forwarding
   # To collect certain logs from HMC, port forwarding needs to be setup. NVDebug will setup port forwarding using the provided port
   # If no port is provided below, the default port 18888 will be used
@@ -46,8 +88,12 @@ DUT_Defaults: &dut_defaults ## User should not modify this line or add anything 
   HOST_USERNAME: ""
   HOST_PASSWORD: ""
   # HOST_SSH_KEY_PATH: ""
-  # HOST_SSH_PASSWORDLESS: false # Assuming you have configured passwordless sudo, via sudoers. If you have not please either provide a keypath or a password 
+  # HOST_SSH_PASSWORDLESS: false # SSH authentication only; sudo is configured separately below.
   # HOST_SSH_PORT: 22
+  # With a key path, HOST_PASSWORD unlocks the local private key only.
+  # Optional remote sudo password; omit if sudo needs no password prompt.
+  # Password-based SSH otherwise continues to reuse HOST_PASSWORD for sudo.
+  # host_sudo_password: ""
 
   # NVIDIA Bug Report Settings (H11)
   # Enables additional log collection when set to true. This runs
@@ -62,7 +108,7 @@ DUT_Defaults: &dut_defaults ## User should not modify this line or add anything 
   #   prefix instead of RF_DEFAULT_PREFIX. Useful when the Customer BMC exposes HMC resources
   #   under a different Redfish root path. Takes precedence over uri_overrides.hmc_prefix_override.
   RF_AUTH: true # Indicates if REST API authentication is required by the Redfish service. True by default
-  # RF_HMC_ACCESS_METHOD: HostBmcTcpPortForwarding # This is the default access method for HMC. Available options are: HostBmcTcpPortForwarding, HostBmcTcp, HmcTcpPortForwarding, HmcTcp
+  # RF_HMC_ACCESS_METHOD: HostBmcTcpPortForwarding # Available options: HostBmcTcpPortForwarding, HostBmcTcp, HmcTcpPortForwarding, HmcTcp
 
   # Port forwarding configuration
   # If set to true, the tool will use port forwarding to collect logs from HMC
@@ -75,14 +121,25 @@ DUT_Defaults: &dut_defaults ## User should not modify this line or add anything 
   # Port to be used for port forwarding
   # If no port is provided below, the default port 18888 will be used
   # TUNNEL_TCP_PORT: 18888
-  
+
   # SSH tunnel configuration (for port forwarding)
+  # Host-key verification is disabled by default for password-only compatibility
+  # on trusted management networks. To opt into OpenSSH known-hosts trust:
+  # ssh_host_key_policy: "strict"
+  # ssh_known_hosts_file: "/etc/nvdebug/known_hosts"
+  # To state the accepted compatibility default explicitly:
+  # ssh_host_key_policy: "insecure"
+  # Legacy StrictHostKeyChecking=no/false/off values in SSH_TUNNEL_OPTIONS are
+  # migrated to that same DUT-wide insecure policy. It applies to BMC, HMC,
+  # Host, proxy/jump-host, SFTP, and OpenSSH tunnel routes for the DUT.
   # Local host to bind the tunnel to (default: localhost)
   # TUNNEL_LOCAL_HOST: "localhost"
-  # SSH options for tunnel creation
-  # SSH_TUNNEL_OPTIONS: "-4 -o StrictHostKeyChecking=no -o LogLevel=ERROR -fNT"
-  # SSH command prefix (e.g., "sshpass -p" for password auth, or empty for key-based auth)
-  # SSH_TUNNEL_PREFIX: "sshpass -p"
+  # At execution, nvdebug appends host-key controls from ssh_host_key_policy.
+  # SSH_TUNNEL_OPTIONS: "-4 -o LogLevel=ERROR -fNT"
+  # Passwords are read from descriptor 0 instead of being exposed in argv.
+  # The older "sshpass -p" spelling is accepted only as a migration alias and
+  # is normalized to this descriptor-safe value.
+  # SSH_TUNNEL_PREFIX: "sshpass -d 0"
 
   # Specify whether the BMC/Host network is "ipv4" or "ipv6". Default is "ipv4"
   IP_NETWORK: 'ipv4'
@@ -100,4 +157,3 @@ DUT_Defaults: &dut_defaults ## User should not modify this line or add anything 
 #   BMC_IP: ""
 #   BMC_USERNAME: ""
 #   BMC_PASSWORD: ""
-

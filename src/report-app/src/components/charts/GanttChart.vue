@@ -1,3 +1,20 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 <template>
   <div ref="rootRef" :class="['gantt', { 'gantt--fullscreen': isFullscreen }]">
     <!-- Toolbar -->
@@ -185,6 +202,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
+import { collectorDetailRoute } from '@/utils/reportRoutes'
 
 interface PerDutCollector {
   id: string
@@ -467,6 +485,7 @@ const legendItems = computed(() => {
   }
   const map: Record<string, { label: string; css: string }> = {
     success: { label: 'Success', css: 'success' },
+    degraded: { label: 'Degraded', css: 'warning' },
     error: { label: 'Error', css: 'error' },
     partial: { label: 'Partial', css: 'warning' },
     skipped: { label: 'Skipped', css: 'text-tertiary' },
@@ -549,7 +568,7 @@ function hideTooltip() {
 }
 
 function navigateToCollector(bar: GanttBar) {
-  router.push(`/dut/${encodeURIComponent(bar.dutId)}/${encodeURIComponent(bar.group)}/${encodeURIComponent(bar.id)}`)
+  router.push(collectorDetailRoute(bar.dutId, bar.group, bar.id))
 }
 
 let resizeObserver: ResizeObserver | null = null
@@ -738,6 +757,7 @@ watch(() => props.perDut, () => nextTick(fitToWidth))
   z-index: 1;
 }
 .gantt__bar--success { background: var(--nv-success); }
+.gantt__bar--degraded { background: var(--nv-warning); }
 .gantt__bar--error { background: var(--nv-error); }
 .gantt__bar--partial { background: var(--nv-warning); }
 .gantt__bar--skipped { background: var(--nv-text-tertiary); }
@@ -877,6 +897,7 @@ watch(() => props.perDut, () => nextTick(fitToWidth))
   text-transform: capitalize;
 }
 .gantt__tooltip-status--success { color: var(--nv-success); font-weight: 600; }
+.gantt__tooltip-status--degraded { color: var(--nv-warning); font-weight: 600; }
 .gantt__tooltip-status--error { color: var(--nv-error); font-weight: 600; }
 .gantt__tooltip-status--partial { color: var(--nv-warning); font-weight: 600; }
 .gantt__tooltip-status--skipped { color: var(--nv-text-tertiary); }

@@ -1,3 +1,20 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 <template>
   <div style="min-height: calc(100vh - 88px);">
     <div class="nv-sidebar">
@@ -87,7 +104,7 @@
             :data="displayErrors"
             :searchable="true"
             :fill-viewport="true"
-            @row-click="(row: Record<string, any>) => router.push(`/dut/${encodeURIComponent(row.dut_id)}/${encodeURIComponent(row.collector_group)}/${encodeURIComponent(row.collector_id)}`)"
+            @row-click="(row: Record<string, any>) => router.push(collectorDetailRoute(row.dut_id, row.collector_group, row.collector_id))"
           >
             <template #cell-collector_group="{ value }">
               <ServiceBadge :service="value" />
@@ -108,6 +125,7 @@ import PageLoader from '@/components/common/PageLoader.vue'
 import DataTable from '@/components/common/DataTable.vue'
 import ServiceBadge from '@/components/common/ServiceBadge.vue'
 import AnalysisNav from '@/components/common/AnalysisNav.vue'
+import { collectorDetailRoute } from '@/utils/reportRoutes'
 
 const router = useRouter()
 const manifestStore = useManifestStore()

@@ -1,3 +1,20 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 <template>
   <div class="nv-log">
     <!-- Filter Bar -->
@@ -6,14 +23,15 @@
         v-model="searchText"
         type="text"
         placeholder="Search logs..."
+        aria-label="Search logs"
         class="nv-input nv-input--sm"
         style="width: 200px;"
       />
-      <select v-model="levelFilter" class="nv-select nv-select--sm">
+      <select v-model="levelFilter" aria-label="Log level" class="nv-select nv-select--sm">
         <option value="">All Levels</option>
         <option v-for="level in levels" :key="level" :value="level">{{ level }}</option>
       </select>
-      <select v-model="componentFilter" class="nv-select nv-select--sm">
+      <select v-model="componentFilter" aria-label="Log component" class="nv-select nv-select--sm">
         <option value="">All Components</option>
         <option v-for="comp in components" :key="comp" :value="comp">{{ comp }}</option>
       </select>
@@ -21,7 +39,14 @@
         {{ visibleLines.length }} / {{ parsedLines.length }} lines
       </span>
       <button @click="copyFiltered" class="nv-btn nv-btn--sm" title="Copy filtered">Copy</button>
-      <button @click="downloadFiltered" class="nv-btn nv-btn--sm" title="Download filtered">Download</button>
+      <button @click="downloadFiltered" class="nv-btn nv-btn--primary nv-btn--row-action" title="Download filtered">
+        <svg aria-hidden="true" width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M8 1v9M4 7l4 4 4-4M2 12v2h12v-2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" /></svg>
+        Download
+      </button>
+    </div>
+
+    <div v-if="preview.truncated" class="nv-log__preview-notice" role="status">
+      {{ previewNotice }} Download the original file to inspect omitted content.
     </div>
 
     <!-- Log Content -->
@@ -37,6 +62,7 @@
       >
         <span v-if="line.timestamp" class="nv-log__timestamp">[{{ line.timestamp }}] </span>
         <span v-if="line.level" :class="['nv-log__level', levelLabelClass(line.level)]">[{{ line.level }}] </span>
+        <span v-if="line.collectorId" class="nv-log__component">[CID:{{ line.collectorId }}] </span>
         <span v-if="line.component" class="nv-log__component">[{{ line.component }}] </span>
         <span class="nv-log__message">{{ line.message }}</span>
       </div>
@@ -51,14 +77,7 @@
 import { ref, computed } from 'vue'
 import { showToast } from '@/composables/useToast'
 import { copyToClipboard } from '@/utils/clipboard'
-
-interface ParsedLine {
-  raw: string
-  timestamp: string | null
-  level: string | null
-  component: string | null
-  message: string
-}
+import { parseLogPreview } from '@/utils/logLines'
 
 const props = withDefaults(defineProps<{
   content: string
@@ -72,16 +91,17 @@ const levelFilter = ref('')
 const componentFilter = ref('')
 const logContainer = ref<HTMLElement>()
 
-const LOG_PATTERN = /\[([^\]]+)\]\s+\[([^\]]+)\]\s+\[([^\]]+)\]\s+(.*)/
-
-const parsedLines = computed<ParsedLine[]>(() => {
-  return props.content.split('\n').map(raw => {
-    const match = raw.match(LOG_PATTERN)
-    if (match) {
-      return { raw, timestamp: match[1], level: match[2], component: match[3], message: match[4] }
-    }
-    return { raw, timestamp: null, level: null, component: null, message: raw }
-  })
+const preview = computed(() => parseLogPreview(props.content))
+const parsedLines = computed(() => preview.value.lines)
+const previewNotice = computed(() => {
+  const details: string[] = []
+  if (preview.value.omittedCharacters > 0) {
+    details.push(`${preview.value.omittedCharacters.toLocaleString()} characters omitted`)
+  }
+  if (preview.value.truncatedLineCount > 0) {
+    details.push(`${preview.value.truncatedLineCount.toLocaleString()} long lines truncated`)
+  }
+  return `Bounded log preview: ${details.join('; ')}.`
 })
 
 const levels = computed(() => [...new Set(parsedLines.value.map(l => l.level).filter(Boolean))].sort() as string[])

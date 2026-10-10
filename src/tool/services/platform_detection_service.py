@@ -13,16 +13,32 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 """
 Platform Detection Service for NVDebug Tool.
 
-Handles gathering platform information including FRU data, system identification,
-and hardware configuration from DUTs for platform and baseboard detection.
+Handles gathering platform information including FRU data, system
+identification, and hardware configuration from DUTs for platform and baseboard
+detection.
 """
 
+import asyncio
 import logging
 import re
 from typing import Any, Dict, Optional, Tuple
+
+from ..utils.platform_detection_profile import (
+    remaining_probe_max_score,
+    score_platform_detection_candidate,
+)
+from ..utils.redfish_limits import (
+    MAX_FOLLOWED_REDFISH_COLLECTION_MEMBERS,
+    bound_redfish_collection_members,
+)
+from ..utils.redfish_topology_profile import (
+    RedfishTopologyProfileError,
+    validate_redfish_uri_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,24 +46,63 @@ logger = logging.getLogger(__name__)
 class PlatformDetectionService:
     """
     Service for detecting platform information from DUTs.
+
+    The type coordinates ``_extract_first_string_field``, ``_model_is_generic``,
+    ``async_init``, ``_load_platform_mappings``, and
+    ``_build_platform_mappings_from_baseboards`` and retains the state those
+    operations share between calls. Resource ownership remains inside the
+    instance until the matching close, exit, or cleanup operation completes.
     """
+
+    MAX_FOLLOWED_COLLECTION_MEMBERS = min(MAX_FOLLOWED_REDFISH_COLLECTION_MEMBERS, 64)
+    MAX_REDFISH_DETECTION_REQUESTS = 128
+    REDFISH_DETECTION_DEADLINE_SECONDS = 30.0
+    REDFISH_REQUEST_TIMEOUT_SECONDS = 10.0
 
     def __init__(self, dut_manager, logger, baseboard_manager=None):
         """
         Initialize the Platform Detection Service.
 
+        The initializer records ``baseboard_manager``, ``dut_manager``,
+        ``logger``, ``platform_detection_profile``, and ``platform_mappings``
+        for later operations and establishes the instance invariants before any
+        public method runs.
+
         Args:
-            dut_manager: DUT manager instance.
-            logger: Logger instance.
-            baseboard_manager: Baseboard manager instance.
+            dut_manager: DUT manager consumed while the function attempts to
+                initialize the Platform Detection Service.
+            logger: Sanitized logger used for operator-visible diagnostics.
+            baseboard_manager: Optional baseboard manager; ``None`` selects the
+                function's default behavior.
         """
         self.dut_manager = dut_manager
         self.logger = logger
         self.baseboard_manager = baseboard_manager
         self.platform_mappings = {}  # Will be loaded in async_init()
+        self.platform_detection_profile = (
+            getattr(baseboard_manager, "platform_detection_profile", None)
+            if baseboard_manager
+            else None
+        )
 
     @staticmethod
     def _extract_first_string_field(payload: Any, field_name: str) -> Optional[str]:
+        """
+        Extract first string field.
+
+        The implementation uses ``payload`` and ``field_name`` to extract first
+        string field.
+
+        Args:
+            payload: Payload object whose ``get`` and ``values`` state is read
+                while performing extract first string field.
+            field_name: Field label included in validation failures for the
+                selected input.
+
+        Returns:
+            The canonical first string field text, or ``None`` when the
+            requested value is unavailable.
+        """
         if isinstance(payload, dict):
             value = payload.get(field_name)
             if isinstance(value, str) and value.strip():
@@ -69,6 +124,18 @@ class PlatformDetectionService:
 
     @staticmethod
     def _model_is_generic(model: str) -> bool:
+        """
+        Return the model is generic.
+
+        The implementation uses ``model`` to produce the model is generic.
+
+        Args:
+            model: Text supplied as model in the format accepted by this
+                function.
+
+        Returns:
+            Whether the model is generic operation succeeds.
+        """
         normalized = model.strip().lower()
         return normalized in {
             "",
@@ -82,83 +149,17 @@ class PlatformDetectionService:
             "ami redfish server",
             "gb hmc",
             "gb bmc",
-        } or normalized.startswith("unknownmodel")
-
-    @staticmethod
-    def _candidate_score(uri: str) -> int:
-        if uri.startswith("/redfish/v1/Systems/HGX_Baseboard_"):
-            return 700
-        if "/Systems/" in uri and "HGX_Baseboard" in uri:
-            return 690
-        if uri.startswith("/redfish/v1/Chassis/HGX_Chassis_") and uri.endswith(
-            "/Assembly"
-        ):
-            return 610
-        if uri.startswith("/redfish/v1/Chassis/HGX_Chassis_"):
-            return 620
-        if uri.startswith("/redfish/v1/Systems/System_"):
-            return 560
-        if uri.startswith("/redfish/v1/Systems/"):
-            return 520
-        if uri.startswith("/redfish/v1/Chassis/Chassis_") and uri.endswith(
-            "/Assembly"
-        ):
-            return 490
-        if uri.startswith("/redfish/v1/Chassis/Chassis_"):
-            return 500
-        if uri.startswith("/redfish/v1/Chassis/") and "BMC" in uri:
-            return 320
-        if uri.startswith("/redfish/v1/Chassis/HMC_"):
-            return 300
-        if uri.startswith("/redfish/v1/Chassis/"):
-            return 440
-        if uri == "/redfish/v1":
-            return 250
-        return 200
-
-    async def _probe_redfish_identity_candidate(
-        self,
-        dut_id: str,
-        uri: str,
-        platform_dict: Dict[str, str],
-    ) -> Optional[Dict[str, Any]]:
-        success, payload, _, _ = await self.dut_manager.execute_redfish_request(
-            dut_id, "GET", uri, timeout=10
-        )
-        if not success or not payload:
-            return None
-
-        model = self._extract_first_string_field(payload, "Model")
-        if model and model.startswith("$"):
-            chassis_id = uri.rstrip("/").split("/")[-1]
-            model = platform_dict.get(chassis_id, model)
-
-        if not model and uri == "/redfish/v1":
-            model = self._extract_first_string_field(payload, "Product")
-
-        if not model or self._model_is_generic(model):
-            return None
-
-        payload = dict(payload)
-        payload["Model"] = model
-        payload.setdefault(
-            "PartNumber", self._extract_first_string_field(payload, "PartNumber") or "N/A"
-        )
-        payload.setdefault(
-            "SerialNumber",
-            self._extract_first_string_field(payload, "SerialNumber") or "N/A",
-        )
-        return {
-            "score": self._candidate_score(uri),
-            "payload": payload,
-        }
+        } or normalized.startswith(("$", "unknownmodel"))
 
     async def async_init(self):
         """
         Async initialization - load platform mappings.
 
-        Args:
-            None
+        The implementation uses current instance state to async initialization -
+        load platform mappings. Owned asynchronous work is awaited before
+        return, so completion does not leave an unobserved task behind. It
+        updates ``platform_mappings`` on the instance as part of that state
+        transition.
         """
         self.platform_mappings = await self._load_platform_mappings()
 
@@ -166,12 +167,17 @@ class PlatformDetectionService:
         """
         Load platform mappings from spreadsheet configuration.
 
+        Get platform mappings from the baseboard manager (spreadsheet).
+
         Returns:
-            Dictionary of platform mappings.
+            A mapping containing platform mappings.
         """
         try:
             # Get platform mappings from the baseboard manager (spreadsheet)
             if self.baseboard_manager and self.baseboard_manager.baseboards:
+                self.platform_detection_profile = getattr(
+                    self.baseboard_manager, "platform_detection_profile", None
+                )
                 return self._build_platform_mappings_from_baseboards(
                     self.baseboard_manager.baseboards
                 )
@@ -207,17 +213,20 @@ class PlatformDetectionService:
         """
         Build platform mappings from baseboard configurations.
 
+        Build platform model mappings from baseboard platform_detection
+        sections.
+
         Args:
-            baseboards: Dictionary of baseboard configurations.
+            baseboards: Mapping supplying fields for platform mappings from
+                baseboard configurations.
+
+        Returns:
+            The validated ``platform_mappings``.
         """
         platform_mappings = {
             "redfish_chassis_mappings": {},
             "platform_model_mappings": [],
         }
-
-        # Extract constants (from baseboards sheet if available, otherwise use defaults)
-        hmc_ip = "192.168.31.1"  # Default HMC IP
-        hmc_hostname = "HMC_0"  # Default HMC hostname
 
         # Build platform model mappings from baseboard platform_detection sections
         for baseboard_name, baseboard_config in baseboards.items():
@@ -225,10 +234,11 @@ class PlatformDetectionService:
             if platform_detection:
                 # Resolve HMC IP reference
                 hmc_ip_value = platform_detection.get("hmc_ip")
-                if hmc_ip_value == "HMC_IP":
-                    hmc_ip_value = hmc_ip
-                elif hmc_ip_value == "HMC_HOSTNAME":
-                    hmc_ip_value = hmc_hostname
+                if isinstance(hmc_ip_value, str) and hmc_ip_value in {
+                    "HMC_IP",
+                    "HMC_HOSTNAME",
+                }:
+                    hmc_ip_value = baseboard_config.get(hmc_ip_value, hmc_ip_value)
 
                 # Add to platform model mappings
                 platform_mappings["platform_model_mappings"].append(
@@ -243,24 +253,8 @@ class PlatformDetectionService:
                     }
                 )
 
-        # Build redfish chassis mappings from baseboard platform_detection sections
+        # Retain the data-derived compatibility map for callers that inspect it.
         redfish_chassis_mappings = {}
-
-        # Add common chassis mappings that are used across multiple baseboards
-        common_chassis = [
-            "HGX_BMC_0",
-            "Chassis_0",
-            "HGX",
-            "BMC_0",
-            "HMC_0",
-            "MGX_NVSwitch_0",
-            "MGX_NVSwitch_1",
-            "MGX_BMC_0",
-            "DGX",
-        ]
-
-        for chassis in common_chassis:
-            redfish_chassis_mappings[chassis] = chassis
 
         # Add baseboard-specific chassis mappings based on platform_detection
         for baseboard_name, baseboard_config in baseboards.items():
@@ -290,20 +284,19 @@ class PlatformDetectionService:
         Gather platform information using multiple methods.
 
         Attempts to gather platform info in the following order:
-        1. Redfish (if preflight passed)
-        2. IPMI (if preflight passed)
-        3. Host (if preflight passed)
+
+        1. Redfish (if preflight passed).
+        2. IPMI (if preflight passed).
+        3. Host (if preflight passed).
 
         Args:
-            dut_id: The DUT identifier
-            preflight_results: Optional preflight results for the DUT
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+            preflight_results: Optional preflight results; ``None`` selects the
+                function's default behavior.
 
         Returns:
-            dict: Dictionary containing platform information with keys:
-                - "model": Platform model name
-                - "partnumber": Part number
-                - "serialnumber": Serial number
-                If all methods fail, returns default values with "Unknown" model.
+            A mapping containing gather platform info.
         """
         await self.logger.write_to_dut_runtime_log(
             dut_id,
@@ -334,7 +327,7 @@ class PlatformDetectionService:
                         partnumber = chassis_dict.get("PartNumber", "N/A")
                         serialnumber = chassis_dict.get("SerialNumber", "N/A")
                         # If Redfish gave us some valid model
-                        if model and model != "N/A":
+                        if isinstance(model, str) and not self._model_is_generic(model):
                             await self.logger.write_to_dut_runtime_log(
                                 dut_id,
                                 "INFO",
@@ -370,7 +363,7 @@ class PlatformDetectionService:
                         "PlatformDetection",
                         f"IPMI FRU result: {ipmi_info}",
                     )
-                    if ipmi_info.get("model"):
+                    if not self._model_is_generic(ipmi_info.get("model", "")):
                         await self.logger.write_to_dut_runtime_log(
                             dut_id,
                             "INFO",
@@ -397,7 +390,7 @@ class PlatformDetectionService:
             if preflight_results.get("host", {}).get("status") == "pass":
                 try:
                     host_info = await self._get_platform_info_via_host(dut_id)
-                    if host_info.get("model"):
+                    if not self._model_is_generic(host_info.get("model", "")):
                         await self.logger.write_to_dut_runtime_log(
                             dut_id,
                             "INFO",
@@ -444,64 +437,298 @@ class PlatformDetectionService:
         self, dut_id: str
     ) -> Tuple[bool, Optional[Dict[str, Any]]]:
         """
-        Get system information via Redfish API with dynamic discovery.
+        Get the highest-ranked platform identity from the catalog probe plan.
+
+        The implementation uses ``dut_id`` to get the highest-ranked platform
+        identity from the catalog probe plan. Owned asynchronous work is awaited
+        before return, so completion does not leave an unobserved task behind.
+        Remote I/O uses the configured transport policy and returns only after
+        its response or failure has been observed.
 
         Args:
-            dut_id: The DUT identifier
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
 
         Returns:
-            tuple: (success, chassis_data)
+            A tuple containing ``outcome flag`` and ``metadata mapping`` in that
+            order.
         """
         try:
-            platform_dict = self.platform_mappings.get("redfish_chassis_mappings", {})
-            success, response, _, _ = await self.dut_manager.execute_redfish_request(
-                dut_id, "GET", "/redfish/v1/Chassis/DGX", timeout=10
-            )
-            if success and response:
-                return True, response
-
-            success, chassis_list_response, _, _ = (
-                await self.dut_manager.execute_redfish_request(
-                    dut_id, "GET", "/redfish/v1/Chassis", timeout=10
+            profile = self.platform_detection_profile
+            if not profile:
+                await self.logger.write_to_dut_runtime_log(
+                    dut_id,
+                    "WARNING",
+                    "PlatformDetection",
+                    "Catalog platform detection profile is unavailable; Redfish "
+                    "platform metadata detection is disabled",
                 )
-            )
-            if not success or not chassis_list_response:
                 return False, None
 
-            for member in chassis_list_response.get("Members", []):
-                uri = member.get("@odata.id")
-                if not isinstance(uri, str) or not uri.startswith("/redfish/v1/Chassis/"):
-                    continue
+            best_payload: Optional[Dict[str, Any]] = None
+            best_score: Optional[int] = None
+            best_identities = set()
+            seen_uris = set()
+            request_count = 0
+            terminal_reason: Optional[str] = None
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + self.REDFISH_DETECTION_DEADLINE_SECONDS
 
-                chassis_id = uri.rstrip("/").split("/")[-1]
-                if chassis_id not in platform_dict and chassis_id != "Unknown":
-                    continue
+            def response_payload(response: Any) -> Tuple[bool, Optional[Any]]:
+                """
+                Return the response payload.
 
-                success, chassis_data, _, _ = await self.dut_manager.execute_redfish_request(
-                    dut_id, "GET", uri, timeout=10
+                The implementation uses ``response`` to produce the response
+                payload.
+
+                Args:
+                    response: Transport response governed by the configured
+                        authentication and trust policy.
+
+                Returns:
+                    A tuple containing ``status flag`` and ``returned value`` in
+                    that order.
+                """
+                if not isinstance(response, tuple) or len(response) < 2:
+                    return False, None
+                return bool(response[0]), response[1]
+
+            async def request_payload(uri: str) -> Tuple[bool, Optional[Any]]:
+                """
+                Return the request payload.
+
+                The implementation uses ``uri`` to produce the request payload.
+                Owned asynchronous work is awaited before return, so completion
+                does not leave an unobserved task behind.
+
+                Args:
+                    uri: Validated remote resource identifier used for URI.
+
+                Returns:
+                    A tuple containing ``success flag`` and ``absence sentinel``
+                    in that order.
+                """
+                nonlocal request_count, terminal_reason
+                if terminal_reason is not None:
+                    return False, None
+                if request_count >= self.MAX_REDFISH_DETECTION_REQUESTS:
+                    terminal_reason = (
+                        "Redfish platform-detection request budget was exhausted "
+                        f"({self.MAX_REDFISH_DETECTION_REQUESTS})"
+                    )
+                    return False, None
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    terminal_reason = (
+                        "Redfish platform-detection deadline was exhausted"
+                    )
+                    return False, None
+
+                request_count += 1
+                request_timeout = min(self.REDFISH_REQUEST_TIMEOUT_SECONDS, remaining)
+                try:
+                    response = await asyncio.wait_for(
+                        self.dut_manager.execute_redfish_request(
+                            dut_id,
+                            "GET",
+                            uri,
+                            timeout=request_timeout,
+                            expected_http_statuses=[404],
+                        ),
+                        timeout=remaining,
+                    )
+                except TimeoutError:
+                    terminal_reason = (
+                        "Redfish platform-detection deadline was exhausted"
+                    )
+                    return False, None
+                return response_payload(response)
+
+            async def consider_uri(uri: str, step: Dict[str, Any]) -> None:
+                """
+                Evaluate one Redfish URI as a platform-detection candidate.
+
+                The implementation uses ``uri`` and ``step`` to evaluate one
+                Redfish URI as a platform-detection candidate. Owned
+                asynchronous work is awaited before return, so completion does
+                not leave an unobserved task behind.
+
+                Args:
+                    uri: Validated remote resource identifier used for URI.
+                    step: Mapping supplying fields for evaluate one Redfish URI
+                        as a platform-detection candidate.
+                """
+                nonlocal best_payload, best_score, best_identities
+                if uri in seen_uris:
+                    return
+                seen_uris.add(uri)
+                success, payload = await request_payload(uri)
+                if not success or not isinstance(payload, dict):
+                    return
+                model = self._extract_first_string_field(
+                    payload, step.get("model_field", "Model")
                 )
-                if not success or not chassis_data:
-                    continue
+                if not model or self._model_is_generic(model):
+                    return
+                score = score_platform_detection_candidate(profile, uri, "model")
+                if score is None:
+                    return
+                normalized_payload = dict(payload)
+                normalized_payload["Model"] = model
+                part_number = self._extract_first_string_field(
+                    payload, step.get("part_number_field", "PartNumber")
+                )
+                serial_number = self._extract_first_string_field(
+                    payload, "SerialNumber"
+                )
+                if part_number:
+                    normalized_payload["PartNumber"] = part_number
+                if serial_number:
+                    normalized_payload["SerialNumber"] = serial_number
+                identity = (model, part_number or "", serial_number or "")
 
-                model = self._extract_first_string_field(chassis_data, "Model")
-                if not model:
-                    continue
+                if best_score is None or score > best_score:
+                    best_score = score
+                    best_payload = normalized_payload
+                    best_identities = {identity}
+                elif score == best_score:
+                    best_identities.add(identity)
 
-                resolved_model = model
-                if model.startswith("$") and chassis_id in platform_dict:
-                    resolved_model = platform_dict[chassis_id]
-                elif model.endswith("_Management_Board"):
-                    base_model = model[: -len("_Management_Board")]
-                    resolved_model = platform_dict.get(base_model, resolved_model)
+            for index, step in enumerate(profile["probe_steps"]):
+                if terminal_reason is not None:
+                    break
+                if "uri" in step:
+                    await consider_uri(step["uri"], step)
+                else:
+                    success, collection_payload = await request_payload(
+                        step["collection_uri"]
+                    )
+                    if success and isinstance(collection_payload, dict):
+                        next_link = collection_payload.get(
+                            "Members@odata.nextLink"
+                        ) or collection_payload.get("@odata.nextLink")
+                        if next_link:
+                            terminal_reason = (
+                                "Redfish platform-detection collection is paginated; "
+                                "the complete member set was not available"
+                            )
+                            break
+                        try:
+                            members, source_member_count, members_truncated = (
+                                bound_redfish_collection_members(
+                                    collection_payload.get("Members"),
+                                    field_name="platform detection Members",
+                                    limit=self.MAX_FOLLOWED_COLLECTION_MEMBERS,
+                                )
+                            )
+                        except ValueError:
+                            terminal_reason = (
+                                "Redfish platform-detection collection returned a "
+                                "malformed Members value"
+                            )
+                            break
+                        advertised_count = collection_payload.get("Members@odata.count")
+                        if advertised_count is not None and (
+                            isinstance(advertised_count, bool)
+                            or not isinstance(advertised_count, int)
+                            or advertised_count < 0
+                            or advertised_count != source_member_count
+                        ):
+                            terminal_reason = (
+                                "Redfish platform-detection collection member list "
+                                "does not match Members@odata.count"
+                            )
+                            break
+                        if members_truncated:
+                            terminal_reason = (
+                                "Redfish platform-detection collection returned "
+                                f"{source_member_count} members; safe follow limit is "
+                                f"{self.MAX_FOLLOWED_COLLECTION_MEMBERS}"
+                            )
+                            break
 
-                if not resolved_model or self._model_is_generic(resolved_model):
-                    continue
+                        collection_uris: list[str] = []
+                        collection_seen: set[str] = set()
+                        invalid_members = 0
+                        for member in members:
+                            raw_uri = (
+                                member.get("@odata.id")
+                                if isinstance(member, dict)
+                                else None
+                            )
+                            try:
+                                uri = validate_redfish_uri_path(
+                                    raw_uri,
+                                    context="platform detection member URI",
+                                    service_root=step["collection_uri"],
+                                )
+                            except (
+                                RedfishTopologyProfileError,
+                                TypeError,
+                                ValueError,
+                            ):
+                                invalid_members += 1
+                                continue
+                            if not uri.startswith(step["member_uri_prefix"]):
+                                invalid_members += 1
+                                continue
+                            member_id = uri[len(step["member_uri_prefix"]) :]
+                            if not member_id or "/" in member_id:
+                                invalid_members += 1
+                                continue
+                            if uri in collection_seen:
+                                continue
+                            collection_seen.add(uri)
+                            collection_uris.append(uri)
 
-                chassis_payload = dict(chassis_data)
-                chassis_payload["Model"] = resolved_model
-                return True, chassis_payload
+                        if invalid_members:
+                            terminal_reason = (
+                                "Redfish platform-detection collection contains "
+                                f"{invalid_members} invalid member URI(s)"
+                            )
+                            break
 
-            return False, None
+                        unseen_uris = [
+                            uri for uri in collection_uris if uri not in seen_uris
+                        ]
+                        if (
+                            request_count + len(unseen_uris)
+                            > self.MAX_REDFISH_DETECTION_REQUESTS
+                        ):
+                            terminal_reason = (
+                                "Redfish platform-detection request budget would be "
+                                f"exceeded ({self.MAX_REDFISH_DETECTION_REQUESTS})"
+                            )
+                            break
+                        for uri in collection_uris:
+                            await consider_uri(uri, step)
+                            if terminal_reason is not None:
+                                break
+
+                if best_score is not None and best_score > remaining_probe_max_score(
+                    profile, index
+                ):
+                    break
+
+            if terminal_reason is not None:
+                await self.logger.write_to_dut_runtime_log(
+                    dut_id,
+                    "WARNING",
+                    "PlatformDetection",
+                    f"{terminal_reason}; refusing incomplete Redfish identity",
+                )
+                return False, None
+            if len(best_identities) > 1:
+                await self.logger.write_to_dut_runtime_log(
+                    dut_id,
+                    "WARNING",
+                    "PlatformDetection",
+                    "Equally ranked Redfish resources reported conflicting "
+                    "model/PartNumber/SerialNumber identities; refusing "
+                    "order-dependent report metadata",
+                )
+                return False, None
+            return (best_payload is not None), best_payload
 
         except Exception as e:
             await self.logger.write_to_dut_runtime_log(
@@ -516,11 +743,17 @@ class PlatformDetectionService:
         """
         Get platform information via IPMI FRU commands.
 
+        The implementation uses ``dut_id`` to get platform information via IPMI
+        FRU commands. Owned asynchronous work is awaited before return, so
+        completion does not leave an unobserved task behind.
+
         Args:
-            dut_id: The DUT identifier
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
 
         Returns:
-            dict: Platform information
+            A mapping containing the ``model``, ``partnumber``, and
+            ``serialnumber`` fields.
         """
         try:
             # Get FRU information via IPMI
@@ -549,15 +782,21 @@ class PlatformDetectionService:
             serialno = None
 
             # Parse FRU output using regex (from legacy code)
-            match_model = re.search(r"Product\s+Name\s*:\s*(.+)", output)
+            match_model = re.search(r"Product\s+Name\s*:[ \t]*(.+)", output)
             if match_model:
                 model = match_model.group(1).strip()
 
-            match_part = re.search(r"Part\s+Number\s*:\s*(.+)", output)
+            match_part = re.search(
+                r"(?m)^[ \t]*(?:Product[ \t]+)?Part[ \t]+Number[ \t]*:[ \t]*(.*)$",
+                output,
+            )
             if match_part:
                 partno = match_part.group(1).strip()
 
-            match_serial = re.search(r"Serial\s+Number\s*:\s*(.+)", output)
+            match_serial = re.search(
+                r"(?m)^[ \t]*(?:Product[ \t]+)?Serial(?:[ \t]+Number)?[ \t]*:[ \t]*(.*)$",
+                output,
+            )
             if match_serial:
                 serialno = match_serial.group(1).strip()
 
@@ -584,11 +823,18 @@ class PlatformDetectionService:
         """
         Get platform information via host dmidecode commands.
 
+        The implementation uses ``dut_id`` to get platform information via host
+        dmidecode commands. Owned asynchronous work is awaited before return, so
+        completion does not leave an unobserved task behind. Filesystem effects
+        remain confined to the caller-selected paths and the owning resource
+        lifecycle.
+
         Args:
-            dut_id: The DUT identifier
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
 
         Returns:
-            dict: Platform information
+            A mapping containing platform info via host.
         """
         try:
             result = {

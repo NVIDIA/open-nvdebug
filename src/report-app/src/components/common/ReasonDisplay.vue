@@ -1,3 +1,20 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 <template>
   <div v-if="text" class="rd" :class="{ 'rd--compact': compact }">
     <!-- Compact mode: truncated with expand -->
@@ -13,14 +30,14 @@
       <div class="rd__body" :class="{ 'rd__body--collapsed': !compact && !expanded && isLong }">
         <!-- Full JSON -->
         <template v-if="parsed.type === 'json'">
-          <pre class="rd__json" v-html="highlightJson(parsed.json)"></pre>
+          <pre class="rd__json"><span v-for="(token, i) in highlightJson(parsed.json)" :key="i" :class="token.className">{{ token.text }}</span></pre>
         </template>
 
         <!-- Mixed: text segments + embedded JSON blocks -->
         <template v-else-if="parsed.type === 'mixed'">
           <template v-for="(seg, i) in parsed.segments" :key="i">
             <span v-if="seg.kind === 'text'" class="rd__text">{{ seg.value }}</span>
-            <pre v-else class="rd__json rd__json--inline" v-html="highlightJson(seg.value)"></pre>
+            <pre v-else class="rd__json rd__json--inline"><span v-for="(token, j) in highlightJson(seg.value)" :key="j" :class="token.className">{{ token.text }}</span></pre>
           </template>
         </template>
 
@@ -29,6 +46,11 @@
           <ul class="rd__list">
             <li v-for="(item, i) in parsed.items" :key="i" class="rd__list-item">{{ item }}</li>
           </ul>
+        </template>
+
+        <!-- Canonical reasons are single-line; restore known diagnostic hierarchy for display only. -->
+        <template v-else-if="parsed.type === 'diagnostic'">
+          <span class="rd__text rd__text--diagnostic">{{ parsed.text }}</span>
         </template>
 
         <!-- Plain text fallback -->
@@ -61,6 +83,7 @@
 import { ref, computed } from 'vue'
 import { copyToClipboard } from '@/utils/clipboard'
 import { showToast } from '@/composables/useToast'
+import { formatDiagnosticReasonForDisplay } from '@/utils/diagnosticReason'
 
 const props = withDefaults(defineProps<{
   text: string
@@ -91,8 +114,9 @@ type Segment = JsonSegment | TextSegment
 interface ParsedJson { type: 'json'; json: string }
 interface ParsedMixed { type: 'mixed'; segments: Segment[] }
 interface ParsedDelimited { type: 'delimited'; items: string[] }
+interface ParsedDiagnostic { type: 'diagnostic'; text: string }
 interface ParsedPlain { type: 'plain' }
-type ParseResult = ParsedJson | ParsedMixed | ParsedDelimited | ParsedPlain
+type ParseResult = ParsedJson | ParsedMixed | ParsedDelimited | ParsedDiagnostic | ParsedPlain
 
 function tryParseJson(s: string): any | null {
   const trimmed = s.trim()
@@ -182,6 +206,9 @@ const parsed = computed<ParseResult>(() => {
     return { type: 'json', json: JSON.stringify(fullJson, null, 2) }
   }
 
+  const diagnostic = formatDiagnosticReasonForDisplay(s)
+  if (diagnostic) return { type: 'diagnostic', text: diagnostic }
+
   if (s.includes('{') || s.includes('[')) {
     const segments = extractJsonBlocks(s)
     if (segments) return { type: 'mixed', segments }
@@ -200,15 +227,41 @@ const parsed = computed<ParseResult>(() => {
   return { type: 'plain' }
 })
 
-function highlightJson(json: string): string {
-  return json
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"([^"\\]*(\\.[^"\\]*)*)"\s*:/g, '<span class="rd-hl-key">"$1"</span>:')
-    .replace(/:\s*"([^"\\]*(\\.[^"\\]*)*)"/g, ': <span class="rd-hl-str">"$1"</span>')
-    .replace(/:\s*(\d+\.?\d*)/g, ': <span class="rd-hl-num">$1</span>')
-    .replace(/:\s*(true|false|null)/g, ': <span class="rd-hl-kw">$1</span>')
+interface JsonHighlightToken {
+  text: string
+  className: 'rd-hl-text' | 'rd-hl-key' | 'rd-hl-str' | 'rd-hl-num' | 'rd-hl-kw'
+}
+
+function highlightJson(json: string): JsonHighlightToken[] {
+  // Vue interpolation owns all escaping. The tokenizer returns text and a
+  // fixed class allowlist, never markup for v-html or an HTML attribute.
+  const tokenPattern = /"(?:\\.|[^"\\])*"(?=\s*:)|"(?:\\.|[^"\\])*"|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?|\b(?:true|false|null)\b/g
+  const tokens: JsonHighlightToken[] = []
+  let offset = 0
+
+  for (const match of json.matchAll(tokenPattern)) {
+    const index = match.index ?? offset
+    if (index > offset) {
+      tokens.push({ text: json.slice(offset, index), className: 'rd-hl-text' })
+    }
+
+    const text = match[0]
+    let className: JsonHighlightToken['className']
+    if (text.startsWith('"')) {
+      className = /^\s*:/.test(json.slice(index + text.length)) ? 'rd-hl-key' : 'rd-hl-str'
+    } else if (text === 'true' || text === 'false' || text === 'null') {
+      className = 'rd-hl-kw'
+    } else {
+      className = 'rd-hl-num'
+    }
+    tokens.push({ text, className })
+    offset = index + text.length
+  }
+
+  if (offset < json.length) {
+    tokens.push({ text: json.slice(offset), className: 'rd-hl-text' })
+  }
+  return tokens
 }
 
 async function copyRaw() {
@@ -255,6 +308,10 @@ async function copyRaw() {
   word-break: break-word;
   display: block;
   margin-bottom: 4px;
+}
+
+.rd__text--diagnostic {
+  line-height: 1.7;
 }
 
 .rd__json {

@@ -1,12 +1,29 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 import { ref, watch } from 'vue'
+import type { RouteLocationRaw } from 'vue-router'
 import { useManifestStore } from '@/stores/manifest'
 import type { FileEntry, ErrorEntry } from '@/types/manifest'
+import { collectorDetailRoute, dutRoute } from '@/utils/reportRoutes'
 
 export interface SearchResult {
   type: 'file' | 'collector' | 'dut' | 'error'
   label: string
   sublabel: string
-  path: string  // route path to navigate to
+  path: RouteLocationRaw
   score: number
 }
 
@@ -42,7 +59,7 @@ export function useSearch() {
           type: 'dut',
           label: dut.id,
           sublabel: `${dut.baseboard} — ${dut.overall_status}`,
-          path: `/dut/${dut.id}`,
+          path: dutRoute(dut.id),
           score: 100,
         })
       }
@@ -58,7 +75,7 @@ export function useSearch() {
               type: 'collector',
               label: `${c.id} — ${c.name}`,
               sublabel: `${dut.id} / ${group.name}`,
-              path: `/dut/${dut.id}/${group.name}/${c.id}`,
+              path: collectorDetailRoute(dut.id, group.name, c.id),
               score: 80,
             })
           }
@@ -73,7 +90,7 @@ export function useSearch() {
           type: 'error',
           label: e.message.slice(0, 80),
           sublabel: `${e.dut_id} / ${e.collector_id}`,
-          path: `/dut/${e.dut_id}/${e.collector_group}/${e.collector_id}`,
+          path: collectorDetailRoute(e.dut_id, e.collector_group, e.collector_id),
           score: 60,
         })
       }

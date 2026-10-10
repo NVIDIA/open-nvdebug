@@ -1,3 +1,20 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 <template>
   <div style="min-height: calc(100vh - 88px);">
     <!-- Sidebar -->
@@ -138,7 +155,10 @@
                 </div>
                 <p class="ano-card__desc">{{ a.description }}</p>
                 <div class="ano-card__meta">
-                  <span class="ano-card__dut" @click.stop="router.push(`/dut/${encodeURIComponent(a.dutId)}`)">
+                  <span
+                    class="ano-card__dut"
+                    @click.stop="router.push(dutRoute(a.dutId, a.collectorId))"
+                  >
                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
                     {{ a.dutId }}
                   </span>
@@ -171,6 +191,7 @@ import type { Anomaly, AnomalyType } from '@/composables/useAnomalyDetection'
 import Breadcrumbs from '@/components/common/Breadcrumbs.vue'
 import PageLoader from '@/components/common/PageLoader.vue'
 import AnalysisNav from '@/components/common/AnalysisNav.vue'
+import { collectorDetailRoute, dutRoute } from '@/utils/reportRoutes'
 
 const router = useRouter()
 const manifestStore = useManifestStore()
@@ -307,11 +328,11 @@ function goToCollector(a: Anomaly) {
   for (const g of dut.collector_groups) {
     const found = g.collectors.find(c => c.id === a.collectorId)
     if (found) {
-      router.push(`/dut/${encodeURIComponent(a.dutId)}/${encodeURIComponent(g.name)}/${encodeURIComponent(a.collectorId)}`)
+      router.push(collectorDetailRoute(a.dutId, g.name, a.collectorId))
       return
     }
   }
-  router.push(`/dut/${encodeURIComponent(a.dutId)}`)
+  router.push(dutRoute(a.dutId))
 }
 
 function formatValue(a: Anomaly): string {

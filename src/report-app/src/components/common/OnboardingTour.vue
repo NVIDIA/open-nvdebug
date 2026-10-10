@@ -1,3 +1,20 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 <template>
   <Teleport to="body">
     <div v-if="visible" class="nv-modal-overlay" style="z-index: 3000;" @click="nextOrClose">
@@ -51,11 +68,22 @@ function nextOrClose() {
 
 function dismiss() {
   visible.value = false
-  localStorage.setItem(TOUR_KEY, 'true')
+  try {
+    localStorage.setItem(TOUR_KEY, 'true')
+  } catch {
+    // Keep the report usable when browser storage is unavailable.
+  }
 }
 
 onMounted(() => {
-  if (!localStorage.getItem(TOUR_KEY)) {
+  let completed = false
+  try {
+    completed = Boolean(localStorage.getItem(TOUR_KEY))
+  } catch {
+    // Unavailable storage behaves like a first visit.
+  }
+
+  if (!completed) {
     // Show tour after a brief delay to let the app render
     setTimeout(() => { visible.value = true }, 1000)
   }

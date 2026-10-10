@@ -1,3 +1,20 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 <template>
   <div style="font-size: 0.8125rem;">
     <div
@@ -43,21 +60,11 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import type { FileEntry } from '@/types/manifest'
-
-interface TreeNode {
-  name: string
-  path: string
-  depth: number
-  children?: TreeNode[]
-  childCount?: number
-  filePath?: string
-  fileType?: string
-  fileSize?: number
-}
+import { buildFileTree, type FileTreeNode } from '@/utils/fileTree'
 
 const props = defineProps<{
   files: FileEntry[]
-  tree?: TreeNode[]
+  tree?: FileTreeNode[]
 }>()
 
 defineEmits<{
@@ -67,57 +74,9 @@ defineEmits<{
 const expanded = ref(new Set<string>())
 
 // Build tree from flat file list
-const tree = computed<TreeNode[]>(() => {
+const tree = computed<FileTreeNode[]>(() => {
   if (props.tree) return props.tree
-
-  const root: Record<string, any> = {}
-  for (const file of props.files) {
-    const parts = file.path.split('/')
-    let current = root
-    for (let i = 0; i < parts.length; i++) {
-      const part = parts[i]
-      if (i === parts.length - 1) {
-        // File leaf
-        if (!current.__files__) current.__files__ = []
-        current.__files__.push({ name: part, ...file })
-      } else {
-        if (!current[part]) current[part] = {}
-        current = current[part]
-      }
-    }
-  }
-
-  function buildNodes(obj: Record<string, any>, parentPath: string, depth: number): TreeNode[] {
-    const nodes: TreeNode[] = []
-
-    // Folders first
-    for (const [key, val] of Object.entries(obj).sort(([a], [b]) => a.localeCompare(b))) {
-      if (key === '__files__') continue
-      const path = parentPath ? `${parentPath}/${key}` : key
-      const children = buildNodes(val, path, depth + 1)
-      const fileCount = countFiles(val)
-      nodes.push({ name: key, path, depth, children, childCount: fileCount })
-    }
-
-    // Then files
-    if (obj.__files__) {
-      for (const f of (obj.__files__ as any[]).sort((a: any, b: any) => a.name.localeCompare(b.name))) {
-        nodes.push({ name: f.name, path: `${parentPath}/${f.name}`, depth, filePath: f.path, fileType: f.type, fileSize: f.size })
-      }
-    }
-
-    return nodes
-  }
-
-  function countFiles(obj: Record<string, any>): number {
-    let count = obj.__files__?.length ?? 0
-    for (const [k, v] of Object.entries(obj)) {
-      if (k !== '__files__' && typeof v === 'object') count += countFiles(v)
-    }
-    return count
-  }
-
-  return buildNodes(root, '', 0)
+  return buildFileTree(props.files)
 })
 
 // Expand top-level folders by default

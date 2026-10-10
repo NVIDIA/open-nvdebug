@@ -17,10 +17,11 @@
 """
 ID filtering utilities for open-nvdebugtool.
 
-This module provides utilities for filtering system IDs, chassis IDs, and manager IDs
-based on configuration settings.
+This module provides utilities for filtering system IDs, chassis IDs, and
+manager IDs based on configuration settings.
 """
 
+import re
 from typing import Any, Dict, List, Optional
 
 
@@ -28,13 +29,26 @@ def should_skip_id(id_value: str, id_type: str, dut_config: Dict[str, Any]) -> b
     """
     Check if an ID should be skipped based on DUT configuration.
 
+    The implementation uses ``id_value``, ``id_type``, and ``dut_config`` to
+    check if an ID should be skipped based on DUT configuration. Every required
+    invariant is checked before a successful value is returned; invalid input
+    follows the function's explicit exception path.
+
     Args:
-        id_value: The ID value to check (e.g., "System_1", "Chassis_2")
-        id_type: The type of ID ("system", "chassis", "manager")
-        dut_config: DUT configuration dictionary
+        id_value: Text supplied as identifier value in the format accepted by
+            this function.
+        id_type: Text supplied as identifier type in the format accepted by this
+            function.
+        dut_config: DUT config governing if an ID should be skipped based on DUT
+            configuration.
 
     Returns:
-        bool: True if the ID should be skipped
+        Whether any configured case-sensitive regular expression fully matches
+        the supplied Redfish identifier.
+
+    Raises:
+        ValueError: If a configured skip entry is not a valid regular
+            expression.
     """
     if not dut_config:
         return False
@@ -54,21 +68,34 @@ def should_skip_id(id_value: str, id_type: str, dut_config: Dict[str, Any]) -> b
     if not skip_list:
         return False
 
-    # Check if the ID is in the skip list
-    return id_value in skip_list
+    for pattern in skip_list:
+        try:
+            if re.fullmatch(pattern, id_value) is not None:
+                return True
+        except (re.error, TypeError) as error:
+            raise ValueError(
+                f"{skip_key} contains an invalid regular expression: {pattern!r}"
+            ) from error
+    return False
 
 
 def filter_ids(ids: List[str], id_type: str, dut_config: Dict[str, Any]) -> List[str]:
     """
     Filter a list of IDs based on DUT configuration.
 
+    The implementation uses ``ids``, ``id_type``, and ``dut_config`` to filter a
+    list of IDs based on DUT configuration.
+
     Args:
-        ids: List of ID values to filter
-        id_type: The type of IDs ("system", "chassis", "manager")
-        dut_config: DUT configuration dictionary
+        ids: Entries supplied as ``ids`` without transferring container
+            ownership.
+        id_type: Text supplied as identifier type in the format accepted by this
+            function.
+        dut_config: DUT config governing filter a list of IDs based on DUT
+            configuration.
 
     Returns:
-        List[str]: Filtered list of IDs
+        The filter identifiers returned in operation-defined order.
     """
     if not ids or not dut_config:
         return ids
@@ -87,13 +114,19 @@ def get_skip_reason(
     """
     Get the reason why an ID was skipped.
 
+    The implementation uses ``id_value``, ``id_type``, and ``dut_config`` to get
+    the reason why an ID was skipped.
+
     Args:
-        id_value: The ID value that was skipped
-        id_type: The type of ID ("system", "chassis", "manager")
-        dut_config: DUT configuration dictionary
+        id_value: Text supplied as identifier value in the format accepted by
+            this function.
+        id_type: Text supplied as identifier type in the format accepted by this
+            function.
+        dut_config: DUT config governing get the reason why an ID was skipped.
 
     Returns:
-        Optional[str]: Reason for skipping, or None if not skipped
+        The canonical skip reason text, or ``None`` when the requested value is
+        unavailable.
     """
     if should_skip_id(id_value, id_type, dut_config):
         skip_key_mapping = {
@@ -117,12 +150,21 @@ async def log_filtered_ids(
     """
     Log information about filtered IDs.
 
+    The implementation uses ``original_ids``, ``filtered_ids``, ``id_type``,
+    ``logger``, and ``dut_id`` to log information about filtered IDs. Owned
+    asynchronous work is awaited before return, so completion does not leave an
+    unobserved task behind.
+
     Args:
-        original_ids: Original list of IDs
-        filtered_ids: Filtered list of IDs
-        id_type: Type of IDs being filtered
-        logger: Logger instance
-        dut_id: DUT ID for logging context (optional)
+        original_ids: Entries supplied as ``original_ids`` without transferring
+            container ownership.
+        filtered_ids: Entries supplied as ``filtered_ids`` without transferring
+            container ownership.
+        id_type: Text supplied as identifier type in the format accepted by this
+            function.
+        logger: Sanitized logger used for operator-visible diagnostics.
+        dut_id: Stable DUT identifier used to correlate configuration, logs, and
+            results.
     """
     if not logger:
         return

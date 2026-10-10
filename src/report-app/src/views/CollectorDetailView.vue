@@ -1,3 +1,20 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 <template>
   <div style="min-height: calc(100vh - 88px);">
     <!-- Left Sidebar (same as DutView) -->
@@ -20,7 +37,7 @@
       <div class="nv-sidebar__section">
         <h4 class="nv-sidebar__section-title nv-glass--accent" style="padding: 4px 8px; border-radius: var(--nv-radius-sm); margin-bottom: 8px;">Collector Groups</h4>
         <div v-for="group in dut?.collector_groups" :key="group.name" style="margin-bottom: 4px;">
-          <router-link :to="`/dut/${dutId}/${group.name}`" class="nv-sidebar__link">
+          <router-link :to="collectorGroupRoute(dutId, group.name)" class="nv-sidebar__link">
             <ServiceBadge :service="group.name" />
           </router-link>
         </div>
@@ -34,7 +51,7 @@
         <router-link
           v-for="c in siblingCollectors"
           :key="c.id"
-          :to="`/dut/${dutId}/${resolvedGroupName}/${c.id}`"
+          :to="collectorDetailRoute(dutId, resolvedGroupName, c.id)"
           :class="['nv-sidebar__link', { 'nv-sidebar__link--active': c.id.toLowerCase() === collectorId.toLowerCase() }]"
           style="font-size: 0.6875rem; padding: 3px 0; display: flex; align-items: center; gap: 6px;"
         >
@@ -44,13 +61,17 @@
         </router-link>
       </div>
 
-      <!-- Files from this collector -->
-      <div v-if="dedupedFiles.length > 0" class="nv-sidebar__section">
+      <!-- Artifact and diagnostic files from this collector -->
+      <div
+        v-for="section in fileSections"
+        :key="`sidebar-${section.key}`"
+        class="nv-sidebar__section"
+      >
         <h4 class="nv-sidebar__section-title nv-glass--accent" style="padding: 4px 8px; border-radius: var(--nv-radius-sm); margin-bottom: 8px;">
-          Collected Files <span class="nv-badge nv-badge--neutral" style="margin-left: auto;">{{ dedupedFiles.length }}</span>
+          {{ section.title }} <span class="nv-badge nv-badge--neutral" style="margin-left: auto;">{{ section.files.length }}</span>
         </h4>
         <router-link
-          v-for="f in dedupedFiles"
+          v-for="f in section.files"
           :key="f.path"
           :to="`/file/${encodeURIComponent(f.path)}`"
           class="nv-sidebar__link"
@@ -63,7 +84,7 @@
     </div>
 
     <!-- Main Content -->
-    <div class="nv-page" style="margin-left: 260px;">
+    <div class="nv-page cd-page">
       <div v-if="!collector" class="nv-glass" style="padding: 48px 32px; text-align: center; margin-top: 24px; border-radius: var(--nv-radius-lg);">
         <div style="font-size: 2.5rem; margin-bottom: 12px; opacity: 0.25;">&#128269;</div>
         <h3 style="font-size: 1rem; font-weight: 600; color: var(--nv-text-primary); margin: 0 0 8px;">Collector Not Found</h3>
@@ -74,11 +95,11 @@
           The collector may not have been executed in this run, or the group name may differ. Check the node's collector groups below.
         </p>
         <div style="display: flex; gap: 8px; justify-content: center; flex-wrap: wrap;">
-          <router-link :to="`/dut/${dutId}`" class="nv-btn nv-btn--primary">View Node</router-link>
+          <router-link :to="dutRoute(dutId)" class="nv-btn nv-btn--primary">View Node</router-link>
           <router-link to="/" class="nv-btn">Dashboard</router-link>
         </div>
       </div>
-      <template v-else>
+      <div v-else :key="`${dutId}:${collectorId}`">
         <Breadcrumbs :items="breadcrumbs" />
 
         <!-- Page Header -->
@@ -93,23 +114,43 @@
           </div>
         </div>
 
-        <!-- Stat Cards Row -->
-        <div class="cd-stats">
-          <div :class="['nv-stat', `nv-stat--${statusColor}`]">
-            <div class="nv-stat__label">Status</div>
-            <div class="nv-stat__value">{{ statusLabel }}</div>
-          </div>
-          <div class="nv-stat nv-stat--blue">
-            <div class="nv-stat__label">Execution Time</div>
-            <div class="nv-stat__value">{{ formatDuration(collector.execution_time) }}</div>
-          </div>
-          <div class="nv-stat nv-stat--purple">
-            <div class="nv-stat__label">Collection Level</div>
-            <div class="nv-stat__value">{{ collector.collection_level || '\u2014' }}</div>
-          </div>
-          <div class="nv-stat nv-stat--emerald">
-            <div class="nv-stat__label">Files Collected</div>
-            <div class="nv-stat__value">{{ dedupedFiles.length }}</div>
+        <div class="cd-overview nv-card">
+          <dl class="cd-summary">
+            <div><dt>Duration</dt><dd>{{ formatDuration(collector.execution_time) }}</dd></div>
+            <div><dt>Artifacts</dt><dd>{{ partitionedFiles.artifacts.length }}</dd></div>
+            <div><dt>Diagnostics</dt><dd>{{ partitionedFiles.diagnostics.length }}</dd></div>
+            <div><dt>Total Size</dt><dd>{{ formatBytes(totalLogSize) }}</dd></div>
+          </dl>
+          <h3 class="cd-stage-title">Stage Timing</h3>
+          <template v-if="hasStageData">
+            <div class="cd-stage-bar">
+              <div
+                v-for="seg in stageSegments"
+                :key="seg.stage"
+                class="cd-stage-bar__segment"
+                :style="{ flex: seg.flex, background: seg.color }"
+                :title="`${seg.label}: ${seg.value.toFixed(2)}s (${seg.pct}%)`"
+              >
+                <span v-if="seg.flex > 0.08" class="cd-stage-bar__label">{{ seg.value.toFixed(1) }}s</span>
+              </div>
+            </div>
+            <div class="cd-stage-legend">
+              <div v-for="seg in stageSegments" :key="seg.stage" class="cd-stage-legend__item">
+                <span class="cd-stage-legend__swatch" :style="{ background: seg.color }"></span>
+                <span style="color: var(--nv-text-secondary);">{{ seg.label }}</span>
+                <span style="font-weight: 600; font-family: var(--nv-font-mono); color: var(--nv-text-primary);">{{ seg.value.toFixed(2) }}s</span>
+                <span style="color: var(--nv-text-tertiary); font-size: 0.6875rem;">({{ seg.pct }}%)</span>
+              </div>
+            </div>
+          </template>
+          <div v-else style="color: var(--nv-text-tertiary); font-size: 0.8125rem; padding: 12px 0;">
+            <template v-if="timingLoading">Loading stage timing…</template>
+            <template v-else-if="timingError">Stage timing could not be loaded. See the detailed timing message below.</template>
+            <template v-else-if="['skipped', 'not_ran', 'cancelled', 'pending'].includes(collector.status)">
+              No stage measurements were recorded. Collector status: {{ collector.status }}.
+              {{ collector.reason }}
+            </template>
+            <template v-else>No stage measurements were recorded in this report.</template>
           </div>
         </div>
 
@@ -122,117 +163,49 @@
             </svg>
           </div>
           <div>
-            <div style="font-size: 0.8125rem; font-weight: 600; color: var(--nv-error); margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.04em;">Failure Reason</div>
+            <div style="font-size: 0.8125rem; font-weight: 600; color: var(--nv-error); margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.04em;">
+              Failure Reason
+              <span
+                v-if="failureCategoryLabel"
+                data-testid="failure-category"
+                class="nv-badge nv-badge--neutral"
+                style="margin-left: 8px; text-transform: none; letter-spacing: normal;"
+              >{{ failureCategoryLabel }}</span>
+            </div>
             <ReasonDisplay :text="collector.reason" />
           </div>
         </div>
 
-        <!-- Success result note -->
-        <div v-if="collector.reason && collector.status === 'success'" class="cd-info-note nv-glass">
-          <div style="color: var(--nv-success); flex-shrink: 0; margin-top: 1px;">
-            <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
-              <circle cx="10" cy="10" r="9" stroke="currentColor" stroke-width="1.5"/>
-              <path d="M6.5 10.5l2 2 5-5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-            </svg>
-          </div>
-          <div>
-            <div style="font-size: 0.8125rem; font-weight: 600; color: var(--nv-success); margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.04em;">Result</div>
-            <ReasonDisplay :text="collector.reason" />
-          </div>
-        </div>
+        <nav class="cd-section-nav" aria-label="Collector sections">
+          <button type="button" class="nv-btn nv-btn--ghost nv-btn--sm" @click="jumpToSection(artifactsSection)">Artifacts</button>
+          <button type="button" class="nv-btn nv-btn--ghost nv-btn--sm" @click="jumpToSection(runtimeLogsSection)">Runtime Logs</button>
+          <button type="button" class="nv-btn nv-btn--ghost nv-btn--sm" @click="jumpToSection(timingSection)">Timing</button>
+        </nav>
 
-        <!-- Execution Details (2-col grid) -->
-        <div class="cd-details-grid">
-          <!-- Left: Execution Info -->
-          <div class="nv-card">
-            <h3 class="cd-section-title">Execution Details</h3>
-            <div class="cd-kv-list">
-              <div class="cd-kv">
-                <span class="cd-kv__label">Collector ID</span>
-                <span class="cd-kv__value" style="font-family: var(--nv-font-mono);">{{ collector.id }}</span>
-              </div>
-              <div class="cd-kv">
-                <span class="cd-kv__label">Collector Name</span>
-                <span class="cd-kv__value">{{ collector.name }}</span>
-              </div>
-              <div class="cd-kv">
-                <span class="cd-kv__label">Service Group</span>
-                <span class="cd-kv__value"><ServiceBadge :service="groupName" /></span>
-              </div>
-              <div class="cd-kv">
-                <span class="cd-kv__label">Status</span>
-                <span class="cd-kv__value"><StatusBadge :status="collector.status" /></span>
-              </div>
-              <div class="cd-kv">
-                <span class="cd-kv__label">Collection Level</span>
-                <span class="cd-kv__value">{{ collector.collection_level || '\u2014' }}</span>
-              </div>
-              <div v-if="collectorPriority != null" class="cd-kv">
-                <span class="cd-kv__label">Priority</span>
-                <span class="cd-kv__value" style="font-family: var(--nv-font-mono);">{{ collectorPriority }}</span>
-              </div>
-              <div class="cd-kv">
-                <span class="cd-kv__label">Execution Time</span>
-                <span class="cd-kv__value" style="font-family: var(--nv-font-mono);">{{ formatDuration(collector.execution_time) }}</span>
-              </div>
-              <div v-if="collector.start_time" class="cd-kv">
-                <span class="cd-kv__label">Start Time</span>
-                <span class="cd-kv__value" style="font-family: var(--nv-font-mono); font-size: 0.75rem;">{{ collector.start_time }}</span>
-              </div>
-              <div v-if="collector.end_time" class="cd-kv">
-                <span class="cd-kv__label">End Time</span>
-                <span class="cd-kv__value" style="font-family: var(--nv-font-mono); font-size: 0.75rem;">{{ collector.end_time }}</span>
-              </div>
-              <div v-if="collectorCommand" class="cd-kv">
-                <span class="cd-kv__label">{{ collectorCommandLabel }}</span>
-                <span class="cd-kv__value cd-kv__value--mono-wrap">{{ collectorCommand }}</span>
-              </div>
-              <div class="cd-kv">
-                <span class="cd-kv__label">Total Log Size</span>
-                <span class="cd-kv__value" style="font-family: var(--nv-font-mono);">{{ formatBytes(totalLogSize) }}</span>
-              </div>
-            </div>
+        <section ref="artifactsSection" class="nv-card cd-anchor" tabindex="-1" aria-labelledby="collector-artifacts-title">
+          <h3 id="collector-artifacts-title" class="cd-section-title">
+            Collected Artifacts <span class="cd-count-badge">{{ partitionedFiles.artifacts.length }}</span>
+          </h3>
+          <div v-if="collector.reason && collector.status === 'success'" class="cd-result">
+            <ReasonDisplay :text="collector.reason" :compact="true" />
           </div>
+          <CollectorFileTable
+            v-if="partitionedFiles.artifacts.length"
+            :files="partitionedFiles.artifacts"
+            state-key="collector-artifacts"
+            @show-operation-timing="jumpToSection(timingSection)"
+          />
+          <div v-else class="cd-empty">
+            <p v-if="collector.status === 'not_ran'">This collector was not executed.</p>
+            <p v-else-if="collector.status === 'skipped'">This collector was skipped.</p>
+            <p v-else>This collector did not produce any collected artifacts.</p>
+            <ReasonDisplay v-if="collector.reason && ['not_ran', 'skipped'].includes(collector.status)" :text="collector.reason" :compact="true" />
+            <p v-if="partitionedFiles.diagnostics.length">{{ partitionedFiles.diagnostics.length }} diagnostic {{ partitionedFiles.diagnostics.length === 1 ? 'file is' : 'files are' }} available below the runtime logs.</p>
+          </div>
+        </section>
 
-          <!-- Right: Stage Timing -->
-          <div class="nv-card">
-            <h3 class="cd-section-title">Stage Timing</h3>
-            <template v-if="hasStageData">
-              <div class="cd-stage-bar">
-                <div
-                  v-for="seg in stageSegments"
-                  :key="seg.stage"
-                  class="cd-stage-bar__segment"
-                  :style="{ flex: seg.flex, background: seg.color }"
-                  :title="`${seg.label}: ${seg.value.toFixed(2)}s (${seg.pct}%)`"
-                >
-                  <span v-if="seg.flex > 0.08" class="cd-stage-bar__label">{{ seg.value.toFixed(1) }}s</span>
-                </div>
-              </div>
-              <div class="cd-stage-legend">
-                <div v-for="seg in stageSegments" :key="seg.stage" class="cd-stage-legend__item">
-                  <span class="cd-stage-legend__swatch" :style="{ background: seg.color }"></span>
-                  <span style="color: var(--nv-text-secondary);">{{ seg.label }}</span>
-                  <span style="font-weight: 600; font-family: var(--nv-font-mono); color: var(--nv-text-primary);">{{ seg.value.toFixed(2) }}s</span>
-                  <span style="color: var(--nv-text-tertiary); font-size: 0.6875rem;">({{ seg.pct }}%)</span>
-                </div>
-              </div>
-            </template>
-            <div v-else style="color: var(--nv-text-tertiary); font-size: 0.8125rem; padding: 12px 0;">
-              No stage timing data available for this collector.
-            </div>
-          </div>
-        </div>
-
-        <!-- Execution Summary (if there's any) -->
-        <div v-if="executionSummary && Object.keys(executionSummary).length > 0" class="nv-card" style="margin-bottom: 16px;">
-          <h3 class="cd-section-title">Execution Summary</h3>
-          <div class="cd-kv-list">
-            <div v-for="(val, key) in executionSummary" :key="key" class="cd-kv">
-              <span class="cd-kv__label">{{ String(key) }}</span>
-              <span class="cd-kv__value" style="font-family: var(--nv-font-mono); word-break: break-all;">{{ formatSummaryValue(val) }}</span>
-            </div>
-          </div>
+        <div ref="runtimeLogsSection" class="cd-anchor" tabindex="-1" aria-label="Collector runtime logs">
+          <CollectorRuntimeLogs :dut-id="dutId" :collector-id="collector.id" />
         </div>
 
         <!-- Error Details (prominent glass panel) -->
@@ -256,98 +229,181 @@
           </div>
         </div>
 
-        <!-- Dependencies -->
-        <div v-if="collector.dependencies.length > 0 || reverseDeps.length > 0" class="cd-details-grid" style="margin-bottom: 16px;">
-          <div v-if="collector.dependencies.length > 0" class="nv-card">
-            <h3 class="cd-section-title">
-              Depends On
-              <span class="cd-count-badge">{{ collector.dependencies.length }}</span>
-            </h3>
-            <div style="display: flex; flex-wrap: wrap; gap: 8px;">
-              <router-link
-                v-for="dep in collector.dependencies"
-                :key="depId(dep)"
-                :to="depRoute(depId(dep))"
-                class="cd-dep-badge"
-              >{{ depId(dep) }}</router-link>
+        <details v-if="partitionedFiles.diagnostics.length" class="nv-card cd-disclosure">
+          <summary>Diagnostics <span class="cd-count-badge">{{ partitionedFiles.diagnostics.length }}</span></summary>
+          <p class="cd-help">Request, response, task-polling, and command-execution metadata.</p>
+          <CollectorFileTable :files="partitionedFiles.diagnostics" state-key="collector-diagnostics" @show-operation-timing="jumpToSection(timingSection)" />
+        </details>
+
+        <section ref="timingSection" class="nv-card cd-anchor" tabindex="-1" aria-labelledby="collector-operation-timing-title">
+          <h3 id="collector-operation-timing-title" class="cd-section-title">Operation Timing <span v-if="granularTiming" class="cd-count-badge">{{ timedOperations.length }}</span></h3>
+          <template v-if="!granularTiming">
+            <p v-if="timingLoading" class="cd-help">Loading bounded detailed timing&hellip;</p>
+            <div v-else-if="timingError" role="alert" class="cd-info-note">
+              <span>{{ timingError }}</span>
+              <button class="nv-btn" type="button" @click="loadDetailedTiming">Retry</button>
+            </div>
+            <p v-else class="cd-help">No operation measurements were recorded in this report.</p>
+          </template>
+          <template v-else>
+            <p style="margin: -4px 0 12px; color: var(--nv-text-tertiary); font-size: 0.75rem; line-height: 1.5;">
+              Collector wall time is authoritative. Cumulative work sums only top-level operations; nested detail is excluded to avoid double-counting. Parallel work can make cumulative time exceed wall time, while active time is the union of measured operations.
+            </p>
+            <div class="cd-details-grid" style="margin-bottom: 12px;">
+              <div class="cd-kv-list">
+                <div class="cd-kv">
+                  <span class="cd-kv__label">Collector Wall Time</span>
+                  <span class="cd-kv__value" style="font-family: var(--nv-font-mono);">{{ formatDuration(granularTiming.wall_clock_duration_seconds) }}</span>
+                </div>
+                <div class="cd-kv">
+                  <span class="cd-kv__label">Active Measured Time</span>
+                  <span class="cd-kv__value" style="font-family: var(--nv-font-mono);">{{ formatDuration(granularTiming.active_operation_union_seconds) }}</span>
+                </div>
+              </div>
+              <div class="cd-kv-list">
+                <div class="cd-kv">
+                  <span class="cd-kv__label">Cumulative Work Time</span>
+                  <span class="cd-kv__value" style="font-family: var(--nv-font-mono);">{{ formatDuration(granularTiming.cumulative_operation_time_seconds) }}</span>
+                </div>
+                <div class="cd-kv">
+                  <span class="cd-kv__label">Nested Detail Excluded</span>
+                  <span class="cd-kv__value" style="font-family: var(--nv-font-mono);">{{ formatDuration(granularTiming.nested_operation_time_excluded_seconds) }}</span>
+                </div>
+                <div class="cd-kv">
+                  <span class="cd-kv__label">Unattributed Wall Time</span>
+                  <span class="cd-kv__value" style="font-family: var(--nv-font-mono);">{{ formatDuration(granularTiming.unattributed_wall_time_seconds) }}</span>
+                </div>
+              </div>
+            </div>
+            <DataTable
+              v-if="operationTableData.length > 0"
+              class="cd-operation-table"
+              :columns="operationColumns"
+              :data="operationTableData"
+              :searchable="operationTableData.length > 5"
+              :page-size="25"
+              state-key="collector-operation-timing"
+            >
+              <template #cell-duration_seconds="{ value, row }">
+                <span style="font-family: var(--nv-font-mono); font-size: 0.75rem; white-space: nowrap;">{{ formatArtifactDuration(value, row) }}</span>
+              </template>
+              <template #cell-status="{ value }">
+                <span :class="['nv-badge', operationStatusBadgeClass(value)]">{{ value }}</span>
+              </template>
+            </DataTable>
+          </template>
+        </section>
+
+        <details class="nv-card cd-disclosure">
+          <summary>Execution Details</summary>
+          <p class="cd-help">Collection status reflects nvdebug execution and artifact capture. Health or diagnostic verdicts embedded inside a captured artifact remain part of that artifact's content.</p>
+          <div class="cd-kv-list">
+            <div class="cd-kv">
+              <span class="cd-kv__label">Collector ID</span>
+              <span class="cd-kv__value" style="font-family: var(--nv-font-mono);">{{ collector.id }}</span>
+            </div>
+            <div class="cd-kv">
+              <span class="cd-kv__label">Collector Name</span>
+              <span class="cd-kv__value">{{ collector.name }}</span>
+            </div>
+            <div class="cd-kv">
+              <span class="cd-kv__label">Service Group</span>
+              <span class="cd-kv__value"><ServiceBadge :service="groupName" /></span>
+            </div>
+            <div class="cd-kv">
+              <span class="cd-kv__label">Status</span>
+              <span class="cd-kv__value"><StatusBadge :status="collector.status" /></span>
+            </div>
+            <div v-if="failureCategoryLabel" class="cd-kv">
+              <span class="cd-kv__label">Failure Category</span>
+              <span class="cd-kv__value" style="font-family: var(--nv-font-mono);">{{ failureCategoryLabel }}</span>
+            </div>
+            <div class="cd-kv">
+              <span class="cd-kv__label">Collection Level</span>
+              <span class="cd-kv__value">{{ collector.collection_level || '\u2014' }}</span>
+            </div>
+            <div v-if="collectorPriority != null" class="cd-kv">
+              <span class="cd-kv__label">Priority</span>
+              <span class="cd-kv__value" style="font-family: var(--nv-font-mono);">{{ collectorPriority }}</span>
+            </div>
+            <div class="cd-kv">
+              <span class="cd-kv__label">Execution Time</span>
+              <span class="cd-kv__value" style="font-family: var(--nv-font-mono);">{{ formatDuration(collector.execution_time) }}</span>
+            </div>
+            <div v-if="collector.start_time" class="cd-kv">
+              <span class="cd-kv__label">Start Time</span>
+              <span class="cd-kv__value" style="font-family: var(--nv-font-mono); font-size: 0.75rem;">{{ collector.start_time }}</span>
+            </div>
+            <div v-if="collector.end_time" class="cd-kv">
+              <span class="cd-kv__label">End Time</span>
+              <span class="cd-kv__value" style="font-family: var(--nv-font-mono); font-size: 0.75rem;">{{ collector.end_time }}</span>
+            </div>
+            <div v-if="collectorCommand" class="cd-kv">
+              <span class="cd-kv__label">{{ collectorCommandLabel }}</span>
+              <span class="cd-kv__value cd-kv__value--mono-wrap">{{ collectorCommand }}</span>
+            </div>
+            <div class="cd-kv">
+              <span class="cd-kv__label">Total Log Size</span>
+              <span class="cd-kv__value" style="font-family: var(--nv-font-mono);">{{ formatBytes(totalLogSize) }}</span>
             </div>
           </div>
-
-          <div v-if="reverseDeps.length > 0" class="nv-card">
-            <h3 class="cd-section-title">
-              Depended By
-              <span class="cd-count-badge">{{ reverseDeps.length }}</span>
-            </h3>
-            <div style="display: flex; flex-wrap: wrap; gap: 8px;">
-              <router-link
-                v-for="dep in reverseDeps"
-                :key="dep.collector_id"
-                :to="depRoute(dep.collector_id)"
-                class="cd-dep-badge cd-dep-badge--reverse"
-              >
-                {{ dep.collector_id }}
-                <span v-if="dep.name" class="cd-dep-badge__name">{{ dep.name }}</span>
-              </router-link>
+          <!-- Execution Summary (if there's any) -->
+          <div v-if="executionSummary && Object.keys(executionSummary).length > 0" class="nv-card" style="margin-bottom: 16px;">
+            <h3 class="cd-section-title">Execution Summary</h3>
+            <div class="cd-kv-list">
+              <div v-for="(val, key) in executionSummary" :key="key" class="cd-kv">
+                <span class="cd-kv__label">{{ String(key) }}</span>
+                <span class="cd-kv__value" style="font-family: var(--nv-font-mono); word-break: break-all;">{{ formatSummaryValue(val) }}</span>
+              </div>
             </div>
           </div>
-        </div>
+        </details>
 
-        <!-- Files Table (DataTable) -->
-        <div v-if="dedupedFiles.length > 0" class="nv-card" style="margin-bottom: 16px;">
-          <h3 class="cd-section-title">
-            Collected Files
-            <span class="cd-count-badge">{{ dedupedFiles.length }}</span>
-          </h3>
-          <DataTable
-            :columns="fileColumns"
-            :data="fileTableData"
-            :searchable="dedupedFiles.length > 5"
-            :page-size="0"
-            @row-click="onFileRowClick"
-          >
-            <template #cell-name="{ row }">
-              <span style="font-weight: 500;">{{ row.name }}</span>
-            </template>
-            <template #cell-size="{ value }">
-              <span style="font-family: var(--nv-font-mono); font-size: 0.75rem; white-space: nowrap;">{{ formatBytes(value) }}</span>
-            </template>
-            <template #cell-type="{ value }">
-              <span :class="['nv-badge', typeBadgeClass(value)]">{{ value }}</span>
-            </template>
-          </DataTable>
-        </div>
+        <details v-if="collector.dependencies.length > 0 || reverseDeps.length > 0" class="nv-card cd-disclosure">
+          <summary>Dependencies</summary>
+          <div class="cd-details-grid">
+            <div v-if="collector.dependencies.length > 0" class="nv-card">
+              <h3 class="cd-section-title">
+                Depends On
+                <span class="cd-count-badge">{{ collector.dependencies.length }}</span>
+              </h3>
+              <div style="display: flex; flex-wrap: wrap; gap: 8px;">
+                <router-link
+                  v-for="dep in collector.dependencies"
+                  :key="depId(dep)"
+                  :to="depRoute(depId(dep))"
+                  class="cd-dep-badge"
+                >{{ depId(dep) }}</router-link>
+              </div>
+            </div>
 
-        <!-- Empty state: not_ran -->
-        <div v-if="collector.status === 'not_ran'" class="nv-glass--subtle" style="padding: 32px; text-align: center; border-radius: var(--nv-radius-lg); margin-bottom: 16px;">
-          <div style="font-size: 2rem; margin-bottom: 8px; opacity: 0.3;">&#9940;</div>
-          <div style="font-size: 0.875rem; font-weight: 600; color: var(--nv-text-primary);">This collector was not executed</div>
-          <div style="font-size: 0.75rem; color: var(--nv-text-tertiary); margin-top: 6px; max-width: 420px; margin-inline: auto; line-height: 1.5;">
-            Possible reasons: not applicable to this baseboard, excluded by collection level, or not selected for this run.
+            <div v-if="reverseDeps.length > 0" class="nv-card">
+              <h3 class="cd-section-title">
+                Depended By
+                <span class="cd-count-badge">{{ reverseDeps.length }}</span>
+              </h3>
+              <div style="display: flex; flex-wrap: wrap; gap: 8px;">
+                <router-link
+                  v-for="dep in reverseDeps"
+                  :key="dep.collector_id"
+                  :to="depRoute(dep.collector_id)"
+                  class="cd-dep-badge cd-dep-badge--reverse"
+                >
+                  {{ dep.collector_id }}
+                  <span v-if="dep.name" class="cd-dep-badge__name">{{ dep.name }}</span>
+                </router-link>
+              </div>
+            </div>
           </div>
-        </div>
-
-        <!-- Empty state: skipped -->
-        <div v-else-if="collector.status === 'skipped' && dedupedFiles.length === 0" class="nv-glass--subtle" style="padding: 32px; text-align: center; border-radius: var(--nv-radius-lg); margin-bottom: 16px;">
-          <div style="font-size: 2rem; margin-bottom: 8px; opacity: 0.3;">&#9193;</div>
-          <div style="font-size: 0.875rem; font-weight: 600; color: var(--nv-text-primary);">This collector was skipped</div>
-          <div v-if="collector.reason" style="margin-top: 6px;">
-            <ReasonDisplay :text="collector.reason" :compact="true" />
-          </div>
-        </div>
-
-        <!-- Empty state: other statuses with no files -->
-        <div v-else-if="dedupedFiles.length === 0" class="nv-glass--subtle" style="padding: 32px; text-align: center; border-radius: var(--nv-radius-lg); margin-bottom: 16px;">
-          <div style="font-size: 2rem; margin-bottom: 8px; opacity: 0.3;">&#128196;</div>
-          <div style="font-size: 0.875rem; color: var(--nv-text-secondary);">This collector did not produce any output files.</div>
-        </div>
-      </template>
+        </details>
+      </div>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { computed, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import { useManifestStore } from '@/stores/manifest'
 import { formatCollectorForTicket } from '@/composables/useCopyForTicket'
 import StatusBadge from '@/components/common/StatusBadge.vue'
@@ -357,12 +413,26 @@ import CopyForTicket from '@/components/common/CopyForTicket.vue'
 import CopyButton from '@/components/common/CopyButton.vue'
 import ReasonDisplay from '@/components/common/ReasonDisplay.vue'
 import DataTable from '@/components/common/DataTable.vue'
-import { dedupFiles } from '@/utils/dedupFiles'
+import CollectorRuntimeLogs from '@/components/collector/CollectorRuntimeLogs.vue'
+import CollectorFileTable from '@/components/collector/CollectorFileTable.vue'
+import { dedupFiles as deduplicateFiles, partitionCollectorFiles } from '@/utils/dedupFiles'
 import { formatDuration } from '@/utils/format'
+import { resolveStageTiming, selectPreferredArtifactTimings, stageTimingFromOperations } from '@/utils/timing'
+import type { GranularCollectorTiming } from '@/types/manifest'
+import type { RouteLocationRaw } from 'vue-router'
+import { collectorDetailRoute, collectorGroupRoute, dutRoute } from '@/utils/reportRoutes'
 
 const route = useRoute()
-const router = useRouter()
 const manifestStore = useManifestStore()
+const artifactsSection = ref<HTMLElement | null>(null)
+const runtimeLogsSection = ref<HTMLElement | null>(null)
+const timingSection = ref<HTMLElement | null>(null)
+
+function jumpToSection(section: HTMLElement | null) {
+  if (!section) return
+  section.focus({ preventScroll: true })
+  section.scrollIntoView({ block: 'start' })
+}
 
 const dutId = computed(() => String(route.params.dutId))
 const groupName = computed(() => String(route.params.group))
@@ -397,6 +467,10 @@ const collector = computed(() => {
   return findCollectorById(collectorId.value, d.collector_groups)
 })
 
+const failureCategoryLabel = computed(() =>
+  collector.value?.failure_category?.replace(/-/g, ' ') ?? '',
+)
+
 const allSiblingCollectors = computed(() => {
   if (resolvedGroup.value) return resolvedGroup.value.collectors
   const d = dut.value
@@ -414,8 +488,8 @@ const siblingCollectors = computed(() =>
 
 const breadcrumbs = computed(() => [
   { label: 'Home', to: '/' },
-  { label: dutId.value, to: '/dut/' + dutId.value },
-  { label: resolvedGroupName.value, to: '/dut/' + dutId.value + '/' + resolvedGroupName.value },
+  { label: dutId.value, to: dutRoute(dutId.value) },
+  { label: resolvedGroupName.value, to: collectorGroupRoute(dutId.value, resolvedGroupName.value) },
   { label: (collector.value?.id ?? '') + ' \u2014 ' + (collector.value?.name ?? '') },
 ])
 
@@ -424,9 +498,35 @@ const ticketText = computed(() => {
   return formatCollectorForTicket(dut.value, groupName.value, collector.value)
 })
 
-const dedupedFiles = computed(() =>
-  dedupFiles(collector.value?.files ?? [])
+const loadedGranularTiming = ref<GranularCollectorTiming | null>(null)
+const loadedTimingKey = ref('')
+const granularTiming = computed(
+  () => loadedGranularTiming.value ?? collector.value?.timing ?? null,
 )
+const timingArtifacts = computed(() => selectPreferredArtifactTimings(
+  granularTiming.value?.artifact_timings ?? [],
+))
+const dedupedFiles = computed(() =>
+  deduplicateFiles(collector.value?.files ?? []).map(file => {
+    const artifact = timingArtifacts.value.get(file.path)
+    if (!artifact) return file
+    return {
+      ...file,
+      produced_by_operation_id: artifact.operation_id,
+      measurement: artifact.measurement,
+      measurement_quality: artifact.measurement_quality,
+      measurement_scope: artifact.measurement_scope,
+      shared_operation_artifact_count: artifact.shared_operation_artifact_count,
+      shared_request_operation_count: artifact.shared_request_operation_count,
+      started_at: artifact.started_at,
+      ended_at: artifact.ended_at,
+      duration_seconds: artifact.duration_seconds,
+      status: artifact.status,
+    }
+  })
+)
+
+const partitionedFiles = computed(() => partitionCollectorFiles(dedupedFiles.value))
 
 const totalLogSize = computed(() =>
   dedupedFiles.value.reduce((sum, f) => sum + (f.size || 0), 0)
@@ -439,6 +539,111 @@ const executionSummary = computed(() =>
 const errorDetails = computed((): any[] =>
   (collector.value as any)?.error_details ?? []
 )
+
+const timingLoading = ref(false)
+const timingError = ref('')
+
+async function loadDetailedTiming() {
+  const currentCollector = collector.value
+  const reference = currentCollector?.timing_ref
+  if (!currentCollector || !reference || currentCollector.timing) return
+  const requestKey = `${dutId.value}:${currentCollector.id}:${reference.sha256}`
+  if (loadedTimingKey.value === requestKey && loadedGranularTiming.value) return
+  timingLoading.value = true
+  timingError.value = ''
+  try {
+    const timing = await manifestStore.loadCollectorTiming(
+      dutId.value,
+      currentCollector.id,
+      reference,
+    )
+    if (
+      `${dutId.value}:${collector.value?.id ?? ''}:${collector.value?.timing_ref?.sha256 ?? ''}`
+      === requestKey
+    ) {
+      loadedGranularTiming.value = timing
+      loadedTimingKey.value = requestKey
+    }
+  } catch (error) {
+    if (
+      `${dutId.value}:${collector.value?.id ?? ''}:${collector.value?.timing_ref?.sha256 ?? ''}`
+      === requestKey
+    ) {
+      timingError.value = String(error instanceof Error ? error.message : error)
+    }
+  } finally {
+    if (
+      `${dutId.value}:${collector.value?.id ?? ''}:${collector.value?.timing_ref?.sha256 ?? ''}`
+      === requestKey
+    ) {
+      timingLoading.value = false
+    }
+  }
+}
+
+watch(
+  () => [
+    dutId.value,
+    collector.value?.id,
+    collector.value?.timing_ref?.source,
+    collector.value?.timing_ref?.size_bytes,
+    collector.value?.timing_ref?.sha256,
+    collector.value?.timing_ref?.snapshot_generation,
+  ],
+  () => {
+    loadedGranularTiming.value = null
+    loadedTimingKey.value = ''
+    timingLoading.value = false
+    timingError.value = ''
+    void loadDetailedTiming()
+  },
+  { immediate: true },
+)
+
+const timedOperations = computed(() =>
+  (granularTiming.value?.operations ?? []).filter(
+    operation => operation.contributes_to_active_time || operation.metadata?.show_in_timing_table === true,
+  )
+)
+
+const operationColumns: FileColumn[] = [
+  { key: 'operation_type', label: 'Operation', sortable: true },
+  { key: 'name', label: 'Name', sortable: true },
+  { key: 'stage', label: 'Stage', sortable: true },
+  { key: 'aggregation_scope', label: 'Aggregation', sortable: true },
+  { key: 'duration_seconds', label: 'Duration', sortable: true },
+  { key: 'status', label: 'Status', sortable: true },
+]
+
+const operationTableData = computed(() => {
+  const operations = granularTiming.value?.operations ?? []
+  const operationsById = new Map(operations.map(operation => [operation.operation_id, operation]))
+
+  function aggregationScope(operation: typeof operations[number]): string {
+    if (operation.metadata?.time_basis === 'duration_only') return 'Duration only'
+    if (!operation.contributes_to_active_time) return 'Detail only'
+
+    const visited = new Set<string>()
+    let parentId = operation.parent_id
+    while (parentId && !visited.has(parentId)) {
+      visited.add(parentId)
+      const parent = operationsById.get(parentId)
+      if (!parent) break
+      if (parent.contributes_to_active_time) return 'Nested (excluded)'
+      parentId = parent.parent_id
+    }
+    return 'Included'
+  }
+
+  return timedOperations.value.map(operation => ({
+    operation_type: operation.operation_type.replace(/_/g, ' '),
+    name: operation.name,
+    stage: operation.stage || '\u2014',
+    aggregation_scope: aggregationScope(operation),
+    duration_seconds: operation.duration_seconds,
+    status: operation.status,
+  }))
+})
 
 // --- Priority & Command/URI ---
 const collectorPriority = computed(() => (collector.value as any)?.priority ?? null)
@@ -492,27 +697,23 @@ const errorClipboardText = computed(() => {
 })
 
 // --- Status helpers ---
-const STATUS_COLORS: Record<string, string> = {
-  success: 'green', error: 'red', partial: 'amber', skipped: 'slate', not_ran: 'slate',
-}
-const STATUS_LABELS: Record<string, string> = {
-  success: 'Success', error: 'Error', partial: 'Partial', skipped: 'Skipped', not_ran: 'Not Ran',
-}
-
-const statusColor = computed(() => STATUS_COLORS[collector.value?.status ?? ''] ?? 'slate')
-const statusLabel = computed(() => STATUS_LABELS[collector.value?.status ?? ''] ?? collector.value?.status ?? 'Unknown')
-
 function statusDotColor(status: string): string {
   const map: Record<string, string> = {
-    success: 'var(--nv-success)', error: 'var(--nv-error)', partial: 'var(--nv-warning)',
+    success: 'var(--nv-success)', degraded: 'var(--nv-warning)', error: 'var(--nv-error)', partial: 'var(--nv-warning)',
     skipped: 'var(--nv-skipped)', not_ran: 'var(--nv-text-tertiary)',
   }
   return map[status] ?? 'var(--nv-text-tertiary)'
 }
 
 // --- Stage Timing (CSS flexbox) ---
+const collectorStageTiming = computed(() => resolveStageTiming(
+  collector.value?.stage_timing,
+  manifestStore.timing?.per_dut?.find(entry => entry.dut_id === dutId.value)
+    ?.collectors.find(entry => entry.id.toLowerCase() === collector.value?.id.toLowerCase())?.stage_timing,
+  stageTimingFromOperations(granularTiming.value),
+))
 const hasStageData = computed(() =>
-  collector.value && Object.values(collector.value.stage_timing).some(v => v != null)
+  Object.values(collectorStageTiming.value).some(v => v != null)
 )
 
 const STAGE_META: Record<string, { color: string; label: string }> = {
@@ -524,7 +725,7 @@ const STAGE_META: Record<string, { color: string; label: string }> = {
 
 const stageSegments = computed(() => {
   if (!collector.value) return []
-  const timing = collector.value.stage_timing
+  const timing = collectorStageTiming.value
   const entries = Object.entries(timing).filter(([, v]) => v != null) as [string, number][]
   const total = entries.reduce((s, [, v]) => s + v, 0) || 1
   return entries.map(([stage, val]) => ({
@@ -540,24 +741,18 @@ const stageSegments = computed(() => {
 // --- Files DataTable ---
 interface FileColumn { key: string; label: string; sortable?: boolean }
 
-const fileColumns: FileColumn[] = [
-  { key: 'name', label: 'File Name', sortable: true },
-  { key: 'size', label: 'Size', sortable: true },
-  { key: 'type', label: 'Type', sortable: true },
-]
-
-const fileTableData = computed(() =>
-  dedupedFiles.value.map(f => ({
-    name: fileName(f.path),
-    size: f.size || 0,
-    type: f.type,
-    _path: f.path,
-  }))
-)
-
-function onFileRowClick(row: Record<string, any>) {
-  router.push(`/file/${encodeURIComponent(row._path)}`)
-}
+const fileSections = computed(() => [
+  {
+    key: 'artifacts',
+    title: 'Collected Artifacts',
+    files: partitionedFiles.value.artifacts,
+  },
+  {
+    key: 'diagnostics',
+    title: 'Diagnostics',
+    files: partitionedFiles.value.diagnostics,
+  },
+].filter(section => section.files.length > 0))
 
 // --- Dependencies helpers ---
 function depId(dep: any): string {
@@ -573,12 +768,12 @@ function formatSummaryValue(val: unknown): string {
   return String(val)
 }
 
-function depRoute(depId: string): string {
+function depRoute(depId: string): RouteLocationRaw {
   const d = dut.value
   if (!d) return '#'
   for (const g of d.collector_groups) {
     if (g.collectors.some(c => c.id === depId)) {
-      return `/dut/${dutId.value}/${g.name}/${depId}`
+      return collectorDetailRoute(dutId.value, g.name, depId)
     }
   }
   return '#'
@@ -589,12 +784,19 @@ function fileName(path: string): string {
   return path.split('/').pop() ?? path
 }
 
-function typeBadgeClass(type: string): string {
-  const map: Record<string, string> = {
-    json: 'nv-badge--info', text: 'nv-badge--neutral', log: 'nv-badge--neutral',
-    xml: 'nv-badge--info', yaml: 'nv-badge--info', binary: 'nv-badge--warning',
-  }
-  return map[type] ?? 'nv-badge--neutral'
+function operationStatusBadgeClass(status: string): string {
+  const normalized = String(status || '').toLowerCase()
+  if (normalized === 'success' || normalized === 'complete') return 'nv-badge--success'
+  if (normalized === 'error' || normalized === 'failed') return 'nv-badge--error'
+  if (normalized === 'cancelled' || normalized === 'degraded' || normalized === 'partial') return 'nv-badge--warning'
+  return 'nv-badge--neutral'
+}
+
+function formatArtifactDuration(value: unknown, row: Record<string, any>): string {
+  if (typeof value === 'number' && Number.isFinite(value)) return formatDuration(value)
+  if (row._measurement_scope === 'shared_operation') return 'Shared operation'
+  if (row._measurement) return 'See operation'
+  return 'Not instrumented'
 }
 
 function formatBytes(b: number): string {
@@ -606,6 +808,8 @@ function formatBytes(b: number): string {
 </script>
 
 <style scoped>
+.cd-page { margin-left: 260px; }
+
 /* ── Header ── */
 .cd-header {
   display: flex;
@@ -619,6 +823,7 @@ function formatBytes(b: number): string {
 .cd-header__main {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 12px;
   min-width: 0;
 }
@@ -637,21 +842,55 @@ function formatBytes(b: number): string {
   font-weight: 600;
   color: var(--nv-text-primary);
   margin: 0;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  overflow-wrap: anywhere;
 }
 .cd-header__actions { flex-shrink: 0; }
 
-/* ── Stats ── */
-.cd-stats {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 12px;
-  margin-bottom: 16px;
+/* ── Compact summary and section navigation ── */
+.cd-overview { margin-bottom: 12px; }
+.cd-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 32px;
+  margin: 0 0 12px;
 }
-@media (max-width: 720px) {
-  .cd-stats { grid-template-columns: repeat(2, 1fr); }
+.cd-summary > div { display: flex; align-items: baseline; gap: 8px; }
+.cd-summary dt { color: var(--nv-text-secondary); font-size: 0.75rem; }
+.cd-summary dd { margin: 0; font-size: 0.875rem; font-weight: 600; }
+.cd-stage-title { margin: 0 0 6px; font-size: 0.75rem; color: var(--nv-text-secondary); }
+.cd-section-nav {
+  position: sticky;
+  top: 52px;
+  z-index: 3;
+  display: flex;
+  gap: 8px;
+  padding: 6px;
+  margin-bottom: 12px;
+  border: 1px solid var(--nv-glass-border);
+  border-radius: var(--nv-radius-md);
+  background: var(--nv-glass-bg-dense);
+  backdrop-filter: var(--nv-glass-blur);
+}
+.cd-anchor { scroll-margin-top: 116px; margin-bottom: 16px; min-width: 0; }
+.cd-operation-table :deep(.dt-scroll) { max-height: 420px; }
+.cd-disclosure { margin-bottom: 12px; min-width: 0; }
+.cd-disclosure > summary {
+  cursor: pointer;
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+.cd-disclosure[open] > summary { margin-bottom: 16px; }
+.cd-help, .cd-empty { color: var(--nv-text-secondary); font-size: 0.8125rem; line-height: 1.5; }
+.cd-result { margin: 0 0 12px; }
+@media (max-width: 1024px) {
+  .cd-page { margin-left: 0; }
+}
+@media (max-width: 600px) {
+  .cd-header { align-items: flex-start; flex-wrap: wrap; padding: 12px; }
+  .cd-header__main { gap: 8px; }
+  .cd-summary { gap: 8px 16px; }
+  .cd-section-nav { gap: 2px; }
+  .cd-section-nav .nv-btn { padding-inline: 8px; }
 }
 
 /* ── Reason Banner ── */
@@ -670,7 +909,7 @@ function formatBytes(b: number): string {
   );
 }
 
-/* ── Info Note (success result) ── */
+/* ── Timing load error ── */
 .cd-info-note {
   display: flex;
   align-items: flex-start;
@@ -678,12 +917,7 @@ function formatBytes(b: number): string {
   padding: 14px 18px;
   margin-bottom: 16px;
   border-radius: var(--nv-radius-lg);
-  border: 1px solid color-mix(in srgb, var(--nv-success) 30%, transparent);
-  background: linear-gradient(
-    135deg,
-    color-mix(in srgb, var(--nv-success) 5%, transparent) 0%,
-    color-mix(in srgb, var(--nv-success) 2%, transparent) 100%
-  );
+  border: 1px solid var(--nv-glass-border);
 }
 
 /* ── Details Grid ── */
@@ -758,11 +992,11 @@ function formatBytes(b: number): string {
 /* ── Stage Timing (CSS flexbox bar) ── */
 .cd-stage-bar {
   display: flex;
-  height: 28px;
+  height: 18px;
   border-radius: var(--nv-radius-md);
   overflow: hidden;
   border: 1px solid var(--nv-glass-border);
-  margin-bottom: 12px;
+  margin-bottom: 8px;
 }
 .cd-stage-bar__segment {
   display: flex;

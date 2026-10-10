@@ -1,0 +1,146 @@
+{
+  "schema_version": "1.2",
+  "status": "completed",
+  "started_at": "2026-08-14T16:15:35Z",
+  "completed_at": "2026-08-14T16:17:35Z",
+  "settings": {
+    "mode": "adaptive",
+    "minimum_limit": 4,
+    "initial_limit": 5,
+    "maximum_limit": 64,
+    "sample_interval_seconds": 20,
+    "healthy_windows_required": 3,
+    "increase_step": 8,
+    "decrease_ratio": 0.75,
+    "hard_decrease_ratio": 0.5,
+    "cooldown_seconds": 60,
+    "endpoint_cooldown_seconds": 30
+  },
+  "plan_summary": {
+    "dut_count": 45,
+    "runnable_service_lanes": 45,
+    "runnable_collector_operations": 324,
+    "skipped_collector_operations": 36,
+    "weighted_demand": 324,
+    "limits": {
+      "redfish_per_dut": 1
+    }
+  },
+  "decisions": [
+    {
+      "timestamp": "2026-08-14T16:15:35Z",
+      "elapsed_seconds": 0,
+      "action": "start",
+      "previous_limit": 5,
+      "new_limit": 5,
+      "reasons": ["mode_adaptive"],
+      "signals": null,
+      "progress": {
+        "admissions": 0,
+        "completed_operations": 0,
+        "limiter": {
+          "capacity": 5,
+          "active_operations": 0,
+          "active_weight": 0,
+          "queued_operations": 0
+        }
+      }
+    },
+    {
+      "timestamp": "2026-08-14T16:16:35Z",
+      "elapsed_seconds": 60,
+      "action": "increase",
+      "previous_limit": 5,
+      "new_limit": 6,
+      "reasons": ["consecutive_healthy_windows"],
+      "signals": {
+        "event_loop_lag_seconds": 0.001,
+        "cpu_utilization": 0.1,
+        "cgroup_throttling_ratio": 0,
+        "memory_headroom_ratio": 0.8,
+        "file_descriptor_utilization": 0.02,
+        "pid_utilization": 0.03,
+        "cgroup_oom_events": 0,
+        "completed_operations": 100,
+        "remote_events": {},
+        "transport_latency_p95_seconds": 2.5
+      },
+      "progress": {
+        "admissions": 160,
+        "completed_operations": 155,
+        "limiter": {
+          "capacity": 6,
+          "active_operations": 5,
+          "active_weight": 5,
+          "queued_operations": 20
+        }
+      }
+    },
+    {
+      "timestamp": "2026-08-14T16:17:35Z",
+      "elapsed_seconds": 120,
+      "action": "stop",
+      "previous_limit": 6,
+      "new_limit": 6,
+      "reasons": ["completed"],
+      "signals": null,
+      "progress": {
+        "admissions": 324,
+        "completed_operations": 324,
+        "limiter": {
+          "capacity": 6,
+          "active_operations": 0,
+          "active_weight": 0,
+          "queued_operations": 0
+        }
+      }
+    }
+  ],
+  "decision_accounting": {
+    "total": 3,
+    "retained": 3,
+    "dropped": 0
+  },
+  "operation_metrics": {
+    "admissions": 324,
+    "queue_wait_seconds_total": 120,
+    "queue_wait_seconds_average": 0.37,
+    "queue_wait_seconds_max": 5,
+    "completed_operations": 324,
+    "active_seconds_total": 600,
+    "active_seconds_average": 1.85,
+    "active_seconds_max": 30,
+    "active_time_by_service": {
+      "redfish": {
+        "completed_operations": 324,
+        "active_seconds_total": 600,
+        "active_seconds_average": 1.85
+      }
+    },
+    "peak_active_operations_by_service": {
+      "redfish": 6
+    },
+    "limiter": {
+      "capacity": 6,
+      "active_operations": 0,
+      "active_weight": 0,
+      "queued_operations": 0,
+      "peak_active_operations": 6,
+      "peak_active_weight": 6,
+      "peak_queued_operations": 20,
+      "backfilled_operations": 3,
+      "queued_wall_seconds": 100,
+      "queued_capacity_weight_seconds": 600,
+      "queued_active_weight_seconds": 597.48,
+      "queued_unused_weight_seconds": 2.52,
+      "saturated_while_queued_seconds": 96,
+      "runnable_gap_weight_seconds": 0.02,
+      "fragmentation_weight_seconds": 2.5,
+      "utilization_while_queued_ratio": 0.9958,
+      "saturation_while_queued_ratio": 0.96
+    }
+  },
+  "remote_pressure_events": {},
+  "endpoint_cooldowns": {},
+  "final_limit": 6
+}

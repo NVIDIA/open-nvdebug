@@ -1,3 +1,20 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 <template>
   <div class="nv-page">
     <Breadcrumbs :items="[{ label: 'Home', to: '/' }, { label: 'File Map' }]" />
@@ -90,9 +107,22 @@ import FileTree from '@/components/common/FileTree.vue'
 import Breadcrumbs from '@/components/common/Breadcrumbs.vue'
 import { showToast } from '@/composables/useToast'
 import { copyToClipboard } from '@/utils/clipboard'
+import { formatAccessPath } from '@/utils/reportMetadata'
+import { downloadCsv } from '@/services/exportService'
+
+interface FileMapRow {
+  dut_id: string
+  collector_group: string
+  collector: string
+  component_label: string
+  access_path: string
+  path: string
+  type: string
+  size: number
+}
 
 interface Column {
-  key: string
+  key: keyof FileMapRow
   label: string
   sortable?: boolean
 }
@@ -113,6 +143,12 @@ const dutNames = computed(() => [...new Set(fileIndex.value.map(f => f.dut_id))]
 const groupNames = computed(() => [...new Set(fileIndex.value.map(f => f.collector_group).filter(Boolean))].sort())
 const dutCount = computed(() => dutNames.value.length)
 const groupCount = computed(() => groupNames.value.length)
+const hasComponentMetadata = computed(() =>
+  fileIndex.value.some(file => Boolean(file.component_label))
+)
+const hasAccessPathMetadata = computed(() =>
+  fileIndex.value.some(file => file.access_path !== undefined)
+)
 
 const filteredFiles = computed(() => {
   let files = fileIndex.value
@@ -121,25 +157,29 @@ const filteredFiles = computed(() => {
   return files
 })
 
-const filteredTableData = computed(() =>
+const filteredTableData = computed<FileMapRow[]>(() =>
   filteredFiles.value.map(f => ({
     dut_id: f.dut_id,
     collector_group: f.collector_group,
     collector: f.collector_id ? `${f.collector_id} ${f.collector_name}` : f.collector_name,
+    component_label: f.component_label ?? '',
+    access_path: f.access_path ? formatAccessPath(f.access_path) : '',
     path: f.path,
     type: f.type,
     size: f.size,
   }))
 )
 
-const tableColumns: Column[] = [
+const tableColumns = computed<Column[]>(() => [
   { key: 'dut_id', label: 'DUT' },
   { key: 'collector_group', label: 'Group' },
   { key: 'collector', label: 'Collector' },
+  ...(hasComponentMetadata.value ? [{ key: 'component_label' as const, label: 'Component' }] : []),
+  ...(hasAccessPathMetadata.value ? [{ key: 'access_path' as const, label: 'Access Path' }] : []),
   { key: 'path', label: 'File Path' },
   { key: 'type', label: 'Type' },
   { key: 'size', label: 'Size' },
-]
+])
 
 function openFile(row: any) {
   const path = typeof row === 'string' ? row : row.path
@@ -168,18 +208,15 @@ watch([dutFilter, groupFilter, viewMode], () => {
 })
 
 function exportCSV() {
-  const headers = ['DUT', 'Group', 'Collector', 'Path', 'Type', 'Size']
+  const columns = tableColumns.value
+  const headers = columns.map(column => column.label)
   const rows = filteredTableData.value.map(r =>
-    [r.dut_id, r.collector_group, r.collector, r.path, r.type, r.size].map(v => `"${String(v).replace(/"/g, '""')}"`)
+    columns.map(column => r[column.key])
   )
-  const csv = [headers.join(','), ...rows.map(r => r.join(','))].join('\n')
-  const blob = new Blob([csv], { type: 'text/csv' })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = `nvdebug-files-${new Date().toISOString().slice(0, 10)}.csv`
-  a.click()
-  URL.revokeObjectURL(url)
+  downloadCsv(
+    [headers, ...rows],
+    `nvdebug-files-${new Date().toISOString().slice(0, 10)}.csv`,
+  )
 }
 
 async function copyShareUrl() {

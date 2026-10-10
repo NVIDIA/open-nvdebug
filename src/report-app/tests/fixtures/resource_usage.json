@@ -1,0 +1,118 @@
+{
+  "schema_version": 1,
+  "status": "completed",
+  "started_at": "2026-08-04T00:00:00Z",
+  "completed_at": "2026-08-04T00:01:00Z",
+  "monitor": {
+    "sample_interval_seconds": 20,
+    "scope": "post_logger_start_through_pre_logger_finalization",
+    "process_io_includes_monitor_writes": true,
+    "sampling_schedule": { "periodic_samples": 2, "missed_intervals": 0, "max_start_jitter_seconds": 0.01 }
+  },
+  "scheduler": {
+    "effective_cpus": 2,
+    "oversubscription_factor": 1.5,
+    "installed_collector_operation_limit": 3,
+    "max_concurrent_duts": 2,
+    "binding_sources": ["cgroup_quota", "affinity"]
+  },
+  "system": {
+    "pid": 4242,
+    "host_cpu_count": 64,
+    "affinity": { "cpu_count": 8, "cpus_compact": "0-7" },
+    "cgroup": {
+      "version": 2,
+      "effective_quota_cpus": 2,
+      "cpuset_cpus_effective": "0-7"
+    }
+  },
+  "baseline": {
+    "timestamp": "2026-08-04T00:00:00Z",
+    "elapsed_seconds": 0,
+    "reason": "baseline",
+    "process": {
+      "rss_bytes": 104857600,
+      "peak_rss_bytes": 104857600,
+      "threads": 4,
+      "open_fds": 20,
+      "user_cpu_seconds": 0,
+      "system_cpu_seconds": 0,
+      "completed_children_user_cpu_seconds": 0,
+      "completed_children_system_cpu_seconds": 0,
+      "major_page_faults": 0,
+      "voluntary_context_switches": 10,
+      "involuntary_context_switches": 2,
+      "io": { "read_bytes": 1000, "write_bytes": 2000, "rchar": 10000, "wchar": 20000 }
+    },
+    "cgroup": { "version": 2, "scopes": [{
+      "controller": "unified", "path": "/nvdebug", "role": "current",
+      "cpu": { "stat": { "usage_usec": 0, "nr_throttled": 0, "throttled_usec": 0 }, "pressure": { "some": { "avg10": 0 }, "full": { "avg10": 0 } } },
+      "memory": { "current_bytes": 125829120, "peak_bytes": 125829120, "limit": { "value": 536870912 }, "events": { "high": 0, "oom": 0, "oom_kill": 0 }, "pressure": { "some": { "avg10": 0 }, "full": { "avg10": 0 } } },
+      "pids": { "current": 5, "limit": { "value": 128 }, "events": { "max": 0 } }
+    }] }
+  },
+  "latest": {
+    "timestamp": "2026-08-04T00:01:00Z",
+    "elapsed_seconds": 60,
+    "reason": "final",
+    "process": {
+      "rss_bytes": 157286400,
+      "peak_rss_bytes": 188743680,
+      "threads": 8,
+      "open_fds": 28,
+      "user_cpu_seconds": 30,
+      "system_cpu_seconds": 10,
+      "completed_children_user_cpu_seconds": 15,
+      "completed_children_system_cpu_seconds": 5,
+      "major_page_faults": 2,
+      "voluntary_context_switches": 100,
+      "involuntary_context_switches": 12,
+      "io": { "read_bytes": 1049576, "write_bytes": 2099152, "rchar": 4204304, "wchar": 8400608 }
+    },
+    "cgroup": { "version": 2, "scopes": [{
+      "controller": "unified", "path": "/nvdebug", "role": "current",
+      "cpu": { "stat": { "usage_usec": 60000000, "nr_throttled": 2, "throttled_usec": 500000 }, "pressure": { "some": { "avg10": 1.25 }, "full": { "avg10": 0.1 } } },
+      "memory": { "current_bytes": 178257920, "peak_bytes": 199229440, "limit": { "value": 536870912 }, "events": { "high": 1, "oom": 0, "oom_kill": 0 }, "pressure": { "some": { "avg10": 0.75 }, "full": { "avg10": 0 } } },
+      "pids": { "current": 10, "limit": { "value": 128 }, "events": { "max": 0 } }
+    }] }
+  },
+  "sample_history": {
+    "format": "jsonl",
+    "current_path": "resource_usage_samples.jsonl",
+    "previous_path": "resource_usage_samples.previous.jsonl",
+    "segments": [
+      { "role": "previous", "path": "resource_usage_samples.previous.jsonl", "samples": 2 },
+      { "role": "current", "path": "resource_usage_samples.jsonl", "samples": 2 }
+    ],
+    "rotations": 1,
+    "samples_retained": 4
+  },
+  "summary": {
+    "duration_seconds": 60,
+    "samples_total": 4,
+    "samples_retained": 4,
+    "samples_dropped": 0,
+    "samples_rotated_out": 0,
+    "sample_history_write_failures": 0,
+    "artifact_write_succeeded": true,
+    "sampling_schedule": { "periodic_samples": 2, "missed_intervals": 0, "max_start_jitter_seconds": 0.01 },
+    "peaks": { "process": { "peak_rss_bytes": 188743680, "rss_bytes": 157286400 } },
+    "deltas": {
+      "process": {
+        "user_cpu_seconds": 30,
+        "system_cpu_seconds": 10,
+        "completed_children_user_cpu_seconds": 15,
+        "completed_children_system_cpu_seconds": 5,
+        "io": { "read_bytes": 1048576, "write_bytes": 2097152, "rchar": 4194304, "wchar": 8388608 }
+      },
+      "cgroup_scopes": {
+        "unified:/nvdebug": {
+          "cpu_stat": { "usage_usec": 60000000, "nr_throttled": 2, "throttled_usec": 500000 },
+          "memory_events": { "high": 1, "oom": 0, "oom_kill": 0 },
+          "pids_events": { "max": 0 }
+        }
+      }
+    }
+  },
+  "errors": []
+}

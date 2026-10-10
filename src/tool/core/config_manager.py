@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 """
 Configuration Manager for NVDebug Tool.
 
@@ -21,21 +22,53 @@ DUT config, collector definitions, and service initialization.
 """
 
 import asyncio
+import copy
 import json
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
-from ..config import sync_legacy_fields
+from ..config import (
+    AdaptiveConcurrencyConfig,
+    RemovedAttachmentLimitError,
+    merge_dut_config_layers,
+    reject_removed_attachment_limit_setting,
+    sync_legacy_fields,
+)
 from ..services.base_service import BaseService
 from ..services.bmc_ssh_service import BMCSSHService
 from ..services.health_check_service import HealthCheckService
 from ..services.host_service import HostService
 from ..services.ipmi_service import IPMIService
+from ..services.redfish_pagination import DEFAULT_MAX_PAGINATION_PAGES
 from ..services.redfish_service import RedfishService
 from ..utils import excel_reader
+from ..utils.catalog_global_profile import load_catalog_global_profile
+from ..utils.catalog_snapshot import (
+    CatalogSnapshot,
+    CatalogSnapshotFacts,
+    read_catalog_snapshot,
+)
+from ..utils.collector_resource_profile import parse_collector_resource_profile
+from ..utils.dgx_diagnostic_routing_profile import (
+    DGX_DIAGNOSTIC_ROUTING_PROFILE_KEY,
+    get_dgx_diagnostic_route,
+    validate_dgx_diagnostic_route_hooks,
+    validate_dgx_diagnostic_routing_profile,
+)
 from ..utils.enums import CollectorServiceMapping
+from ..utils.redfish_diagnostic_concurrency import (
+    diagnostic_concurrency_profile_for_collector,
+)
+from ..utils.redfish_limits import RedfishRequestCaptureLimits, RedfishResponseLimits
+from ..utils.redfish_topology_profile import (
+    REDFISH_TOPOLOGY_PROFILE_KEY,
+    build_redfish_resource_uri_lookup,
+    validate_redfish_topology_profile,
+)
 from ..utils.resources import find_config_directory
+from ..utils.spreadsheet_utils import decode_long_cell
+from ..utils.timeout_config import TIMEOUT_CONFIG_OVERRIDE_KEYS
 from ..utils.uri_config_manager import URIConfigManager
 from ..utils.yaml_manager import YAMLManager
 
@@ -43,18 +76,65 @@ from ..utils.yaml_manager import YAMLManager
 logger = logging.getLogger(__name__)
 
 
+def _decode_catalog_json_object(
+    raw_value: Any,
+    *,
+    collector_id: Any,
+    column_name: str,
+    excel_row: int,
+) -> Dict[str, Any]:
+    """
+    Decode one optional JSON-object cell without consulting another source.
+
+    The implementation uses ``raw_value``, ``collector_id``, ``column_name``,
+    and ``excel_row`` to decode one optional JSON-object cell without consulting
+    another source. Parsing or I/O must finish before the validated
+    representation is made available to the caller. If the function cannot
+    decode one optional JSON-object cell without consulting another source, its
+    exception reaches the caller instead of being converted into a successful
+    result.
+
+    Args:
+        raw_value: Raw value consumed while the function attempts to decode one
+            optional JSON-object cell without consulting another source.
+        collector_id: Stable collector identifier used to correlate
+            configuration, logs, and results.
+        column_name: Stable column name used for lookup and operator-facing
+            diagnostics.
+        excel_row: Numeric excel row used while the operation performs bounded
+            accounting.
+
+    Returns:
+        A mapping containing catalog JSON object.
+
+    Raises:
+        ValueError: If ``location``: cannot decode a JSON object (``exc``); or
+            ``location``: expected a JSON object, got ``__name__``.
+    """
+    if not excel_reader.notna(raw_value) or not str(raw_value).strip():
+        return {}
+
+    location = (
+        f"Log Collection Catalog row {excel_row}, collector {collector_id}, "
+        f"column {column_name}"
+    )
+    try:
+        value = json.loads(decode_long_cell(str(raw_value)))
+    except (TypeError, ValueError, OSError, UnicodeError) as exc:
+        raise ValueError(f"{location}: cannot decode a JSON object ({exc})") from exc
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"{location}: expected a JSON object, got {type(value).__name__}"
+        )
+    return value
+
+
 class ConfigurationManager:
     """
     Manages all configuration loading and service initialization.
 
-    Handles loading of tool configuration, DUT configuration, collector definitions,
-    and initializes services for each DUT.
-
-    Attributes:
-        tool_config_path: Path to tool configuration file.
-        dut_config_path: Path to DUT configuration file.
-        sanitized_console: Console for output.
-        quiet_mode: Whether to suppress output.
+    Handles loading of tool configuration, DUT configuration, collector
+    definitions, and initializes services for each DUT.
     """
 
     def __init__(
@@ -67,11 +147,21 @@ class ConfigurationManager:
         """
         Initialize configuration manager.
 
+        The initializer records ``_catalog_snapshot``,
+        ``_catalog_snapshot_prebound``, ``_catalog_snapshot_source``,
+        ``collector_definitions``, and ``dgx_diagnostic_routing_profile`` for
+        later operations and establishes the instance invariants before any
+        public method runs.
+
         Args:
-            tool_config_path (str): Path to tool config file.
-            dut_config_path (str): Path to DUT config file.
-            sanitized_console: Sanitized console instance.
-            quiet_mode (bool): Suppress output messages.
+            tool_config_path: Optional filesystem location used as the tool
+                config path for this operation.
+            dut_config_path: Optional filesystem location used as the DUT config
+                path for this operation.
+            sanitized_console: Optional sanitized console; ``None`` selects the
+                function's default behavior.
+            quiet_mode: Whether quiet mode is enabled or required for this
+                operation.
         """
         self.tool_config_path = tool_config_path
         self.dut_config_path = dut_config_path
@@ -82,7 +172,9 @@ class ConfigurationManager:
         self.tool_config: Dict[str, Any] = {}
         self.dut_config: Dict[str, Any] = {}
         self.collector_definitions: Dict[str, Any] = {}
-        self._generated_collector_definitions_cache: Optional[Dict[str, Any]] = None
+        self._catalog_snapshot: Optional[CatalogSnapshot] = None
+        self._catalog_snapshot_source: Optional[str] = None
+        self._catalog_snapshot_prebound = False
 
         # Service instances
         self.services: Dict[str, BaseService] = {}
@@ -93,6 +185,7 @@ class ConfigurationManager:
 
         # URI configuration manager
         self.uri_config_manager: Optional[URIConfigManager] = None
+        self.dgx_diagnostic_routing_profile: Optional[Dict[str, Any]] = None
 
         # Load all configurations
         if tool_config_path and dut_config_path:
@@ -101,11 +194,17 @@ class ConfigurationManager:
 
     async def _log_runtime(self, level: str, message: str) -> None:
         """
-        Log message using async logger if available, otherwise fall back to standard logger.
+        Log runtime.
+
+        The implementation uses ``level`` and ``message`` to log runtime. Owned
+        asynchronous work is awaited before return, so completion does not leave
+        an unobserved task behind.
 
         Args:
-            level: Log level (ERROR, WARNING, DEBUG, INFO).
-            message: Message to log.
+            level: Text supplied as level in the format accepted by this
+                function.
+            message: Operator-facing text carried by the reported event or
+                failure.
         """
         if hasattr(self, "logger") and self.logger:
             # Use async logger if available
@@ -128,35 +227,52 @@ class ConfigurationManager:
         dut_configs,
         sanitized_console=None,
         quiet_mode: bool = False,
+        catalog_snapshot: Optional[CatalogSnapshot] = None,
     ):
         """
         Create ConfigurationManager from ToolConfig and DUTConfig objects.
 
+        Convert ToolConfig object to dictionary format expected by the system.
+
         Args:
-            tool_config: ToolConfig object or dictionary.
-            dut_configs: DUTConfig objects (list or dictionary).
-            sanitized_console: Optional sanitized console for output.
-            quiet_mode: Whether to suppress output.
+            tool_config: Tool config governing configurationManager from
+                ToolConfig and DUTConfig objects.
+            dut_configs: DUT configs governing configurationManager from
+                ToolConfig and DUTConfig objects.
+            sanitized_console: Optional sanitized console; ``None`` selects the
+                function's default behavior.
+            quiet_mode: Whether quiet mode is enabled or required for this
+                operation.
+            catalog_snapshot: Optional catalog snapshot; ``None`` selects the
+                function's default behavior.
 
         Returns:
-            ConfigurationManager instance.
+            The validated ``instance``.
+
+        Raises:
+            ValueError: If an authoritative catalog snapshot lacks a configured
+                Telemetry Catalog path.
         """
         instance = cls(sanitized_console=sanitized_console, quiet_mode=quiet_mode)
 
         # Convert ToolConfig object to dictionary format expected by the system
         if hasattr(tool_config, "__dict__"):
-
             config_dir = instance._find_config_directory()
 
+            execution_config = {
+                "max_concurrent_collectors_per_dut": tool_config.max_concurrent_collectors_per_dut,
+                "timeout": getattr(
+                    tool_config, "timeout", 300
+                ),  # Default timeout of 300 seconds
+                "retry_count": tool_config.retry_count,
+            }
+            if tool_config.max_concurrent_duts is not None:
+                execution_config["max_concurrent_duts"] = (
+                    tool_config.max_concurrent_duts
+                )
+
             tool_config_dict = {
-                "execution_config": {
-                    "max_concurrent_duts": tool_config.max_concurrent_duts,
-                    "max_concurrent_collectors_per_dut": tool_config.max_concurrent_collectors_per_dut,
-                    "timeout": getattr(
-                        tool_config, "timeout", 300
-                    ),  # Default timeout of 300 seconds
-                    "retry_count": tool_config.retry_count,
-                },
+                "execution_config": execution_config,
                 "collector_definitions": {
                     "spreadsheet_path": (
                         tool_config.spreadsheet
@@ -181,9 +297,14 @@ class ConfigurationManager:
                 "verbose": getattr(tool_config, "verbose", False),
                 "skip_preflight": getattr(tool_config, "skip_preflight", False),
                 "skip_sanitization": getattr(tool_config, "skip_sanitization", False),
+                "caller_output_was_explicit": getattr(
+                    tool_config,
+                    "caller_output_was_explicit",
+                    False,
+                ),
+                "apply_sanitization": getattr(tool_config, "apply_sanitization", False),
                 "skip_html_reports": getattr(tool_config, "skip_html_reports", False),
                 "report_format": getattr(tool_config, "report_format", "spa"),
-                "skip_auto_parse": getattr(tool_config, "skip_auto_parse", False),
                 "collector_id": getattr(tool_config, "collector_id", None),
                 "collector_group": getattr(tool_config, "collector_group", None),
                 "skip_collectors": getattr(tool_config, "skip_collectors", None),
@@ -211,10 +332,13 @@ class ConfigurationManager:
                 ),
                 "uri_overrides": getattr(tool_config, "uri_overrides", None),
                 "max_pagination_pages": getattr(
-                    tool_config, "max_pagination_pages", 100
+                    tool_config, "max_pagination_pages", DEFAULT_MAX_PAGINATION_PAGES
                 ),
                 "max_duplicate_url_retries": getattr(
                     tool_config, "max_duplicate_url_retries", 3
+                ),
+                "redfish_request_capture": (
+                    RedfishRequestCaptureLimits.from_tool_config(tool_config).as_dict()
                 ),
                 # Legacy field names for backward compatibility
                 "skip_zip": getattr(tool_config, "skip_zip", False),
@@ -259,6 +383,23 @@ class ConfigurationManager:
                 "EXPAND_QUERY_SYSTEM_LEVEL": getattr(
                     tool_config, "EXPAND_QUERY_SYSTEM_LEVEL", 1
                 ),
+                "__explicit_tool_config_fields": sorted(
+                    key
+                    for key, value in getattr(
+                        tool_config, "explicit_tool_config_keys", {}
+                    ).items()
+                    if value
+                ),
+                "__explicit_cli_config_fields": sorted(
+                    key
+                    for key, value in getattr(
+                        tool_config, "explicit_cli_config_keys", {}
+                    ).items()
+                    if value
+                ),
+                "EXPAND_FALLBACK_MODE": getattr(
+                    tool_config, "EXPAND_FALLBACK_MODE", "auto"
+                ),
                 # Timeout Fields
                 "NVOS_TECH_DUMP_TIMEOUT": getattr(
                     tool_config, "NVOS_TECH_DUMP_TIMEOUT", 600
@@ -268,6 +409,9 @@ class ConfigurationManager:
                 ),
                 "REDFISH_DEVICE_DUMP_SLEEP_DURATION": getattr(
                     tool_config, "REDFISH_DEVICE_DUMP_SLEEP_DURATION", 60
+                ),
+                "COLLECTOR_EXTENSION_CONFIG": getattr(
+                    tool_config, "COLLECTOR_EXTENSION_CONFIG", {}
                 ),
                 # Directory Fields
                 "BMC_TEMP_DIR": getattr(tool_config, "BMC_TEMP_DIR", "/tmp"),
@@ -294,10 +438,43 @@ class ConfigurationManager:
                 "EXTRA_LOG_COLLECTION": getattr(
                     tool_config, "EXTRA_LOG_COLLECTION", None
                 ),
+                "sysinfo_snapshot_mode": getattr(
+                    tool_config, "sysinfo_snapshot_mode", "fast"
+                ),
             }
+            concurrency_mode = getattr(tool_config, "concurrency_mode", "conservative")
+            initial_io_oversubscription = getattr(
+                tool_config, "initial_io_oversubscription", None
+            )
+            minimum_collector_operations = getattr(
+                tool_config, "minimum_collector_operations", 1
+            )
+            maximum_collector_operations = getattr(
+                tool_config, "maximum_collector_operations", None
+            )
+            adaptive_concurrency = dict(
+                getattr(tool_config, "adaptive_concurrency", {}) or {}
+            )
+            default_adaptive_concurrency = AdaptiveConcurrencyConfig().model_dump()
+            if concurrency_mode != "conservative":
+                execution_config["concurrency_mode"] = concurrency_mode
+            if initial_io_oversubscription is not None:
+                execution_config["initial_io_oversubscription"] = (
+                    initial_io_oversubscription
+                )
+            if minimum_collector_operations != 1:
+                execution_config["minimum_collector_operations"] = (
+                    minimum_collector_operations
+                )
+            if maximum_collector_operations is not None:
+                execution_config["maximum_collector_operations"] = (
+                    maximum_collector_operations
+                )
+            if adaptive_concurrency != default_adaptive_concurrency:
+                execution_config["adaptive"] = adaptive_concurrency
             # Include i2c_config overrides if present (avoid inserting None)
             _i2c = getattr(tool_config, "i2c_config", None)
-            if _i2c:
+            if _i2c is not None:
                 tool_config_dict["i2c_config"] = _i2c
             # Include preflight_config if present (credential validation settings)
             _preflight = getattr(tool_config, "preflight_config", None)
@@ -310,15 +487,53 @@ class ConfigurationManager:
             # Include redfish_session_config if present (connection pool settings)
             _redfish_session = getattr(tool_config, "redfish_session_config", None)
             if _redfish_session:
-                tool_config_dict["redfish_session_config"] = (
-                    _redfish_session.model_dump()
-                    if hasattr(_redfish_session, "model_dump")
-                    else _redfish_session
+                if hasattr(_redfish_session, "model_dump"):
+                    redfish_session_values = _redfish_session.model_dump()
+                    fields_set = set(
+                        getattr(_redfish_session, "model_fields_set", set())
+                    )
+                    for field_name in RedfishResponseLimits.model_fields:
+                        if field_name in fields_set:
+                            redfish_session_values[field_name] = getattr(
+                                _redfish_session,
+                                field_name,
+                            )
+                    tool_config_dict["redfish_session_config"] = redfish_session_values
+                else:
+                    tool_config_dict["redfish_session_config"] = _redfish_session
+            _ssh_connection_pool = getattr(tool_config, "ssh_connection_pool", None)
+            if _ssh_connection_pool is not None:
+                tool_config_dict["ssh_connection_pool"] = (
+                    _ssh_connection_pool.model_dump()
+                    if hasattr(_ssh_connection_pool, "model_dump")
+                    else dict(_ssh_connection_pool)
                 )
+            # Carry the tool-wide SSH trust policy so an operator-configured
+            # 'strict' is not silently discarded on the way to the runtime.
+            _ssh_policy = getattr(tool_config, "ssh_host_key_policy", None)
+            if _ssh_policy is not None:
+                tool_config_dict["ssh_host_key_policy"] = _ssh_policy
+            _ssh_known_hosts = getattr(tool_config, "ssh_known_hosts_file", None)
+            if _ssh_known_hosts is not None:
+                tool_config_dict["ssh_known_hosts_file"] = _ssh_known_hosts
         else:
-            tool_config_dict = tool_config
+            tool_config_dict = dict(tool_config)
+            tool_config_dict["redfish_request_capture"] = (
+                RedfishRequestCaptureLimits.from_tool_config(tool_config_dict).as_dict()
+            )
 
         instance.tool_config = tool_config_dict
+
+        if catalog_snapshot is not None:
+            spreadsheet_path = tool_config_dict.get("collector_definitions", {}).get(
+                "spreadsheet_path"
+            )
+            if not spreadsheet_path:
+                raise ValueError(
+                    "an authoritative catalog snapshot requires a configured "
+                    "Telemetry Catalog path"
+                )
+            instance._bind_catalog_snapshot(spreadsheet_path, catalog_snapshot)
 
         # Log skip flag values for debugging (print to console since logger may not be initialized yet)
         # print(
@@ -340,6 +555,13 @@ class ConfigurationManager:
                                 dut_values, explicit_fields=explicit
                             )
                             normalized["__explicit_fields"] = sorted(explicit)
+                            referenced = getattr(
+                                dut_config, "_referenced_config_data", None
+                            )
+                            if isinstance(referenced, dict):
+                                normalized["__referenced_config_data"] = copy.deepcopy(
+                                    referenced
+                                )
                             dut_config_dict[dut_name] = normalized
                         else:
                             dut_config_dict[dut_name] = sync_legacy_fields(
@@ -358,6 +580,11 @@ class ConfigurationManager:
                                 dut_values, explicit_fields=explicit
                             )
                             normalized["__explicit_fields"] = sorted(explicit)
+                            referenced = getattr(dut, "_referenced_config_data", None)
+                            if isinstance(referenced, dict):
+                                normalized["__referenced_config_data"] = copy.deepcopy(
+                                    referenced
+                                )
                             dut_config_dict[dut.name] = normalized
                         else:
                             dut_config_dict[dut.name] = sync_legacy_fields(
@@ -379,8 +606,12 @@ class ConfigurationManager:
         """
         Find the config directory using the shared utility function.
 
+        After applying local validation, the function forwards current instance
+        state to ``find_config_directory`` and preserves its return and
+        exception contract.
+
         Returns:
-            Path to configuration directory.
+            The validated config directory filesystem path.
         """
         return find_config_directory()
 
@@ -388,13 +619,29 @@ class ConfigurationManager:
         """
         Load tool configuration from YAML file.
 
+        Ensure additional fields are included with default values if not
+        present.
+
         Returns:
-            Tool configuration dictionary.
+            A mapping containing tool config.
         """
         try:
             self.tool_config = YAMLManager.load_yaml(
                 self.tool_config_path, "Tool configuration"
             )
+            reject_removed_attachment_limit_setting(self.tool_config)
+            explicit_tool_config_fields = {
+                key
+                for key in self.tool_config.keys()
+                if (key.startswith("EXPAND_QUERY_") and key.endswith("_LEVEL"))
+                or key in TIMEOUT_CONFIG_OVERRIDE_KEYS
+            }
+            execution_config = self.tool_config.get("execution_config")
+            if "max_concurrent_duts" in self.tool_config or (
+                isinstance(execution_config, dict)
+                and "max_concurrent_duts" in execution_config
+            ):
+                explicit_tool_config_fields.add("max_concurrent_duts")
 
             # Ensure additional fields are included with default values if not present
             additional_fields_defaults = {
@@ -422,7 +669,7 @@ class ConfigurationManager:
                 "NVLINK_OOB_URI": [],
                 "CUSTOM_DUMP_SERVICES": [],
                 "POST_CODES_URI": [],
-                "max_pagination_pages": 100,
+                "max_pagination_pages": DEFAULT_MAX_PAGINATION_PAGES,
                 "max_duplicate_url_retries": 3,
             }
 
@@ -439,6 +686,10 @@ class ConfigurationManager:
                         "DEBUG",
                         f"ConfigManager: {field} already exists in tool_config: {self.tool_config[field]}",
                     )
+
+            self.tool_config["__explicit_tool_config_fields"] = sorted(
+                explicit_tool_config_fields
+            )
 
             # Auto-detect spreadsheet path if not already configured
             if "collector_definitions" not in self.tool_config:
@@ -464,11 +715,27 @@ class ConfigurationManager:
             return self.tool_config
         except Exception as e:
             await self._log_runtime("ERROR", f"Failed to load tool config: {e}")
+            if isinstance(e, RemovedAttachmentLimitError):
+                raise
             return {}
 
     async def _load_dut_config(self) -> None:
         """
         Load DUT configuration with robust error handling and format conversion.
+
+        The implementation uses current instance state to load DUT configuration
+        with robust error handling and format conversion. Parsing or I/O must
+        finish before the validated representation is made available to the
+        caller. Owned asynchronous work is awaited before return, so completion
+        does not leave an unobserved task behind. It updates ``dut_config`` on
+        the instance as part of that state transition. If the function cannot
+        load DUT configuration with robust error handling and format conversion,
+        its exception reaches the caller instead of being converted into a
+        successful result.
+
+        Raises:
+            ValueError: If tool configuration baseboard conflicts with
+                TargetBaseboard.
         """
         try:
             # Load and validate YAML
@@ -483,8 +750,26 @@ class ConfigurationManager:
                     "WARNING", f"DUT configuration validation issues: {issues}"
                 )
 
-            # Convert legacy format if needed
-            converted_config = YAMLManager.convert_legacy_dut_format(dut_config_data)
+            # Legacy DUT files kept their baseboard in the tool configuration.
+            # Preserve that explicit identity; never invent a replacement
+            # platform when neither configuration layer provides one.
+            configured_baseboard = self.tool_config.get("baseboard")
+            legacy_configured_baseboard = self.tool_config.get("TargetBaseboard")
+            if (
+                configured_baseboard is not None
+                and legacy_configured_baseboard is not None
+                and str(configured_baseboard).strip().casefold()
+                != str(legacy_configured_baseboard).strip().casefold()
+            ):
+                raise ValueError(
+                    "tool configuration baseboard conflicts with TargetBaseboard"
+                )
+            if configured_baseboard is None:
+                configured_baseboard = legacy_configured_baseboard
+            converted_config = YAMLManager.convert_legacy_dut_format(
+                dut_config_data,
+                default_baseboard=configured_baseboard,
+            )
 
             # Store the converted config in memory (don't write back to original file)
             self.dut_config = converted_config
@@ -500,8 +785,11 @@ class ConfigurationManager:
         """
         Load collector definitions from Telemetry Catalog spreadsheet.
 
+        Always require a valid spreadsheet path in spreadsheet-only mode.
+
         Raises:
-            FileNotFoundError: If no valid spreadsheet is found.
+            FileNotFoundError: If the function cannot load collector definitions
+                from Telemetry Catalog spreadsheet safely.
         """
         # Check if spreadsheet path is configured
         spreadsheet_path = self.tool_config.get("collector_definitions", {}).get(
@@ -509,7 +797,9 @@ class ConfigurationManager:
         )
 
         # Always require a valid spreadsheet path in spreadsheet-only mode
-        if not spreadsheet_path or not Path(spreadsheet_path).exists():
+        if not spreadsheet_path or (
+            self._catalog_snapshot is None and not Path(spreadsheet_path).exists()
+        ):
             error_msg = "No valid Telemetry Catalog spreadsheet found. Please provide a spreadsheet via --spreadsheet argument."
             if self.sanitized_console:
                 self.sanitized_console.print_error(error_msg)
@@ -524,6 +814,14 @@ class ConfigurationManager:
                     )
                 )
             raise FileNotFoundError(error_msg)
+
+        try:
+            catalog_snapshot = self._catalog_snapshot_for_path(spreadsheet_path)
+        except FileNotFoundError:
+            error_msg = "No valid Telemetry Catalog spreadsheet found. Please provide a spreadsheet via --spreadsheet argument."
+            if self.sanitized_console:
+                self.sanitized_console.print_error(error_msg)
+            raise FileNotFoundError(error_msg) from None
 
         # Use the provided spreadsheet path
         if not self.quiet_mode:
@@ -543,106 +841,193 @@ class ConfigurationManager:
                         f"Loading from provided spreadsheet: {spreadsheet_path}",
                     )
                 )
-        await self._load_from_spreadsheet(spreadsheet_path)
-
-    def _get_generated_collector_stages(self, collector_id: str) -> Dict[str, Any]:
-        """
-        Return collector stages from the generated YAML catalog as a fallback.
-
-        Some spreadsheet cells exceed Excel's cell-size limit and can contain
-        truncated JSON. The generated YAML catalog preserves those stages in a
-        structured form, so use it only when the spreadsheet stage JSON cannot
-        be parsed.
-        """
-        if not collector_id:
-            return {}
-
-        if self._generated_collector_definitions_cache is None:
-            generated_path = (
-                Path(__file__).resolve().parents[3]
-                / "generation_config"
-                / "collector_definitions.yaml"
-            )
-            try:
-                generated_data = YAMLManager.load_yaml(
-                    generated_path, "generated collector definitions"
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Unable to load generated collector definitions fallback: %s",
-                    exc,
-                )
-                self._generated_collector_definitions_cache = {}
-            else:
-                collectors = generated_data.get("collectors", {})
-                self._generated_collector_definitions_cache = (
-                    collectors if isinstance(collectors, dict) else {}
-                )
-
-        collector_def = self._generated_collector_definitions_cache.get(
-            str(collector_id), {}
+        await self._load_from_spreadsheet(
+            spreadsheet_path,
+            catalog_snapshot=catalog_snapshot,
         )
-        stages = (
-            collector_def.get("stages", {}) if isinstance(collector_def, dict) else {}
-        )
-        return stages if isinstance(stages, dict) else {}
+
+    def _catalog_snapshot_for_path(self, spreadsheet_path: str) -> CatalogSnapshot:
+        """
+        Capture or return this manager's one authoritative catalog snapshot.
+
+        The implementation uses ``spreadsheet_path`` to capture or return this
+        manager's one authoritative catalog snapshot. It updates
+        ``_catalog_snapshot`` and ``_catalog_snapshot_source`` on the instance
+        as part of that state transition. If the function cannot capture or
+        return this manager's one authoritative catalog snapshot, its exception
+        reaches the caller instead of being converted into a successful result.
+
+        Args:
+            spreadsheet_path: filesystem location used as the spreadsheet path
+                for this operation.
+
+        Returns:
+            A ``CatalogSnapshot`` representing catalog snapshot for path.
+
+        Raises:
+            ValueError: If telemetry Catalog path changed after its runtime
+                snapshot was captured.
+        """
+
+        source_key = str(Path(spreadsheet_path).absolute())
+        if self._catalog_snapshot is not None:
+            if self._catalog_snapshot_source != source_key:
+                raise ValueError(
+                    "Telemetry Catalog path changed after its runtime snapshot "
+                    "was captured"
+                )
+            return self._catalog_snapshot
+
+        snapshot = read_catalog_snapshot(spreadsheet_path)
+        self._catalog_snapshot = snapshot
+        self._catalog_snapshot_source = source_key
+        return snapshot
+
+    def _bind_catalog_snapshot(
+        self,
+        spreadsheet_path: str | Path,
+        catalog_snapshot: CatalogSnapshot,
+    ) -> None:
+        """
+        Bind the exact snapshot already consumed during CLI resolution.
+
+        The implementation uses ``spreadsheet_path`` and ``catalog_snapshot`` to
+        bind the exact snapshot already consumed during CLI resolution. It
+        updates ``_catalog_snapshot``, ``_catalog_snapshot_prebound``, and
+        ``_catalog_snapshot_source`` on the instance as part of that state
+        transition. If the function cannot bind the exact snapshot already
+        consumed during CLI resolution, its exception reaches the caller instead
+        of being converted into a successful result.
+
+        Args:
+            spreadsheet_path: filesystem location used as the spreadsheet path
+                for this operation.
+            catalog_snapshot: Catalog snapshot consumed while the function
+                attempts to bind the exact snapshot already consumed during CLI
+                resolution.
+
+        Raises:
+            TypeError: If the catalog_snapshot is not an immutable
+                CatalogSnapshot.
+            ValueError: If telemetry Catalog snapshot authority cannot be
+                replaced.
+        """
+
+        if not isinstance(catalog_snapshot, CatalogSnapshot):
+            raise TypeError("catalog_snapshot must be an immutable CatalogSnapshot")
+        source_key = str(Path(spreadsheet_path).absolute())
+        if self._catalog_snapshot is not None:
+            if (
+                self._catalog_snapshot_source != source_key
+                or self._catalog_snapshot is not catalog_snapshot
+            ):
+                raise ValueError(
+                    "Telemetry Catalog snapshot authority cannot be replaced"
+                )
+            self._catalog_snapshot_prebound = True
+            return
+        self._catalog_snapshot = catalog_snapshot
+        self._catalog_snapshot_source = source_key
+        self._catalog_snapshot_prebound = True
 
     async def _initialize_uri_config_manager(self) -> None:
         """
         Initialize URI configuration manager with tool and DUT-specific overrides.
 
+        The implementation uses current instance state to initialize URI
+        configuration manager with tool and DUT-specific overrides. Owned
+        asynchronous work is awaited before return, so completion does not leave
+        an unobserved task behind. It updates ``dgx_diagnostic_routing_profile``
+        and ``uri_config_manager`` on the instance as part of that state
+        transition. If the function cannot initialize URI configuration manager
+        with tool and DUT-specific overrides, its exception reaches the caller
+        instead of being converted into a successful result.
+
         Raises:
-            Exception: If the URI configurations cannot be loaded.
+            ValueError: If cannot initialize Redfish URI policy without a
+                Telemetry Catalog; or configure either uri_overrides or
+                uri_config_file, not both.
         """
+        # Reinitialization is transactional at the manager boundary: never let
+        # callers continue with a stale instance after a new policy fails.
+        self.uri_config_manager = None
+        self.dgx_diagnostic_routing_profile = None
         try:
-            # Check for URI overrides directly in tool config
+            spreadsheet_path = self.tool_config.get("collector_definitions", {}).get(
+                "spreadsheet_path"
+            )
+            if not spreadsheet_path:
+                raise ValueError(
+                    "Cannot initialize Redfish URI policy without a Telemetry Catalog"
+                )
+
+            catalog_snapshot = self._catalog_snapshot_for_path(spreadsheet_path)
+            topology_profile = load_catalog_global_profile(
+                catalog_snapshot,
+                REDFISH_TOPOLOGY_PROFILE_KEY,
+                validate_redfish_topology_profile,
+            )
+            topology_resource_uris = build_redfish_resource_uri_lookup(topology_profile)
+            routing_profile = load_catalog_global_profile(
+                catalog_snapshot,
+                DGX_DIAGNOSTIC_ROUTING_PROFILE_KEY,
+                lambda value: validate_dgx_diagnostic_routing_profile(
+                    value,
+                    allowed_collection_uri_keys=topology_resource_uris,
+                ),
+            )
+            validate_dgx_diagnostic_route_hooks(
+                self.collector_definitions.get("collectors", {}),
+                routing_profile,
+            )
             uri_overrides = self.tool_config.get("uri_overrides")
             uri_config_file = self.tool_config.get("uri_config_file")
+            uri_overrides_supplied = (
+                "uri_overrides" in self.tool_config and uri_overrides is not None
+            )
+            uri_config_file_supplied = uri_config_file not in (None, "")
 
-            if uri_overrides:
+            if uri_overrides_supplied and uri_config_file_supplied:
+                raise ValueError(
+                    "Configure either uri_overrides or uri_config_file, not both"
+                )
+
+            if uri_overrides_supplied:
                 await self._log_runtime(
                     "INFO",
                     "Initializing URI config manager with inline tool config overrides",
                 )
-                # Create a temporary config structure for the URI manager
-                temp_uri_config = {
-                    "prefix_override": uri_overrides.get("prefix_override"),
-                    "hmc_prefix_override": uri_overrides.get("hmc_prefix_override"),
-                    "hmc_resource_prefix": uri_overrides.get("hmc_resource_prefix"),
-                    "default_uris": uri_overrides.get("default_uris", {}),
-                    "baseboard_overrides": uri_overrides.get("baseboard_overrides", {}),
-                    "platform_overrides": uri_overrides.get("platform_overrides", {}),
-                }
-                self.uri_config_manager = URIConfigManager()
-                self.uri_config_manager.tool_uris = temp_uri_config
-
-                # Load DUT-specific URI configurations
-                await self._load_dut_uri_configs()
-            elif uri_config_file:
+            elif uri_config_file_supplied:
                 await self._log_runtime(
                     "INFO",
                     f"Initializing URI config manager with file: {uri_config_file}",
                 )
-                self.uri_config_manager = URIConfigManager(uri_config_file)
-
-                # Load DUT-specific URI configurations
-                await self._load_dut_uri_configs()
             else:
                 await self._log_runtime(
                     "INFO",
-                    "No URI configuration specified - using default URIs",
+                    "Initializing URI config manager from the Telemetry Catalog",
                 )
-                self.uri_config_manager = URIConfigManager()
 
-        except Exception as e:
-            await self._log_runtime(
-                "ERROR", f"Failed to initialize URI config manager: {e}"
+            self.uri_config_manager = URIConfigManager(
+                uri_config_file,
+                topology_profile=topology_profile,
+                tool_uri_overrides=uri_overrides,
             )
-            self.uri_config_manager = URIConfigManager()
+            self.dgx_diagnostic_routing_profile = routing_profile
+            await self._load_dut_uri_configs()
+        except Exception as error:
+            self.uri_config_manager = None
+            self.dgx_diagnostic_routing_profile = None
+            await self._log_runtime(
+                "ERROR", f"Failed to initialize URI config manager: {error}"
+            )
+            raise
 
     async def _load_dut_uri_configs(self) -> None:
         """
         Load URI configurations for all DUTs from their individual configurations.
+
+        Load DUT-specific config file if ConfigFileToUse is specified.
 
         Raises:
             Exception: If the URI configurations cannot be loaded.
@@ -661,8 +1046,9 @@ class ConfigurationManager:
                         dut_id, dut_config_with_overrides
                     )
 
-        except Exception as e:
-            await self._log_runtime("ERROR", f"Failed to load DUT URI configs: {e}")
+        except Exception as error:
+            await self._log_runtime("ERROR", f"Failed to load DUT URI configs: {error}")
+            raise
 
     async def _load_dut_specific_config(
         self, dut_id: str, dut_config: Dict[str, Any]
@@ -670,12 +1056,20 @@ class ConfigurationManager:
         """
         Load DUT-specific configuration file if ConfigFileToUse is specified.
 
+        The implementation uses ``dut_id`` and ``dut_config`` to load
+        DUT-specific configuration file if ConfigFileToUse is specified. Parsing
+        or I/O must finish before the validated representation is made available
+        to the caller. Owned asynchronous work is awaited before return, so
+        completion does not leave an unobserved task behind.
+
         Args:
-            dut_id: The DUT identifier
-            dut_config: The DUT configuration
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+            dut_config: DUT config governing DUT-specific configuration file if
+                ConfigFileToUse is specified.
 
         Returns:
-            dict: Merged configuration with DUT-specific overrides
+            A mapping containing DUT specific config.
         """
         try:
             config_file_to_use = dut_config.get("ConfigFileToUse")
@@ -687,12 +1081,16 @@ class ConfigurationManager:
                 "INFO",
                 f"Loading DUT-specific config for {dut_id}: {config_file_to_use}",
             )
-            dut_specific_config = YAMLManager.load_yaml(
-                config_file_to_use, f"DUT-specific config for {dut_id}"
-            )
+            retained_snapshot = dut_config.get("__referenced_config_data")
+            if isinstance(retained_snapshot, dict):
+                dut_specific_config = copy.deepcopy(retained_snapshot)
+            else:
+                dut_specific_config = YAMLManager.load_yaml(
+                    config_file_to_use, f"DUT-specific config for {dut_id}"
+                )
 
             # Merge configurations: DUT config overrides DUT-specific config
-            merged_config = {**dut_specific_config, **dut_config}
+            merged_config = merge_dut_config_layers(dut_specific_config, dut_config)
 
             await self._log_runtime(
                 "INFO", f"Successfully loaded DUT-specific config for {dut_id}"
@@ -704,59 +1102,122 @@ class ConfigurationManager:
                 "ERROR",
                 f"Failed to load DUT-specific config for {dut_id}: {e}",
             )
-            return dut_config
+            raise
 
-    async def _load_from_spreadsheet(self, spreadsheet_path: str) -> None:
+    async def _load_from_spreadsheet(
+        self,
+        spreadsheet_path: str,
+        *,
+        catalog_snapshot: Optional[CatalogSnapshot] = None,
+    ) -> None:
         """
         Load collector definitions from Excel spreadsheet.
 
+        Read the spreadsheet Don't treat "N/A" as NaN since it's a valid value
+        meaning "not applicable".
+
         Args:
-            spreadsheet_path: Path to the spreadsheet file
+            spreadsheet_path: filesystem location used as the spreadsheet path
+                for this operation.
+            catalog_snapshot: Optional catalog snapshot; ``None`` selects the
+                function's default behavior.
 
         Raises:
             Exception: If the spreadsheet cannot be loaded.
         """
         try:
-
             # Read the spreadsheet
             # Don't treat "N/A" as NaN since it's a valid value meaning "not applicable"
-            df = excel_reader.read_excel(
-                spreadsheet_path,
-                sheet_name="Log Collection Catalog",
-                keep_default_na=False,
-            )
+            if catalog_snapshot is None:
+                # Direct/lightweight callers retain path compatibility.  The
+                # production loader always supplies its pinned snapshot.
+                df = excel_reader.read_excel(
+                    spreadsheet_path,
+                    sheet_name="Log Collection Catalog",
+                    keep_default_na=False,
+                )
+            else:
+                df = catalog_snapshot.read_excel(
+                    "Log Collection Catalog",
+                    keep_default_na=False,
+                )
             if self.sanitized_console and not self.quiet_mode:
                 self.sanitized_console.print_debug(
                     f"Read spreadsheet with {len(df)} rows"
                 )
 
+            catalog_columns = list(df.columns)
+            if catalog_columns.count("ID") != 1:
+                if "ID" not in catalog_columns:
+                    raise ValueError(
+                        "Telemetry Catalog is missing required columns: ID"
+                    )
+                raise ValueError("Telemetry Catalog has duplicate required columns: ID")
+
             # Convert to dictionary format
             collectors = {}
-            for _, row in df.iterrows():
+            for row_index, row in df.iterrows():
                 collector_id = row.get("ID", "")
                 if collector_id:
-                    # Parse JSON fields
-                    dependencies = {}
-                    stages = {}
-                    try:
-                        if excel_reader.notna(row.get("Dependencies")):
-                            dependencies = json.loads(str(row.get("Dependencies")))
-                    except (json.JSONDecodeError, TypeError):
-                        dependencies = {}
-
-                    try:
-                        if excel_reader.notna(row.get("Stages")):
-                            stages = json.loads(str(row.get("Stages")))
-                    except (json.JSONDecodeError, TypeError) as exc:
-                        stages = self._get_generated_collector_stages(
-                            str(collector_id)
+                    excel_row = int(row_index) + 2
+                    if collector_id in collectors:
+                        raise ValueError(
+                            "Telemetry Catalog has duplicate collector ID "
+                            f"{collector_id!r} at Excel row {excel_row}"
                         )
-                        if stages:
-                            await self._log_runtime(
-                                "WARNING",
-                                f"Failed to parse Stages JSON for collector {collector_id}; "
-                                f"using generated YAML fallback: {exc}",
-                            )
+                    dependencies = _decode_catalog_json_object(
+                        row.get("Dependencies"),
+                        collector_id=collector_id,
+                        column_name="Dependencies",
+                        excel_row=excel_row,
+                    )
+                    redfish_capability = _decode_catalog_json_object(
+                        row.get("Redfish Capability"),
+                        collector_id=collector_id,
+                        column_name="Redfish Capability",
+                        excel_row=excel_row,
+                    )
+                    outcome_policy = _decode_catalog_json_object(
+                        row.get("Outcome Policy"),
+                        collector_id=collector_id,
+                        column_name="Outcome Policy",
+                        excel_row=excel_row,
+                    )
+                    runtime_budget = _decode_catalog_json_object(
+                        row.get("Runtime Budget"),
+                        collector_id=collector_id,
+                        column_name="Runtime Budget",
+                        excel_row=excel_row,
+                    )
+                    resource_profile = _decode_catalog_json_object(
+                        row.get("Resource Profile"),
+                        collector_id=collector_id,
+                        column_name="Resource Profile",
+                        excel_row=excel_row,
+                    )
+                    parse_collector_resource_profile(
+                        resource_profile,
+                        context=(
+                            f"Log Collection Catalog row {excel_row}, "
+                            f"collector {collector_id}"
+                        ),
+                    )
+                    debug_capture = _decode_catalog_json_object(
+                        row.get("Debug Capture"),
+                        collector_id=collector_id,
+                        column_name="Debug Capture",
+                        excel_row=excel_row,
+                    )
+                    stages = _decode_catalog_json_object(
+                        row.get("Stages"),
+                        collector_id=collector_id,
+                        column_name="Stages",
+                        excel_row=excel_row,
+                    )
+                    diagnostic_concurrency_profile_for_collector(
+                        {"stages": stages},
+                        collector_id=str(collector_id),
+                    )
 
                     # Parse applicable baseboards
                     applicable_baseboards = []
@@ -767,13 +1228,23 @@ class ConfigurationManager:
                     # contains at least one baseboard name.
                     applicable_str = ""
                     raw_applicable = row.get("applicable_baseboards")
+                    if (
+                        not excel_reader.notna(raw_applicable)
+                        or not str(raw_applicable).strip()
+                    ):
+                        raw_applicable = row.get("Applicable Baseboards")
                     if excel_reader.notna(raw_applicable):
                         applicable_str = str(raw_applicable).strip()
 
                     if applicable_str:
-                        applicable_baseboards = [
-                            b.strip() for b in applicable_str.split(",") if b.strip()
-                        ]
+                        if applicable_str.lower() == "all":
+                            applicable_baseboards = ["all"]
+                        else:
+                            applicable_baseboards = [
+                                b.strip()
+                                for b in applicable_str.split(",")
+                                if b.strip()
+                            ]
                     else:
                         # Try the individual column format (e.g., "Applicable for Blackwell-HGX-8-GPU")
                         for col in df.columns:
@@ -799,27 +1270,86 @@ class ConfigurationManager:
                             execution_hooks = stages["execution"].get("hooks", [])
                             for hook in execution_hooks:
                                 if hook.get("method") == "collect_host_unified":
-                                    # Host collectors with collect_host_unified typically need sudo
-                                    use_sudo = True
-                                    # Add use_sudo to the execution stage params
-                                    if "params" not in hook:
-                                        hook["params"] = {}
-                                    hook["params"]["use_sudo"] = True
+                                    # Host collectors with collect_host_unified
+                                    # default to sudo, but an explicit false is
+                                    # part of the collector contract and must
+                                    # survive spreadsheet round-trips.
+                                    params = hook.get("params")
+                                    if isinstance(params, dict):
+                                        params.setdefault("use_sudo", True)
+                                        use_sudo = bool(params["use_sudo"])
+                                    else:
+                                        use_sudo = True
                                     break
+
+                    exclude_baseboards = []
+                    raw_excluded = row.get("exclude_baseboards")
+                    if (
+                        not excel_reader.notna(raw_excluded)
+                        or not str(raw_excluded).strip()
+                    ):
+                        raw_excluded = row.get("Exclude Baseboards")
+                    if excel_reader.notna(raw_excluded) and str(raw_excluded).strip():
+                        exclude_baseboards = [
+                            baseboard.strip()
+                            for baseboard in str(raw_excluded).split(",")
+                            if baseboard.strip()
+                        ]
+
+                    raw_tags = row.get("Tags", "")
+                    tags = []
+                    if excel_reader.notna(raw_tags) and str(raw_tags).strip():
+                        tags = [
+                            tag.strip()
+                            for tag in str(raw_tags).replace("|", ",").split(",")
+                            if tag.strip()
+                        ]
+
+                    raw_family = row.get("Family", "")
+                    family = (
+                        str(raw_family).strip()
+                        if excel_reader.notna(raw_family)
+                        else ""
+                    )
+                    raw_category = row.get("Category", "")
+                    category = (
+                        str(raw_category).strip()
+                        if excel_reader.notna(raw_category)
+                        else ""
+                    )
 
                     collectors[collector_id] = {
                         "collector_id": collector_id,
                         "name": row.get("Collector Name", ""),
                         "group": row.get("Collection Group", ""),
+                        "family": family,
+                        "category": category,
+                        "tags": tags,
                         "description": row.get("Description", ""),
                         "action_type": row.get("Action Type", ""),
-                        "parser_type": row.get("Parser Type", ""),
+                        "report_role": (
+                            str(row.get("Report Role", "")).strip().lower()
+                            if excel_reader.notna(row.get("Report Role", ""))
+                            else ""
+                        ),
                         "collection_level": row.get("Collection Level", "L1"),
                         "timeout": row.get("Timeout", 300),
                         "retry_count": row.get("Retry Count", 3),
                         "sequential_execution": row.get("Sequential Execution", False),
+                        "enforce_wall_timeout": str(
+                            row.get("Enforce Wall Timeout", False)
+                        )
+                        .strip()
+                        .lower()
+                        in {"true", "1", "yes"},
                         "applicable_baseboards": applicable_baseboards,
+                        "exclude_baseboards": exclude_baseboards,
                         "dependencies": dependencies,
+                        "redfish_capability": redfish_capability,
+                        "outcome_policy": outcome_policy,
+                        "runtime_budget": runtime_budget,
+                        "resource_profile": resource_profile,
+                        "debug_capture": debug_capture,
                         "stages": stages,
                         "enabled": row.get("Enabled", True),
                         "streaming_candidate": bool(
@@ -886,10 +1416,16 @@ class ConfigurationManager:
                     f"Exception details: {type(e).__name__}: {str(e)}"
                 )
             self.collector_definitions = {"collectors": {}}
+            raise
 
     async def _initialize_services(self) -> None:
         """
         Initialize service instances.
+
+        The implementation uses current instance state to initialize service
+        instances. Owned asynchronous work is awaited before return, so
+        completion does not leave an unobserved task behind. It updates
+        ``services`` on the instance as part of that state transition.
 
         Raises:
             Exception: If the services cannot be initialized.
@@ -905,10 +1441,15 @@ class ConfigurationManager:
 
     async def set_orchestrator_reference(self, orchestrator: Any) -> None:
         """
-        Set orchestrator reference for all services after orchestrator is fully initialized
+        Set orchestrator reference.
+
+        The implementation uses ``orchestrator`` to set orchestrator reference.
+        Owned asynchronous work is awaited before return, so completion does not
+        leave an unobserved task behind.
 
         Args:
-            orchestrator: WorkflowOrchestrator instance.
+            orchestrator: Orchestrator consumed while the function attempts to
+                set orchestrator reference.
         """
         for service_name, service in self.services.items():
             if hasattr(service, "set_orchestrator"):
@@ -921,6 +1462,10 @@ class ConfigurationManager:
     async def _categorize_collectors(self) -> None:
         """
         Categorize collectors as sequential or parallel.
+
+        The implementation uses current instance state to categorize collectors
+        as sequential or parallel. Owned asynchronous work is awaited before
+        return, so completion does not leave an unobserved task behind.
 
         Raises:
             Exception: If the collectors cannot be categorized.
@@ -958,6 +1503,11 @@ class ConfigurationManager:
         """
         Initialize collector categorization after logger is assigned.
 
+        The implementation uses current instance state to initialize collector
+        categorization after logger is assigned. Owned asynchronous work is
+        awaited before return, so completion does not leave an unobserved task
+        behind.
+
         Raises:
             Exception: If the collectors cannot be categorized.
         """
@@ -973,6 +1523,11 @@ class ConfigurationManager:
     async def initialize_minimal(self) -> None:
         """
         Minimal initialization for validation - only loads collector definitions.
+
+        The implementation uses current instance state to minimal initialization
+        for validation - only loads collector definitions. Owned asynchronous
+        work is awaited before return, so completion does not leave an
+        unobserved task behind.
         """
         # Only load collector definitions for validation
         await self._load_collector_definitions()
@@ -981,7 +1536,8 @@ class ConfigurationManager:
         """
         Async initialization - called after sync __init__.
 
-        Loads all configurations, initializes services, and categorizes collectors.
+        Loads all configurations, initializes services, and categorizes
+        collectors.
         """
         # Load all configurations if not already loaded
         if (
@@ -1011,17 +1567,67 @@ class ConfigurationManager:
         """
         Get all collector definitions.
 
+        After applying local validation, the function forwards current instance
+        state to ``self.collector_definitions.get`` and preserves its return and
+        exception contract.
+
         Returns:
-            Dictionary of all collector definitions.
+            A mapping containing all collectors.
         """
         return self.collector_definitions.get("collectors", {})
+
+    def get_catalog_snapshot_facts(self) -> Optional[CatalogSnapshotFacts]:
+        """
+        Return bounded facts for the exact catalog consumed by this run.
+
+        The implementation uses current instance state to produce bounded facts
+        for the exact catalog consumed by this run.
+
+        Returns:
+            A ``CatalogSnapshotFacts`` representing catalog snapshot facts, or
+            ``None`` when the requested value is unavailable.
+        """
+
+        if self._catalog_snapshot is None:
+            return None
+        return self._catalog_snapshot.facts
+
+    def get_catalog_snapshot(self) -> Optional[CatalogSnapshot]:
+        """
+        Return the opaque runtime catalog capability to workbook consumers.
+
+        The implementation uses current instance state to produce the opaque
+        runtime catalog capability to workbook consumers.
+
+        Returns:
+            A ``CatalogSnapshot`` representing catalog snapshot, or ``None``
+            when the requested value is unavailable.
+        """
+
+        return self._catalog_snapshot
+
+    def has_prebound_catalog_snapshot(self) -> bool:
+        """
+        Return whether external resolution and runtime share one byte authority.
+
+        The implementation uses current instance state to determine whether
+        external resolution and runtime share one byte authority.
+
+        Returns:
+            Whether external resolution and runtime share one byte authority.
+        """
+
+        return self._catalog_snapshot_prebound
 
     def get_sequential_collectors(self) -> Set[str]:
         """
         Get set of sequential collector IDs.
 
+        The implementation uses current instance state to get set of sequential
+        collector IDs.
+
         Returns:
-            Set of collector IDs marked for sequential execution.
+            The unique sequential collectors returned by the operation.
         """
         return self.sequential_collectors
 
@@ -1029,8 +1635,11 @@ class ConfigurationManager:
         """
         Get set of parallel collector IDs.
 
+        The implementation uses current instance state to get set of parallel
+        collector IDs.
+
         Returns:
-            Set of collector IDs marked for parallel execution.
+            The unique parallel collectors returned by the operation.
         """
         return self.parallel_collectors
 
@@ -1038,8 +1647,12 @@ class ConfigurationManager:
         """
         Get the URI configuration manager.
 
+        The implementation uses current instance state to get the URI
+        configuration manager.
+
         Returns:
-            URIConfigManager instance or None.
+            An ``URIConfigManager`` representing URI config manager, or ``None``
+            when the requested value is unavailable.
         """
         return self.uri_config_manager
 
@@ -1047,11 +1660,15 @@ class ConfigurationManager:
         """
         Get collector information by ID.
 
+        After applying local validation, the function forwards ``collector_id``
+        to ``collectors.get`` and preserves its return and exception contract.
+
         Args:
-            collector_id: Collector ID.
+            collector_id: Stable collector identifier used to correlate
+                configuration, logs, and results.
 
         Returns:
-            Dictionary of collector information.
+            A mapping containing collector info.
         """
         collectors = self.collector_definitions.get("collectors", {})
         return collectors.get(collector_id, {})
@@ -1060,11 +1677,15 @@ class ConfigurationManager:
         """
         Get all collectors for a specific group based on service mappings.
 
+        Use service mapping to determine group membership This ensures
+        consistency with how groups are used throughout the system.
+
         Args:
-            group: Collector group name (service mapping, e.g., "health_check").
+            group: Text supplied as group in the format accepted by this
+                function.
 
         Returns:
-            Dictionary of collectors in the specified group.
+            The validated ``collectors``.
         """
         collectors = {}
         all_collectors = self.collector_definitions.get("collectors", {})
@@ -1082,8 +1703,11 @@ class ConfigurationManager:
         """
         Get all unique collector groups based on service mappings.
 
+        Use service mapping instead of group name from definition This ensures
+        consistency between initialization and updates.
+
         Returns:
-            List of all unique collector group names (service mappings).
+            The all collector groups returned in operation-defined order.
         """
         from ..utils.enums import CollectorServiceMapping
 
@@ -1103,8 +1727,11 @@ class ConfigurationManager:
         """
         Get all service instances.
 
+        The implementation uses current instance state to get all service
+        instances.
+
         Returns:
-            Dictionary of service instances by name.
+            A mapping containing services.
         """
         return self.services
 
@@ -1112,8 +1739,11 @@ class ConfigurationManager:
         """
         Get tool configuration.
 
+        The implementation uses current instance state to get tool
+        configuration.
+
         Returns:
-            Tool configuration dictionary.
+            A mapping containing tool config.
         """
         return self.tool_config
 
@@ -1121,14 +1751,15 @@ class ConfigurationManager:
         """
         Get tool configuration with DUT-specific overrides.
 
-        This method merges the global tool config with any DUT-specific tool config
-        options found in the DUT's ConfigFileToUse.
+        This method merges the global tool config with any DUT-specific tool
+        config options found in the DUT's ConfigFileToUse.
 
         Args:
-            dut_id: The DUT identifier
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
 
         Returns:
-            dict: Merged tool configuration with DUT-specific overrides
+            A mapping containing DUT specific tool config.
         """
         # Start with the global tool config
         merged_tool_config = self.tool_config.copy()
@@ -1138,6 +1769,15 @@ class ConfigurationManager:
             dut_config = self.dut_config.get(dut_id, {})
             if not dut_config:
                 return merged_tool_config
+
+            # Only source-present DUT values may override the global tool config.
+            dut_tool_fields = ("TASK_ID_PREFIX", "TOOL_TEMP_DIR")
+            explicit_fields = dut_config.get("__explicit_fields")
+            if explicit_fields is None:
+                explicit_fields = dut_config
+            for field in dut_tool_fields:
+                if field in explicit_fields and field in dut_config:
+                    merged_tool_config[field] = dut_config[field]
 
             # Check if DUT has a ConfigFileToUse
             config_file_to_use = dut_config.get("ConfigFileToUse")
@@ -1149,9 +1789,13 @@ class ConfigurationManager:
                 "INFO",
                 f"Loading DUT-specific tool config for {dut_id}: {config_file_to_use}",
             )
-            dut_specific_config = YAMLManager.load_yaml(
-                config_file_to_use, f"DUT-specific config for {dut_id}"
-            )
+            retained_snapshot = dut_config.get("__referenced_config_data")
+            if isinstance(retained_snapshot, dict):
+                dut_specific_config = copy.deepcopy(retained_snapshot)
+            else:
+                dut_specific_config = YAMLManager.load_yaml(
+                    config_file_to_use, f"DUT-specific config for {dut_id}"
+                )
 
             # Extract tool config sections from DUT-specific config
             # Look for tool config sections that might override global settings
@@ -1174,6 +1818,7 @@ class ConfigurationManager:
                 # Global fields that can be overridden per-DUT
                 "TASK_ID_PREFIX",
                 "TOOL_TEMP_DIR",
+                "max_pagination_pages",
                 # Streaming configuration
                 "streaming_only",
                 "stream_begin",
@@ -1187,6 +1832,8 @@ class ConfigurationManager:
 
             # Merge tool config sections from DUT-specific config
             for section in tool_config_sections:
+                if section in dut_tool_fields and section in explicit_fields:
+                    continue
                 if section in dut_specific_config:
                     if section in merged_tool_config:
                         # Merge nested sections
@@ -1215,14 +1862,16 @@ class ConfigurationManager:
                 "ERROR",
                 f"Failed to load DUT-specific tool config for {dut_id}: {e}",
             )
-            return merged_tool_config
+            raise
 
     def get_dut_config(self) -> Dict[str, Any]:
         """
         Get DUT configuration.
 
+        The implementation uses current instance state to get DUT configuration.
+
         Returns:
-            DUT configuration dictionary.
+            A mapping containing DUT config.
         """
         return self.dut_config
 
@@ -1230,17 +1879,65 @@ class ConfigurationManager:
         """
         Get collector definitions.
 
+        The implementation uses current instance state to get collector
+        definitions.
+
         Returns:
-            Collector definitions dictionary.
+            A mapping containing collector definitions.
         """
         return self.collector_definitions
+
+    def get_dgx_diagnostic_routing_profile(self) -> Dict[str, Any]:
+        """
+        Return a defensive validated copy of catalog-owned DGX routing.
+
+        After applying local validation, the function forwards current instance
+        state to ``validate_dgx_diagnostic_routing_profile`` and preserves its
+        return and exception contract.
+
+        Returns:
+            A mapping containing dgx diagnostic routing profile.
+
+        Raises:
+            RuntimeError: If DGX diagnostic routing profile is not initialized.
+        """
+
+        if self.dgx_diagnostic_routing_profile is None:
+            raise RuntimeError("DGX diagnostic routing profile is not initialized")
+        return validate_dgx_diagnostic_routing_profile(
+            self.dgx_diagnostic_routing_profile
+        )
+
+    def get_dgx_diagnostic_route(self, route_name: str) -> Dict[str, Any]:
+        """
+        Return one defensive validated catalog-owned DGX route.
+
+        After applying local validation, the function forwards ``route_name`` to
+        ``get_dgx_diagnostic_route`` and preserves its return and exception
+        contract.
+
+        Args:
+            route_name: Stable route name used for lookup and operator-facing
+                diagnostics.
+
+        Returns:
+            A mapping containing dgx diagnostic route.
+        """
+
+        return get_dgx_diagnostic_route(
+            self.get_dgx_diagnostic_routing_profile(),
+            route_name,
+        )
 
     def set_orchestrator(self, orchestrator) -> None:
         """
         Set the orchestrator reference in all services.
 
+        Use setter to ensure dependent refs are populated safely.
+
         Args:
-            orchestrator: WorkflowOrchestrator instance.
+            orchestrator: Orchestrator consumed while the function attempts to
+                set the orchestrator reference in all services.
         """
         for service in self.services.values():
             # Use setter to ensure dependent refs are populated safely

@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 """
 Auto Detection Service.
 
@@ -30,6 +31,19 @@ from rich.table import Table
 from rich.text import Text
 
 from ..utils.console_output import create_sanitized_console
+from ..utils.platform_detection_profile import (
+    remaining_probe_max_score,
+    score_platform_detection_candidate,
+)
+from ..utils.redfish_limits import (
+    MAX_FOLLOWED_REDFISH_COLLECTION_MEMBERS,
+    bound_redfish_collection_members,
+)
+from ..utils.redfish_topology_profile import (
+    RedfishTopologyProfileError,
+    validate_redfish_uri_path,
+)
+from ..utils.sanitizer import neutralize_terminal_text
 
 logger = logging.getLogger(__name__)
 
@@ -37,17 +51,27 @@ logger = logging.getLogger(__name__)
 class AutoDetectionService:
     """
     Service for detecting platform and baseboard types from DUTs.
+
     Builds platform-baseboard mapping from spreadsheet configuration.
     """
+
+    MAX_FOLLOWED_COLLECTION_MEMBERS = MAX_FOLLOWED_REDFISH_COLLECTION_MEMBERS
 
     def __init__(self, dut_manager, logger, sanitized_console=None):
         """
         Initialize the AutoDetectionService.
 
+        The initializer records ``console``, ``dut_manager``, ``logger``,
+        ``platform_detection_profile``, and ``platform_mappings`` for later
+        operations and establishes the instance invariants before any public
+        method runs.
+
         Args:
-            dut_manager: DUT manager instance
-            logger: Logger instance
-            sanitized_console: Sanitized console instance
+            dut_manager: DUT manager consumed while the function attempts to
+                initialize the AutoDetectionService.
+            logger: Sanitized logger used for operator-visible diagnostics.
+            sanitized_console: Optional sanitized console; ``None`` selects the
+                function's default behavior.
         """
         self.dut_manager = dut_manager
         self.logger = logger
@@ -57,9 +81,23 @@ class AutoDetectionService:
             else create_sanitized_console()
         )
         self.platform_mappings = []  # Will be populated in async_init
+        self.platform_detection_profile: Optional[Dict[str, Any]] = None
+        self.reserved_model_patterns: List[str] = []
 
     @staticmethod
     def _identity_is_present(value: Any) -> bool:
+        """
+        Return the identity is present.
+
+        The implementation uses ``value`` to produce the identity is present.
+
+        Args:
+            value: Value object whose ``strip`` state is read while performing
+                identity is present.
+
+        Returns:
+            Whether the identity is present operation succeeds.
+        """
         if not isinstance(value, str):
             return False
         normalized = value.strip()
@@ -67,6 +105,18 @@ class AutoDetectionService:
 
     @staticmethod
     def _model_is_generic(model: str) -> bool:
+        """
+        Return the model is generic.
+
+        The implementation uses ``model`` to produce the model is generic.
+
+        Args:
+            model: Text supplied as model in the format accepted by this
+                function.
+
+        Returns:
+            Whether the model is generic operation succeeds.
+        """
         normalized = model.strip().lower()
         return normalized in {
             "",
@@ -85,6 +135,22 @@ class AutoDetectionService:
     def _extract_first_string_field(
         self, payload: Any, field_name: str
     ) -> Optional[str]:
+        """
+        Extract first string field.
+
+        The implementation uses ``payload`` and ``field_name`` to extract first
+        string field.
+
+        Args:
+            payload: Payload object whose ``get`` and ``values`` state is read
+                while performing extract first string field.
+            field_name: Field label included in validation failures for the
+                selected input.
+
+        Returns:
+            The canonical first string field text, or ``None`` when the
+            requested value is unavailable.
+        """
         if isinstance(payload, dict):
             value = payload.get(field_name)
             if isinstance(value, str) and value.strip():
@@ -100,45 +166,44 @@ class AutoDetectionService:
                     return found
         return None
 
-    @staticmethod
-    def _candidate_score(uri: str, signal: str) -> int:
-        if uri.startswith("/redfish/v1/Systems/HGX_Baseboard_"):
-            score = 700
-        elif "/Systems/" in uri and "HGX_Baseboard" in uri:
-            score = 690
-        elif uri.startswith("/redfish/v1/Chassis/HGX_Chassis_") and uri.endswith(
-            "/Assembly"
-        ):
-            score = 610
-        elif uri.startswith("/redfish/v1/Chassis/HGX_Chassis_"):
-            score = 620
-        elif uri.startswith("/redfish/v1/Systems/System_"):
-            score = 560
-        elif uri.startswith("/redfish/v1/Systems/"):
-            score = 520
-        elif uri.startswith("/redfish/v1/Chassis/Chassis_") and uri.endswith(
-            "/Assembly"
-        ):
-            score = 490
-        elif uri.startswith("/redfish/v1/Chassis/Chassis_"):
-            score = 500
-        elif uri.startswith("/redfish/v1/Chassis/") and "BMC" in uri:
-            score = 320
-        elif uri.startswith("/redfish/v1/Chassis/HMC_"):
-            score = 300
-        elif uri.startswith("/redfish/v1/Chassis/"):
-            score = 440
-        elif uri == "/redfish/v1":
-            score = 250
-        else:
-            score = 200
+    def _candidate_score(self, uri: str, signal: str) -> Optional[int]:
+        """
+        Return the candidate score.
 
-        if signal == "manufacturer":
-            score -= 40
-        return score
+        After applying local validation, the function forwards ``uri`` and
+        ``signal`` to ``score_platform_detection_candidate`` and preserves its
+        return and exception contract.
+
+        Args:
+            uri: Validated remote resource identifier used for URI.
+            signal: Text supplied as signal in the format accepted by this
+                function.
+
+        Returns:
+            The numeric candidate score value, or ``None`` when the requested
+            value is unavailable.
+        """
+        return score_platform_detection_candidate(
+            self.platform_detection_profile, uri, signal
+        )
 
     @staticmethod
-    def _extract_redfish_success_payload(response: Any) -> Tuple[bool, Optional[Any]]:
+    def _extract_redfish_success_payload(
+        response: Any,
+    ) -> Tuple[bool, Optional[Any]]:
+        """
+        Extract Redfish success payload.
+
+        The implementation uses ``response`` to extract Redfish success payload.
+
+        Args:
+            response: Transport response governed by the configured
+                authentication and trust policy.
+
+        Returns:
+            A tuple containing ``success flag`` and ``absence sentinel`` in that
+            order.
+        """
         if not isinstance(response, tuple) or len(response) < 2:
             return False, None
         success = response[0]
@@ -146,27 +211,123 @@ class AutoDetectionService:
         return (success, payload) if isinstance(success, bool) else (False, None)
 
     @staticmethod
-    def _mapping_specificity(mapping: Dict[str, Any], pattern: str, value: str) -> Tuple[int, int, int]:
-        """Rank a matching mapping so the most-specific one wins a tie.
+    def _mapping_specificity(
+        mapping: Dict[str, Any], pattern: str, value: str
+    ) -> Tuple[int, int]:
+        """
+        Rank evidence-backed specificity without using catalog order.
 
         Order, highest first:
-          1. Baseboard name appears as a case-insensitive substring of the
-             observed value (e.g. model "MGX-GH200 System" contains the
-             baseboard name "MGX-GH200"). This is a strong signal the mapping
-             is the intended target.
-          2. Longer baseboard name (ties broken by name length).
-          3. Longer matching pattern (a broad ".*GH200.*" loses to a more
-             specific ".*GH200-NVL2.*").
+
+        1. Baseboard name appears as a case-insensitive substring of the
+           observed value (e.g. model "MGX-GH200 System" contains the baseboard
+           name "MGX-GH200"). This is a strong signal the mapping is the
+           intended target.
+        2. Longer matching pattern (a broad ".*GH200.*" loses to a more specific
+           ".*GH200-NVL2.*").
+
+        Baseboard-name length is deliberately not a tie-breaker: shared board
+        codes such as P2312 must remain ambiguous unless the observed identity
+        itself distinguishes their owners.
+
+        Args:
+            mapping: Mapping supplying fields for rank evidence-backed
+                specificity without using catalog order.
+            pattern: Text supplied as pattern in the format accepted by this
+                function.
+            value: Text supplied as value in the format accepted by this
+                function.
+
+        Returns:
+            A tuple containing ``name in value`` and ``len`` in that order.
         """
         baseboard_name = (mapping.get("baseboards") or [""])[0] or ""
         value_lower = (value or "").lower()
         name_lower = baseboard_name.lower()
         name_in_value = 1 if name_lower and name_lower in value_lower else 0
-        return (name_in_value, len(baseboard_name), len(pattern or ""))
+        return (name_in_value, len(pattern or ""))
+
+    async def _select_unambiguous_mapping_hit(
+        self,
+        dut_id: str,
+        identity_name: str,
+        value: str,
+        hits: List[Tuple[Dict[str, Any], str]],
+    ) -> Optional[Tuple[Dict[str, Any], str]]:
+        """
+        Return the uniquely best mapping, or fail closed on an evidence tie.
+
+        The implementation uses ``dut_id``, ``identity_name``, ``value``, and
+        ``hits`` to produce the uniquely best mapping, or fail closed on an
+        evidence tie. Owned asynchronous work is awaited before return, so
+        completion does not leave an unobserved task behind.
+
+        Args:
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+            identity_name: Stable identity name used for lookup and
+                operator-facing diagnostics.
+            value: Text supplied as value in the format accepted by this
+                function.
+            hits: Mapping supplying fields for uniquely best mapping, or fail
+                closed on an evidence tie.
+
+        Returns:
+            A tuple containing the fields that represent unambiguous mapping
+            hit, or ``None`` when the requested value is unavailable.
+        """
+
+        if not hits:
+            return None
+        ranked = [
+            (
+                self._mapping_specificity(mapping, pattern, value),
+                mapping,
+                pattern,
+            )
+            for mapping, pattern in hits
+        ]
+        best_rank = max(rank for rank, _, _ in ranked)
+        best_hits = [
+            (mapping, pattern) for rank, mapping, pattern in ranked if rank == best_rank
+        ]
+        owners = {
+            str((mapping.get("baseboards") or [""])[0]) for mapping, _ in best_hits
+        }
+        owners.discard("")
+        if len(owners) != 1:
+            await self.logger.write_to_dut_runtime_log(
+                dut_id,
+                "WARNING",
+                "AutoDetection",
+                f"{identity_name} {value!r} matches equally specific catalog "
+                "baseboards; refusing order-dependent auto-detection: "
+                + ", ".join(sorted(owners or {"<unmapped>"})),
+            )
+            return None
+        return sorted(best_hits, key=lambda item: item[1])[0]
 
     async def try_manufacturer_matching(
         self, dut_id: str, manufacturer: str, info_dict: Dict[str, Any]
     ) -> bool:
+        """
+        Return the try manufacturer matching.
+
+        The implementation uses ``dut_id``, ``manufacturer``, and ``info_dict``
+        to produce the try manufacturer matching. Owned asynchronous work is
+        awaited before return, so completion does not leave an unobserved task
+        behind.
+
+        Args:
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+            manufacturer: Text supplied as manufacturer in the format accepted
+                by this function.
+            info_dict: Mapping supplying fields for try manufacturer matching.
+
+        Returns:
+            Whether the try manufacturer matching operation succeeds.
+        """
         if not manufacturer:
             return False
 
@@ -190,10 +351,12 @@ class AutoDetectionService:
                     regex_matches.append((mapping, pattern))
 
         if exact_matches:
-            best_mapping, best_pattern = max(
-                exact_matches,
-                key=lambda mp: self._mapping_specificity(mp[0], mp[1], manufacturer),
+            selected = await self._select_unambiguous_mapping_hit(
+                dut_id, "Manufacturer", manufacturer, exact_matches
             )
+            if selected is None:
+                return False
+            best_mapping, best_pattern = selected
             await self.logger.write_to_dut_runtime_log(
                 dut_id,
                 "INFO",
@@ -222,10 +385,12 @@ class AutoDetectionService:
         if not valid_regex_hits:
             return False
 
-        best_mapping, best_pattern = max(
-            valid_regex_hits,
-            key=lambda mp: self._mapping_specificity(mp[0], mp[1], manufacturer),
+        selected = await self._select_unambiguous_mapping_hit(
+            dut_id, "Manufacturer", manufacturer, valid_regex_hits
         )
+        if selected is None:
+            return False
+        best_mapping, best_pattern = selected
         await self.logger.write_to_dut_runtime_log(
             dut_id,
             "INFO",
@@ -240,25 +405,42 @@ class AutoDetectionService:
         return True
 
     async def _evaluate_redfish_candidate(
-        self, dut_id: str, uri: str, payload: Dict[str, Any]
+        self,
+        dut_id: str,
+        uri: str,
+        payload: Dict[str, Any],
+        *,
+        model_field: str = "Model",
+        manufacturer_field: str = "Manufacturer",
+        part_number_field: str = "PartNumber",
     ) -> Optional[Dict[str, Any]]:
-        model = self._extract_first_string_field(payload, "Model")
-        manufacturer = self._extract_first_string_field(payload, "Manufacturer")
-        part_number = self._extract_first_string_field(payload, "PartNumber")
+        """
+        Return the evaluate Redfish candidate.
 
-        if uri.startswith("/redfish/v1/Chassis/PowerShelf") or (
-            isinstance(manufacturer, str) and manufacturer.strip().lower() == "delta"
-        ):
-            return {
-                "uri": uri,
-                "signal": "heuristic",
-                "score": self._candidate_score(uri, "model"),
-                "platform": "PowerShelf",
-                "baseboard": "PowerShelf",
-                "node_type": "PowerShelf",
-                "model": model,
-                "manufacturer": manufacturer,
-            }
+        The implementation uses ``dut_id``, ``uri``, ``payload``,
+        ``model_field``, and ``manufacturer_field`` to produce the evaluate
+        Redfish candidate. Owned asynchronous work is awaited before return, so
+        completion does not leave an unobserved task behind.
+
+        Args:
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+            uri: Validated remote resource identifier used for URI.
+            payload: Mapping supplying fields for evaluate Redfish candidate.
+            model_field: Text supplied as model field in the format accepted by
+                this function.
+            manufacturer_field: Text supplied as manufacturer field in the
+                format accepted by this function.
+            part_number_field: Text supplied as part number field in the format
+                accepted by this function.
+
+        Returns:
+            A mapping containing the ``uri``, ``signal``, ``score``,
+            ``platform``, and ``baseboard`` fields.
+        """
+        model = self._extract_first_string_field(payload, model_field)
+        manufacturer = self._extract_first_string_field(payload, manufacturer_field)
+        part_number = self._extract_first_string_field(payload, part_number_field)
 
         match_info: Dict[str, Optional[str]] = {
             "platform": None,
@@ -309,10 +491,20 @@ class AutoDetectionService:
         if signal is None:
             return None
 
+        score = self._candidate_score(uri, signal)
+        if score is None:
+            await self.logger.write_to_dut_runtime_log(
+                dut_id,
+                "WARNING",
+                "AutoDetection",
+                f"Catalog platform detection profile has no score for {uri}",
+            )
+            return None
+
         return {
             "uri": uri,
             "signal": signal,
-            "score": self._candidate_score(uri, signal),
+            "score": score,
             "platform": match_info["platform"],
             "baseboard": match_info["baseboard"],
             "node_type": match_info["node_type"],
@@ -324,83 +516,176 @@ class AutoDetectionService:
     async def _select_best_redfish_candidate(
         self, dut_id: str
     ) -> Optional[Dict[str, Any]]:
+        """
+        Select best Redfish candidate.
+
+        The implementation uses ``dut_id`` to select best Redfish candidate.
+        Owned asynchronous work is awaited before return, so completion does not
+        leave an unobserved task behind.
+
+        Args:
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+
+        Returns:
+            The validated ``best_candidate``, or ``None`` when no value
+            qualifies.
+        """
+        profile = self.platform_detection_profile
+        if not profile:
+            await self.logger.write_to_dut_runtime_log(
+                dut_id,
+                "WARNING",
+                "AutoDetection",
+                "Catalog platform detection profile is unavailable; Redfish "
+                "auto-detection is disabled",
+            )
+            return None
+
         best_candidate: Optional[Dict[str, Any]] = None
+        equally_ranked_baseboards = set()
         seen_uris = set()
 
-        async def consider_uri(uri: str) -> None:
-            nonlocal best_candidate
+        async def consider_uri(uri: str, step: Dict[str, Any]) -> None:
+            """
+            Evaluate one Redfish URI as a platform-detection candidate.
+
+            The implementation uses ``uri`` and ``step`` to evaluate one Redfish
+            URI as a platform-detection candidate. Owned asynchronous work is
+            awaited before return, so completion does not leave an unobserved
+            task behind.
+
+            Args:
+                uri: Validated remote resource identifier used for URI.
+                step: Mapping supplying fields for evaluate one Redfish URI as a
+                    platform-detection candidate.
+            """
+            nonlocal best_candidate, equally_ranked_baseboards
             if uri in seen_uris:
                 return
             seen_uris.add(uri)
 
             success, payload = self._extract_redfish_success_payload(
-                await self.dut_manager.execute_redfish_request(dut_id, "GET", uri)
+                await self.dut_manager.execute_redfish_request(
+                    dut_id,
+                    "GET",
+                    uri,
+                    expected_http_statuses=[404],
+                )
             )
             if not success or not payload:
                 return
 
-            candidate = await self._evaluate_redfish_candidate(dut_id, uri, payload)
-            if candidate and (
-                best_candidate is None
-                or candidate["score"] > best_candidate["score"]
-            ):
+            candidate = await self._evaluate_redfish_candidate(
+                dut_id,
+                uri,
+                payload,
+                model_field=step.get("model_field", "Model"),
+                manufacturer_field=step.get("manufacturer_field", "Manufacturer"),
+                part_number_field=step.get("part_number_field", "PartNumber"),
+            )
+            if candidate is None:
+                return
+            if best_candidate is None or candidate["score"] > best_candidate["score"]:
                 best_candidate = candidate
+                equally_ranked_baseboards = {candidate["baseboard"]}
+            elif candidate["score"] == best_candidate["score"]:
+                equally_ranked_baseboards.add(candidate["baseboard"])
 
-        primary_system_ids = ["HGX_Baseboard_0", "System_0", "DGX"]
-        primary_chassis_ids = [
-            "HGX_Chassis_0",
-            "Chassis_0",
-            "DGX",
-            "HGX_BMC_0",
-            "BMC_0",
-            "HMC_0",
-            "HGX",
-            "MGX_NVSwitch_0",
-            "MGX_NVSwitch_1",
-            "MGX_BMC_0",
-        ]
-        primary_chassis_assembly_ids = ["HGX_Chassis_0", "Chassis_0", "DGX"]
+        for index, step in enumerate(profile["probe_steps"]):
+            if "uri" in step:
+                await consider_uri(step["uri"], step)
+            else:
+                success, collection_payload = self._extract_redfish_success_payload(
+                    await self.dut_manager.execute_redfish_request(
+                        dut_id,
+                        "GET",
+                        step["collection_uri"],
+                        expected_http_statuses=[404],
+                    )
+                )
+                if success and isinstance(collection_payload, dict):
+                    try:
+                        members, source_member_count, members_truncated = (
+                            bound_redfish_collection_members(
+                                collection_payload.get("Members", []),
+                                field_name="platform detection Members",
+                                limit=self.MAX_FOLLOWED_COLLECTION_MEMBERS,
+                            )
+                        )
+                    except ValueError:
+                        await self.logger.write_to_dut_runtime_log(
+                            dut_id,
+                            "WARNING",
+                            "AutoDetection",
+                            "Ignoring malformed Redfish platform-detection collection",
+                        )
+                        continue
+                    if members_truncated:
+                        await self.logger.write_to_dut_runtime_log(
+                            dut_id,
+                            "WARNING",
+                            "AutoDetection",
+                            "Refusing order-dependent platform detection from a "
+                            f"collection with {source_member_count} members; safe "
+                            f"follow limit is {self.MAX_FOLLOWED_COLLECTION_MEMBERS}",
+                        )
+                        continue
+                    for member in members:
+                        uri = (
+                            member.get("@odata.id")
+                            if isinstance(member, dict)
+                            else None
+                        )
+                        try:
+                            uri = validate_redfish_uri_path(
+                                uri,
+                                context="platform detection member URI",
+                                service_root=step["collection_uri"],
+                            )
+                        except (
+                            RedfishTopologyProfileError,
+                            TypeError,
+                            ValueError,
+                        ):
+                            continue
+                        if not uri.startswith(step["member_uri_prefix"]):
+                            continue
+                        member_id = uri[len(step["member_uri_prefix"]) :]
+                        if not member_id or "/" in member_id:
+                            continue
+                        await consider_uri(uri, step)
 
-        for system_id in primary_system_ids:
-            await consider_uri(f"/redfish/v1/Systems/{system_id}")
+            remaining_max = remaining_probe_max_score(profile, index)
+            if (
+                best_candidate is not None
+                # An equally ranked later identity could expose a conflict. Stop
+                # only when no remaining probe can equal or improve the winner.
+                and best_candidate["score"] > remaining_max
+            ):
+                break
 
-        for chassis_id in primary_chassis_ids:
-            await consider_uri(f"/redfish/v1/Chassis/{chassis_id}")
-
-        for chassis_id in primary_chassis_assembly_ids:
-            await consider_uri(f"/redfish/v1/Chassis/{chassis_id}/Assembly")
-
-        success, systems_payload = self._extract_redfish_success_payload(
-            await self.dut_manager.execute_redfish_request(
-                dut_id, "GET", "/redfish/v1/Systems"
+        if len(equally_ranked_baseboards) > 1:
+            await self.logger.write_to_dut_runtime_log(
+                dut_id,
+                "WARNING",
+                "AutoDetection",
+                "Equally ranked Redfish identities resolved to conflicting "
+                "baseboards; refusing order-dependent auto-detection: "
+                + ", ".join(sorted(str(item) for item in equally_ranked_baseboards)),
             )
-        )
-        if success and systems_payload:
-            for member in systems_payload.get("Members", []):
-                uri = member.get("@odata.id")
-                if isinstance(uri, str) and uri.startswith("/redfish/v1/Systems/"):
-                    await consider_uri(uri)
-
-        success, chassis_payload = self._extract_redfish_success_payload(
-            await self.dut_manager.execute_redfish_request(
-                dut_id, "GET", "/redfish/v1/Chassis"
-            )
-        )
-        if success and chassis_payload:
-            for member in chassis_payload.get("Members", []):
-                uri = member.get("@odata.id")
-                if isinstance(uri, str) and uri.startswith("/redfish/v1/Chassis/"):
-                    await consider_uri(uri)
-
-        await consider_uri("/redfish/v1")
+            return None
         return best_candidate
 
     async def async_init(self):
         """
         Async initialization to build platform mappings.
 
-        Args:
-            None
+        The implementation uses current instance state to async initialization
+        to build platform mappings. Owned asynchronous work is awaited before
+        return, so completion does not leave an unobserved task behind. It
+        updates ``platform_mappings`` on the instance as part of that state
+        transition.
         """
         self.platform_mappings = await self._build_platform_mappings_from_spreadsheet()
 
@@ -410,8 +695,11 @@ class AutoDetectionService:
         """
         Build platform mappings from spreadsheet.
 
-        Args:
-            None
+        Get platform mappings from the baseboard manager (spreadsheet).
+
+        Returns:
+            The platform mappings from spreadsheet returned in operation-defined
+            order.
         """
         try:
             # Get platform mappings from the baseboard manager (spreadsheet)
@@ -438,6 +726,17 @@ class AutoDetectionService:
                     "No baseboard manager available",
                 )
                 return []
+
+            self.platform_detection_profile = getattr(
+                baseboard_manager, "platform_detection_profile", None
+            )
+            if not self.platform_detection_profile:
+                await self.logger.log_runtime(
+                    "WARNING",
+                    "AutoDetectionService",
+                    "Catalog platform detection profile is unavailable; Redfish "
+                    "auto-detection will fail closed",
+                )
 
             if not baseboard_manager.baseboards:
                 await self.logger.log_runtime(
@@ -468,14 +767,34 @@ class AutoDetectionService:
         """
         Convert baseboard configurations to legacy mapping format.
 
+        The implementation uses ``baseboards`` to convert baseboard
+        configurations to legacy mapping format. The source value keeps its
+        ownership while the normalized representation is returned separately. It
+        updates ``reserved_model_patterns`` on the instance as part of that
+        state transition.
+
         Args:
-            baseboards: Baseboard configurations
+            baseboards: Mapping supplying fields for baseboard configurations to
+                legacy mapping format.
+
+        Returns:
+            The validated ``mappings``.
         """
         mappings = []
+        self.reserved_model_patterns = []
 
         for baseboard_name, baseboard_config in baseboards.items():
             platform_detection = baseboard_config.get("platform_detection", {})
             if platform_detection:
+                for pattern in (
+                    platform_detection.get("reserved_model_patterns", []) or []
+                ):
+                    pattern_text = str(pattern).strip()
+                    if (
+                        pattern_text
+                        and pattern_text not in self.reserved_model_patterns
+                    ):
+                        self.reserved_model_patterns.append(pattern_text)
                 mapping = {
                     "platform": baseboard_config.get("platform", "x86_64"),
                     "node_type": platform_detection.get("node_type", "Compute"),
@@ -496,8 +815,10 @@ class AutoDetectionService:
         """
         Build a list of valid platform-baseboard combinations from spreadsheet.
 
+        Sort by platform, then by baseboard for consistent display.
+
         Returns:
-            list: List of tuples (platform, baseboard, node_type) representing valid combinations
+            The validated ``combinations``.
         """
         combinations = []
         for mapping in self.platform_mappings:
@@ -514,8 +835,17 @@ class AutoDetectionService:
         """
         Display manual selection prompt using Rich console.
 
+        The implementation uses current instance state to display manual
+        selection prompt using Rich console. If the function cannot display
+        manual selection prompt using Rich console, its exception reaches the
+        caller instead of being converted into a successful result.
+
         Returns:
-            tuple: (selected_platform, selected_baseboard) - the user's selection
+            A tuple containing ``selected platform`` and ``selected baseboard``
+            in that order.
+
+        Raises:
+            ValueError: If no platform-baseboard combinations available.
         """
         combinations = self.build_platform_baseboard_combinations()
 
@@ -550,7 +880,7 @@ class AutoDetectionService:
             # Add platform header
             table.add_row(
                 # f"[bold]{platform.upper()} PLATFORM:[/bold]", "", "", "", style="bold"
-                f"[bold]{platform.upper()} PLATFORM:[/bold]",
+                f"[bold]{neutralize_terminal_text(platform.upper())} PLATFORM:[/bold]",
                 "",
                 "",
                 style="bold",
@@ -558,7 +888,11 @@ class AutoDetectionService:
 
             for baseboard, node_type in platform_groups[platform]:
                 # table.add_row(f"  {option_number}", platform, baseboard, node_type)
-                table.add_row(f"  {option_number}", baseboard, node_type)
+                table.add_row(
+                    f"  {option_number}",
+                    neutralize_terminal_text(baseboard),
+                    neutralize_terminal_text(node_type),
+                )
                 option_map[option_number] = (platform, baseboard)
                 option_number += 1
 
@@ -582,7 +916,11 @@ class AutoDetectionService:
                     if 1 <= choice_num <= len(combinations):
                         selected_platform, selected_baseboard = option_map[choice_num]
                         self.console.print(
-                            f"[green]✓ Selected: {selected_platform} - {selected_baseboard}[/green]"
+                            Text.from_markup(
+                                "[green]✓ Selected: "
+                                f"{neutralize_terminal_text(selected_platform)} - "
+                                f"{neutralize_terminal_text(selected_baseboard)}[/green]"
+                            )
                         )
                         return selected_platform, selected_baseboard
                     else:
@@ -608,16 +946,25 @@ class AutoDetectionService:
     ) -> Tuple[str, str]:
         """
         Prompt the user to confirm or override the detected baseboard.
+
         Platform and node_type are derived from the baseboard mapping.
 
         Args:
-            detected_platform: The detected platform (derived from baseboard)
-            detected_baseboard: The detected baseboard (primary detection target)
-            detected_node_type: The detected node type (derived from baseboard)
-            non_interactive: If True, use detected values or exit
+            detected_platform: Text supplied as detected platform in the format
+                accepted by this function.
+            detected_baseboard: Text supplied as detected baseboard in the
+                format accepted by this function.
+            detected_node_type: Text supplied as detected node type in the
+                format accepted by this function.
+            non_interactive: Whether non interactive is enabled or required for
+                this operation.
 
         Returns:
-            tuple: (confirmed_platform, confirmed_baseboard) - the final platform and baseboard to use
+            A tuple containing ``detected platform`` and ``detected baseboard``
+            in that order.
+
+        Raises:
+            ValueError: If baseboard detection failed in non-interactive mode.
         """
         # Check if detection was successful (we primarily care about baseboard)
         detection_successful = detected_baseboard is not None
@@ -627,9 +974,17 @@ class AutoDetectionService:
             detection_text = Text()
             detection_text.append("Detection Results\n", style="bold")
             # detection_text.append(f"Platform:     {detected_platform}\n")
-            detection_text.append(f"Baseboard:    {detected_baseboard}\n")
+            detection_text.append_text(
+                Text.from_markup(
+                    f"Baseboard:    {neutralize_terminal_text(detected_baseboard)}\n"
+                )
+            )
             if detected_node_type:
-                detection_text.append(f"Node Type:    {detected_node_type}")
+                detection_text.append_text(
+                    Text.from_markup(
+                        f"Node Type:    {neutralize_terminal_text(detected_node_type)}"
+                    )
+                )
 
             self.console.print(" ")
             self.console.print(" \n ")
@@ -664,16 +1019,29 @@ class AutoDetectionService:
             detection_text = Text()
             detection_text.append("Baseboard Detection Failed\n", style="bold red")
             if detected_baseboard:
-                detection_text.append(
-                    f"Partially detected baseboard: {detected_baseboard}\n"
+                detection_text.append_text(
+                    Text.from_markup(
+                        "Partially detected baseboard: "
+                        f"{neutralize_terminal_text(detected_baseboard)}\n"
+                    )
                 )
             else:
                 detection_text.append("Baseboard detection failed\n")
 
             if detected_platform:
-                detection_text.append(f"Derived platform: {detected_platform}\n")
+                detection_text.append_text(
+                    Text.from_markup(
+                        "Derived platform: "
+                        f"{neutralize_terminal_text(detected_platform)}\n"
+                    )
+                )
             if detected_node_type:
-                detection_text.append(f"Derived node type: {detected_node_type}")
+                detection_text.append_text(
+                    Text.from_markup(
+                        "Derived node type: "
+                        f"{neutralize_terminal_text(detected_node_type)}"
+                    )
+                )
 
             self.console.print(
                 Panel(
@@ -701,6 +1069,25 @@ class AutoDetectionService:
         info_dict: Dict[str, Any],
         non_interactive: bool,
     ) -> Tuple[bool, Dict[str, Any]]:
+        """
+        Finalize detection with confirmation.
+
+        The implementation uses ``dut_id``, ``info_dict``, and
+        ``non_interactive`` to finalize detection with confirmation. Owned
+        asynchronous work is awaited before return, so completion does not leave
+        an unobserved task behind.
+
+        Args:
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+            info_dict: Mapping supplying fields for finalize detection with
+                confirmation.
+            non_interactive: Whether non interactive is enabled or required for
+                this operation.
+
+        Returns:
+            A tuple containing ``success flag`` and ``info dict`` in that order.
+        """
         try:
             detected_node_type = info_dict.get("node_type")
             confirmed_platform, confirmed_baseboard = (
@@ -718,10 +1105,9 @@ class AutoDetectionService:
 
             mapping_found = False
             for mapping in self.platform_mappings:
-                if (
-                    confirmed_platform == mapping["platform"]
-                    and confirmed_baseboard in mapping.get("baseboards", [])
-                ):
+                if confirmed_platform == mapping[
+                    "platform"
+                ] and confirmed_baseboard in mapping.get("baseboards", []):
                     info_dict["node_type"] = mapping["node_type"]
                     mapping_found = True
                     break
@@ -775,12 +1161,28 @@ class AutoDetectionService:
         """
         Validate against platform mappings.
 
+        The implementation uses ``dut_id``, ``platform``, ``baseboard``,
+        ``node_type``, and ``manufacturer`` to validate against platform
+        mappings. Every required invariant is checked before a successful value
+        is returned; invalid input follows the function's explicit exception
+        path. Owned asynchronous work is awaited before return, so completion
+        does not leave an unobserved task behind.
+
         Args:
-            dut_id: The DUT identifier
-            platform: The platform to validate against
-            baseboard: The baseboard to validate against
-            node_type: The node type to validate against
-            manufacturer: The manufacturer to validate against
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+            platform: Optional platform; ``None`` selects the function's default
+                behavior.
+            baseboard: Optional baseboard; ``None`` selects the function's
+                default behavior.
+            node_type: Optional node type; ``None`` selects the function's
+                default behavior.
+            manufacturer: Optional manufacturer; ``None`` selects the function's
+                default behavior.
+
+        Returns:
+            The uniquely applicable ``mapping``, or ``None`` when no mapping
+            matches or the supplied evidence leaves multiple baseboards.
         """
         await self.logger.write_to_dut_runtime_log(
             dut_id,
@@ -788,19 +1190,42 @@ class AutoDetectionService:
             "AutoDetection",
             f"Validating against mappings: platform={platform}, node_type={node_type}, manufacturer={manufacturer}",
         )
+        matching_mappings: List[Dict[str, Any]] = []
         for mapping in self.platform_mappings:
             # Check if all provided values match the mapping
             if platform and mapping["platform"] != platform:
+                continue
+            if baseboard and baseboard not in mapping.get("baseboards", []):
                 continue
             if node_type and mapping["node_type"] != node_type:
                 continue
             if manufacturer and manufacturer not in mapping["manufacturer"]:
                 continue
+            matching_mappings.append(mapping)
+
+        candidate_baseboards = {
+            candidate
+            for mapping in matching_mappings
+            for candidate in mapping.get("baseboards", [])
+            if candidate
+        }
+        if len(candidate_baseboards) > 1:
+            await self.logger.write_to_dut_runtime_log(
+                dut_id,
+                "WARNING",
+                "AutoDetection",
+                "Mapping criteria matched multiple baseboards; refusing to select "
+                f"one by catalog order: {sorted(candidate_baseboards)}",
+            )
+            return None
+
+        if matching_mappings:
+            mapping = matching_mappings[0]
             await self.logger.write_to_dut_runtime_log(
                 dut_id,
                 "DEBUG",
                 "AutoDetection",
-                f"Found matching mapping: {mapping}",
+                f"Found unambiguous matching mapping: {mapping}",
             )
             return mapping
         await self.logger.write_to_dut_runtime_log(
@@ -818,18 +1243,22 @@ class AutoDetectionService:
         """
         Try to match a model against the platform mapping.
 
-        Phase 1 finds literal exact matches; Phase 2 finds regex matches.
-        When multiple mappings match the same model, the most specific one
-        wins via `_mapping_specificity` (prefers a mapping whose baseboard
-        name is a substring of the model, then the longest baseboard name,
-        then the longest matching pattern). This prevents broad regexes
-        like ``.*GH200.*`` on a generically-named baseboard (e.g. "C2")
-        from shadowing a more specific mapping (e.g. "MGX-GH200").
+        Phase 1 finds literal exact matches; Phase 2 finds regex matches. When
+        multiple mappings match the same model, the most specific evidence wins.
+        Equally specific mappings for different baseboards are rejected rather
+        than being resolved by catalog order or name length.
 
         Args:
-            dut_id: The DUT identifier
-            model: The model to match
-            info_dict: The info dictionary to update
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+            model: Text supplied as model in the format accepted by this
+                function.
+            info_dict: Mapping supplying fields for try to match a model against
+                the platform mapping.
+
+        Returns:
+            Whether the try to match a model against the platform mapping
+            operation succeeds.
         """
         if not model:
             return False
@@ -851,8 +1280,6 @@ class AutoDetectionService:
 
         exact_hits: List[Tuple[Dict[str, Any], str]] = []
         for mapping in self.platform_mappings:
-            if mapping["node_type"] == "PowerShelf":
-                continue
             if not mapping["models"]:
                 continue
             for model_pattern in mapping["models"]:
@@ -862,10 +1289,12 @@ class AutoDetectionService:
                     exact_hits.append((mapping, model_pattern))
 
         if exact_hits:
-            best_mapping, best_pattern = max(
-                exact_hits,
-                key=lambda mp: self._mapping_specificity(mp[0], mp[1], model),
+            selected = await self._select_unambiguous_mapping_hit(
+                dut_id, "Model", model, exact_hits
             )
+            if selected is None:
+                return False
+            best_mapping, best_pattern = selected
             await self.logger.write_to_dut_runtime_log(
                 dut_id,
                 "INFO",
@@ -879,6 +1308,27 @@ class AutoDetectionService:
             if best_mapping["baseboards"]:
                 info_dict["baseboard"] = best_mapping["baseboards"][0]
             return True
+
+        for reserved_pattern in self.reserved_model_patterns:
+            try:
+                reserved_match = re.search(reserved_pattern, model, re.IGNORECASE)
+            except re.error as error:
+                await self.logger.write_to_dut_runtime_log(
+                    dut_id,
+                    "WARNING",
+                    "AutoDetection",
+                    f"Invalid reserved model regex {reserved_pattern!r}: {error}",
+                )
+                continue
+            if reserved_match:
+                await self.logger.write_to_dut_runtime_log(
+                    dut_id,
+                    "WARNING",
+                    "AutoDetection",
+                    f"Model {model!r} is reserved by catalog metadata and has no "
+                    "exact enabled identity; refusing a broad regex match",
+                )
+                return False
 
         # Phase 2: Try regex patterns only if no exact match was found
         await self.logger.write_to_dut_runtime_log(
@@ -922,10 +1372,12 @@ class AutoDetectionService:
         if not regex_hits:
             return False
 
-        best_mapping, best_pattern = max(
-            regex_hits,
-            key=lambda mp: self._mapping_specificity(mp[0], mp[1], model),
+        selected = await self._select_unambiguous_mapping_hit(
+            dut_id, "Model", model, regex_hits
         )
+        if selected is None:
+            return False
+        best_mapping, best_pattern = selected
         await self.logger.write_to_dut_runtime_log(
             dut_id,
             "INFO",
@@ -943,21 +1395,22 @@ class AutoDetectionService:
         self, dut_id: str, part_number: str, info_dict: Dict[str, Any]
     ) -> bool:
         """
-        Try to match a Redfish PartNumber against the baseboard mapping's
-        ``part_numbers`` list.
+        Return the try part number matching.
 
-        Required when two baseboards publish the same Model string and can
-        only be told apart by their FRU PartNumber (e.g. GB200 NVL vs
-        GB200 NVL4 -- both publish ``Model="GB200 NVL"`` but their
-        HGX_Baseboard_0 PartNumbers differ at the ``-1201-`` vs ``-0201-``
-        infix). Like ``try_model_matching`` this runs Phase 1 (literal
-        equality) then Phase 2 (regex search) and uses the same
-        ``_mapping_specificity`` tie-break.
+        The implementation uses ``dut_id``, ``part_number``, and ``info_dict``
+        to produce the try part number matching. Owned asynchronous work is
+        awaited before return, so completion does not leave an unobserved task
+        behind.
 
         Args:
-            dut_id: The DUT identifier
-            part_number: The PartNumber string to match
-            info_dict: The info dictionary to update on a successful match
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+            part_number: Text supplied as part number in the format accepted by
+                this function.
+            info_dict: Mapping supplying fields for try part number matching.
+
+        Returns:
+            Whether the try part number matching operation succeeds.
         """
         if not part_number:
             return False
@@ -976,10 +1429,12 @@ class AutoDetectionService:
                     exact_hits.append((mapping, pn_pattern))
 
         if exact_hits:
-            best_mapping, best_pattern = max(
-                exact_hits,
-                key=lambda mp: self._mapping_specificity(mp[0], mp[1], part_number),
+            selected = await self._select_unambiguous_mapping_hit(
+                dut_id, "PartNumber", part_number, exact_hits
             )
+            if selected is None:
+                return False
+            best_mapping, best_pattern = selected
             await self.logger.write_to_dut_runtime_log(
                 dut_id,
                 "INFO",
@@ -1011,10 +1466,12 @@ class AutoDetectionService:
         if not regex_hits:
             return False
 
-        best_mapping, best_pattern = max(
-            regex_hits,
-            key=lambda mp: self._mapping_specificity(mp[0], mp[1], part_number),
+        selected = await self._select_unambiguous_mapping_hit(
+            dut_id, "PartNumber", part_number, regex_hits
         )
+        if selected is None:
+            return False
+        best_mapping, best_pattern = selected
         await self.logger.write_to_dut_runtime_log(
             dut_id,
             "INFO",
@@ -1037,15 +1494,21 @@ class AutoDetectionService:
         """
         Detect platform and baseboard type from the DUT.
 
+        The implementation uses ``dut_id``, ``preflight_results``, and
+        ``non_interactive`` to detect platform and baseboard type from the DUT.
+        Owned asynchronous work is awaited before return, so completion does not
+        leave an unobserved task behind.
+
         Args:
-            dut_id: The DUT identifier
-            preflight_results: Optional preflight results for the DUT
-            non_interactive: If True, use detected values or exit
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+            preflight_results: Optional preflight results; ``None`` selects the
+                function's default behavior.
+            non_interactive: Whether non interactive is enabled or required for
+                this operation.
 
         Returns:
-            tuple: (success, info_dict) where:
-                - success (bool): True if detection was successful
-                - info_dict (dict): Dictionary containing platform, baseboard, and node_type
+            A tuple containing ``success flag`` and ``info dict`` in that order.
         """
         info_dict = {"platform": None, "baseboard": None, "node_type": None}
 
@@ -1059,21 +1522,33 @@ class AutoDetectionService:
         # Simple console output for autodetection start
         # self.console.print(f"[bold blue]Auto-detecting platform and baseboard for {dut_id}...[/bold blue]")
 
-        # Use provided preflight results or empty dict if none provided
-        if preflight_results is None:
-            preflight_results = {}
-
-        host_preflight_passed = (
-            preflight_results.get("host", {}).get("status") == "pass"
+        # Callers may provide either the service map directly or the complete
+        # per-DUT preflight record returned by DUTManager. Normalize both forms
+        # here so every auto-detection entry point follows the same transport
+        # gating rules.
+        preflight_was_provided = bool(preflight_results)
+        preflight_results = preflight_results or {}
+        nested_service_results = preflight_results.get("services")
+        service_preflight_results = (
+            nested_service_results
+            if isinstance(nested_service_results, dict)
+            else preflight_results
         )
-        redfish_preflight_status = preflight_results.get("redfish", {}).get("status")
+
+        host_preflight_status = service_preflight_results.get("host", {}).get("status")
+        host_preflight_passed = host_preflight_status == "pass"
+        redfish_preflight_status = service_preflight_results.get("redfish", {}).get(
+            "status"
+        )
         redfish_preflight_passed = redfish_preflight_status == "pass"
 
         await self.logger.write_to_dut_runtime_log(
             dut_id,
             "DEBUG",
             "AutoDetection",
-            f"Preflight status - Host: {'Passed' if host_preflight_passed else 'Failed'}, Redfish: {'Passed' if redfish_preflight_passed else 'Failed'}",
+            "Preflight status - "
+            f"Host: {host_preflight_status or 'not assigned'}, "
+            f"Redfish: {redfish_preflight_status or 'not assigned'}",
         )
 
         # Debug: Log platform mappings
@@ -1105,7 +1580,6 @@ class AutoDetectionService:
             dut_config = {}
 
         _switch_detected = False
-        switch_baseboard_fallback = None
 
         # Detection Strategy 1: BMC/Redfish detection
         if dut_config.get("BMC_IP"):
@@ -1169,17 +1643,34 @@ class AutoDetectionService:
         # Detection Strategy 2: Host-based fallback
         # Try host detection only if Redfish did not already determine the baseboard.
         if not (info_dict["platform"] and info_dict["baseboard"]):
-            await self.logger.write_to_dut_runtime_log(
-                dut_id,
-                "DEBUG",
-                "AutoDetection",
-                "Attempting host-based fallback detection",
-            )
+            host_fallback_allowed = not preflight_was_provided or host_preflight_passed
+            if host_fallback_allowed:
+                await self.logger.write_to_dut_runtime_log(
+                    dut_id,
+                    "DEBUG",
+                    "AutoDetection",
+                    "Attempting host-based fallback detection",
+                )
+            else:
+                host_reason = (
+                    f"preflight status is '{host_preflight_status}'"
+                    if host_preflight_status
+                    else "no Host transport was assigned"
+                )
+                await self.logger.write_to_dut_runtime_log(
+                    dut_id,
+                    "INFO",
+                    "AutoDetection",
+                    "Skipping host-based fallback detection because " + host_reason,
+                )
 
             try:
-                exit_code, output, stderr = await self.dut_manager.execute_host_command(
-                    dut_id, "which nv"
-                )
+                if host_fallback_allowed:
+                    exit_code, output, stderr = (
+                        await self.dut_manager.execute_host_command(dut_id, "which nv")
+                    )
+                else:
+                    exit_code, output, stderr = 1, "", ""
                 if exit_code == 0 and output:
                     # Treat this as a provisional SwitchTray signal and keep going so
                     # Redfish can refine the exact tray baseboard.
@@ -1202,8 +1693,7 @@ class AutoDetectionService:
                     ]
                     if len(switch_mappings) == 1 and switch_mappings[0]["baseboards"]:
                         info_dict["baseboard"] = switch_mappings[0]["baseboards"][0]
-                    elif switch_mappings and switch_mappings[0]["baseboards"]:
-                        switch_baseboard_fallback = switch_mappings[0]["baseboards"][0]
+                    elif len(switch_mappings) > 1:
                         await self.logger.write_to_dut_runtime_log(
                             dut_id,
                             "DEBUG",
@@ -1219,10 +1709,10 @@ class AutoDetectionService:
                 )
 
             # If not a switch, it must be a compute node
-            if not _switch_detected:
+            if host_fallback_allowed and not _switch_detected:
                 try:
-                    exit_code, output, stderr = await self.dut_manager.execute_host_command(
-                        dut_id, "uname -m"
+                    exit_code, output, stderr = (
+                        await self.dut_manager.execute_host_command(dut_id, "uname -m")
                     )
                     if exit_code == 0 and output:
                         arch = output.strip()
@@ -1241,78 +1731,88 @@ class AutoDetectionService:
 
                         # Validate against mapping
                         mapping = await self.validate_against_mapping(
-                            dut_id, platform=info_dict["platform"], node_type="Compute"
+                            dut_id,
+                            platform=info_dict["platform"],
+                            node_type="Compute",
                         )
-                        if mapping:
-                            # Set baseboard from mapping first (fallback)
-                            if mapping.get("baseboards"):
-                                info_dict["baseboard"] = mapping["baseboards"][0]
-                                await self.logger.write_to_dut_runtime_log(
-                                    dut_id,
-                                    "DEBUG",
-                                    "AutoDetection",
-                                    f"Set baseboard from mapping: {info_dict['baseboard']}",
-                                )
+                        if mapping and mapping.get("baseboards"):
+                            info_dict["baseboard"] = mapping["baseboards"][0]
+                            await self.logger.write_to_dut_runtime_log(
+                                dut_id,
+                                "DEBUG",
+                                "AutoDetection",
+                                "Set baseboard from unambiguous mapping: "
+                                f"{info_dict['baseboard']}",
+                            )
 
-                            # Try to detect baseboard via host for more specific matching
-                            try:
-                                exit_code, output, stderr = (
-                                    await self.dut_manager.execute_host_command(
-                                        dut_id, "dmidecode -t 2", use_sudo=True
-                                    )
+                        # Strong model evidence can resolve an architecture that
+                        # maps to multiple baseboards, so always run the DMI probe.
+                        try:
+                            exit_code, output, stderr = (
+                                await self.dut_manager.execute_host_command(
+                                    dut_id, "dmidecode -t 2", use_sudo=True
                                 )
-                                success = exit_code == 0
-                                if success and output:
-                                    # Parse dmidecode output for baseboard info
-                                    for line in output.split("\n"):
-                                        if "Product Name:" in line:
-                                            detected_baseboard = line.split(
-                                                "Product Name:"
-                                            )[1].strip()
-                                            if detected_baseboard:
+                            )
+                            success = exit_code == 0
+                            if success and output:
+                                # Parse dmidecode output for baseboard info
+                                for line in output.split("\n"):
+                                    if "Product Name:" in line:
+                                        detected_baseboard = line.split(
+                                            "Product Name:"
+                                        )[1].strip()
+                                        if detected_baseboard:
+                                            await self.logger.write_to_dut_runtime_log(
+                                                dut_id,
+                                                "DEBUG",
+                                                "AutoDetection",
+                                                f"Detected model via dmidecode: {detected_baseboard}",
+                                            )
+
+                                            # Try model matching for more specific baseboard
+                                            if await self.try_model_matching(
+                                                dut_id,
+                                                detected_baseboard,
+                                                info_dict,
+                                            ):
                                                 await self.logger.write_to_dut_runtime_log(
                                                     dut_id,
-                                                    "DEBUG",
+                                                    "INFO",
                                                     "AutoDetection",
-                                                    f"Detected model via dmidecode: {detected_baseboard}",
+                                                    f"Successfully matched model '{detected_baseboard}' to platform '{info_dict['platform']}' and baseboard '{info_dict['baseboard']}'",
                                                 )
-
-                                                # Try model matching for more specific baseboard
-                                                if await self.try_model_matching(
-                                                    dut_id, detected_baseboard, info_dict
-                                                ):
-                                                    await self.logger.write_to_dut_runtime_log(
-                                                        dut_id,
-                                                        "INFO",
-                                                        "AutoDetection",
-                                                        f"Successfully matched model '{detected_baseboard}' to platform '{info_dict['platform']}' and baseboard '{info_dict['baseboard']}'",
-                                                    )
-                                                    # Don't return here - let it flow to confirmation prompt
-                                                else:
-                                                    # Model matching failed, but we still have a baseboard from mapping
-                                                    await self.logger.write_to_dut_runtime_log(
-                                                        dut_id,
-                                                        "INFO",
-                                                        "AutoDetection",
-                                                        f"Model '{detected_baseboard}' didn't match specific patterns, but using baseboard from platform mapping: '{info_dict['baseboard']}'",
-                                                    )
-                                                    # Don't return here - let it flow to confirmation prompt
-                            except Exception as e:
+                                                # Don't return here - let it flow to confirmation prompt
+                                            elif info_dict.get("baseboard"):
+                                                await self.logger.write_to_dut_runtime_log(
+                                                    dut_id,
+                                                    "INFO",
+                                                    "AutoDetection",
+                                                    f"Model '{detected_baseboard}' didn't match specific patterns, but using unambiguous baseboard from platform mapping: '{info_dict['baseboard']}'",
+                                                )
+                                                # Don't return here - let it flow to confirmation prompt
+                                            else:
+                                                await self.logger.write_to_dut_runtime_log(
+                                                    dut_id,
+                                                    "WARNING",
+                                                    "AutoDetection",
+                                                    f"Model '{detected_baseboard}' did not match a specific pattern and architecture-only evidence is ambiguous",
+                                                )
+                        except Exception as e:
+                            await self.logger.write_to_dut_runtime_log(
+                                dut_id,
+                                "WARNING",
+                                "AutoDetection",
+                                f"Error detecting compute baseboard: {e}",
+                            )
+                            if info_dict.get("baseboard"):
                                 await self.logger.write_to_dut_runtime_log(
                                     dut_id,
-                                    "WARNING",
+                                    "INFO",
                                     "AutoDetection",
-                                    f"Error detecting compute baseboard: {e}",
+                                    "Using unambiguous baseboard from platform mapping "
+                                    f"despite dmidecode error: '{info_dict['baseboard']}'",
                                 )
-                                # Even if dmidecode fails, we still have a baseboard from mapping
-                                if info_dict.get("baseboard"):
-                                    await self.logger.write_to_dut_runtime_log(
-                                        dut_id,
-                                        "INFO",
-                                        "AutoDetection",
-                                        f"Using baseboard from platform mapping despite dmidecode error: '{info_dict['baseboard']}'",
-                                    )
-                                    # Don't return here - let it flow to confirmation prompt
+                                # Don't return here - let it flow to confirmation prompt
                 except Exception as e:
                     await self.logger.write_to_dut_runtime_log(
                         dut_id,
@@ -1320,15 +1820,6 @@ class AutoDetectionService:
                         "AutoDetection",
                         f"Error detecting CPU architecture: {e}",
                     )
-
-        if _switch_detected and not info_dict.get("baseboard") and switch_baseboard_fallback:
-            info_dict["baseboard"] = switch_baseboard_fallback
-            await self.logger.write_to_dut_runtime_log(
-                dut_id,
-                "INFO",
-                "AutoDetection",
-                f"Redfish did not disambiguate switch tray baseboard, falling back to '{switch_baseboard_fallback}'",
-            )
 
         # Check if detection was successful
         self.console.print("[green]Detection completed, processing results...[/green]")

@@ -1,3 +1,20 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 <template>
   <div style="min-height: calc(100vh - 88px);">
     <div class="nv-sidebar">
@@ -14,7 +31,7 @@
           @click="selectedService = selectedService === s.name ? '' : s.name"
         >
           <span>{{ s.name }}</span>
-          <span class="nv-badge" :class="s.successRate >= 90 ? 'nv-badge--success' : s.successRate >= 50 ? 'nv-badge--warning' : 'nv-badge--error'" style="font-size: 0.625rem;">{{ s.successRate.toFixed(0) }}%</span>
+          <span class="nv-badge" :class="serviceRateBadge(s.lifecycle)" style="font-size: 0.625rem;">{{ serviceRateLabel(s.lifecycle) }}</span>
         </a>
       </div>
 
@@ -47,21 +64,31 @@
           <div v-for="s in displayServices" :key="s.name" class="sh-card nv-glass" @click="selectedService = selectedService === s.name ? '' : s.name">
             <div class="sh-card__header">
               <ServiceBadge :service="s.name" />
-              <span class="sh-card__rate" :style="{ color: s.successRate >= 90 ? 'var(--nv-success)' : s.successRate >= 50 ? 'var(--nv-warning)' : 'var(--nv-error)' }">{{ s.successRate.toFixed(1) }}%</span>
+              <span class="sh-card__rate" :style="{ color: serviceRateColor(s.lifecycle) }">{{ serviceRateLabel(s.lifecycle, 1) }}</span>
             </div>
             <div class="sh-card__stats">
               <span style="color: var(--nv-success);">{{ s.success }} ok</span>
+              <span v-if="s.degraded" style="color: var(--nv-warning);">{{ s.degraded }} degraded</span>
               <span v-if="s.error" style="color: var(--nv-error);">{{ s.error }} err</span>
               <span v-if="s.partial" style="color: var(--nv-warning);">{{ s.partial }} partial</span>
               <span v-if="s.skipped" style="color: var(--nv-text-tertiary);">{{ s.skipped }} skip</span>
+              <span v-if="s.cancelled" style="color: var(--nv-warning);">{{ s.cancelled }} cancelled</span>
+              <span v-if="s.running" style="color: var(--nv-info);">{{ s.running }} running</span>
+              <span v-if="s.pending" style="color: var(--nv-text-tertiary);">{{ s.pending }} pending</span>
             </div>
             <div class="sh-card__bar">
               <div class="sh-card__bar-fill sh-card__bar-fill--success" :style="{ width: pct(s.success, s.total) }"></div>
+              <div class="sh-card__bar-fill sh-card__bar-fill--degraded" :style="{ width: pct(s.degraded, s.total) }"></div>
               <div class="sh-card__bar-fill sh-card__bar-fill--error" :style="{ width: pct(s.error, s.total) }"></div>
               <div class="sh-card__bar-fill sh-card__bar-fill--partial" :style="{ width: pct(s.partial, s.total) }"></div>
+              <div class="sh-card__bar-fill sh-card__bar-fill--cancelled" :style="{ width: pct(s.cancelled, s.total) }"></div>
             </div>
             <div class="sh-card__meta">
-              {{ s.total }} collectors &middot; {{ formatDuration(s.totalDuration) }} total &middot; {{ formatDuration(s.avgDuration) }} avg
+              {{ s.total }} completed
+              <template v-if="s.running || s.pending">
+                &middot; {{ s.running }} running &middot; {{ s.pending }} pending
+              </template>
+              &middot; {{ formatDuration(s.totalDuration) }} total &middot; {{ formatDuration(s.avgDuration) }} avg
             </div>
           </div>
         </div>
@@ -73,10 +100,10 @@
               :columns="perDutColumns"
               :data="perDutData"
               :searchable="true"
-              @row-click="(row: Record<string, any>) => router.push(`/dut/${encodeURIComponent(row.dutId)}`)"
+              @row-click="(row: Record<string, any>) => router.push(dutRoute(row.dutId))"
             >
-              <template #cell-successRate="{ value }">
-                <span :style="{ color: Number(value) >= 90 ? 'var(--nv-success)' : Number(value) >= 50 ? 'var(--nv-warning)' : 'var(--nv-error)', fontWeight: 600 }">{{ Number(value).toFixed(0) }}%</span>
+              <template #cell-successRate="{ row }">
+                <span :style="{ color: serviceRateColor(row.lifecycle), fontWeight: 600 }">{{ row.successRateLabel }}</span>
               </template>
             </DataTable>
           </div>
@@ -95,50 +122,79 @@ import PageLoader from '@/components/common/PageLoader.vue'
 import DataTable from '@/components/common/DataTable.vue'
 import ServiceBadge from '@/components/common/ServiceBadge.vue'
 import AnalysisNav from '@/components/common/AnalysisNav.vue'
+import {
+  formatCollectorPassRate,
+  isTerminalCollectorStatus,
+  summarizeCollectorStatuses,
+} from '@/utils/collectorLifecycle'
+import type {
+  CollectorLifecycleCounts,
+  CollectorLifecycleSummary,
+} from '@/utils/collectorLifecycle'
 import { formatDuration } from '@/utils/format'
+import { dutRoute } from '@/utils/reportRoutes'
 
 const router = useRouter()
 const manifestStore = useManifestStore()
 const selectedService = ref('')
 const dutFilter = ref('')
 
-interface ServiceStats {
-  name: string
-  success: number
-  error: number
-  partial: number
-  skipped: number
-  notRan: number
+interface LifecycleDisplayStats extends CollectorLifecycleCounts {
+  lifecycle: CollectorLifecycleSummary
   total: number
-  successRate: number
+  successRate: number | null
+  successRateLabel: string
+}
+
+interface ServiceStats extends LifecycleDisplayStats {
+  name: string
   totalDuration: number
   avgDuration: number
 }
 
 const serviceList = computed<ServiceStats[]>(() => {
-  const map = new Map<string, ServiceStats>()
+  const map = new Map<
+    string,
+    { name: string; statuses: unknown[]; totalDuration: number }
+  >()
   const duts = dutFilter.value ? manifestStore.duts.filter(d => d.id === dutFilter.value) : manifestStore.duts
   for (const dut of duts) {
     for (const g of dut.collector_groups) {
       const svc = g.service_type || g.name
-      if (!map.has(svc)) map.set(svc, { name: svc, success: 0, error: 0, partial: 0, skipped: 0, notRan: 0, total: 0, successRate: 0, totalDuration: 0, avgDuration: 0 })
+      if (!map.has(svc)) {
+        map.set(svc, { name: svc, statuses: [], totalDuration: 0 })
+      }
       const s = map.get(svc)!
       for (const c of g.collectors) {
-        if (c.status === 'not_ran') { s.notRan++; continue }
-        s.total++
-        if (c.status === 'success') s.success++
-        else if (c.status === 'error') s.error++
-        else if (c.status === 'partial') s.partial++
-        else if (c.status === 'skipped') s.skipped++
-        s.totalDuration += c.execution_time
+        s.statuses.push(c.status)
+        if (isTerminalCollectorStatus(c.status)) {
+          s.totalDuration += c.execution_time
+        }
       }
     }
   }
-  for (const s of map.values()) {
-    s.successRate = s.total > 0 ? (s.success / s.total) * 100 : 0
-    s.avgDuration = s.total > 0 ? s.totalDuration / s.total : 0
-  }
-  return [...map.values()].sort((a, b) => b.total - a.total)
+  return [...map.values()]
+    .map(s => {
+      const lifecycle = summarizeCollectorStatuses(s.statuses)
+      return {
+        name: s.name,
+        ...lifecycle.counts,
+        lifecycle,
+        total: lifecycle.completedCount,
+        successRate: lifecycle.passRate,
+        successRateLabel: formatCollectorPassRate(lifecycle),
+        totalDuration: s.totalDuration,
+        avgDuration:
+          lifecycle.completedCount > 0
+            ? s.totalDuration / lifecycle.completedCount
+            : 0,
+      }
+    })
+    .sort(
+      (a, b) =>
+        b.lifecycle.completedCount + b.lifecycle.activeCount -
+        (a.lifecycle.completedCount + a.lifecycle.activeCount),
+    )
 })
 
 const displayServices = computed(() => serviceList.value)
@@ -146,44 +202,74 @@ const displayServices = computed(() => serviceList.value)
 const perDutColumns = [
   { key: 'dutId', label: 'DUT', sortable: true },
   { key: 'success', label: 'Success', sortable: true },
+  { key: 'degraded', label: 'Degraded', sortable: true },
   { key: 'error', label: 'Error', sortable: true },
   { key: 'partial', label: 'Partial', sortable: true },
-  { key: 'total', label: 'Total', sortable: true },
+  { key: 'cancelled', label: 'Cancelled', sortable: true },
+  { key: 'running', label: 'Running', sortable: true },
+  { key: 'pending', label: 'Pending', sortable: true },
+  { key: 'total', label: 'Completed', sortable: true },
   { key: 'successRate', label: 'Success Rate', sortable: true },
   { key: 'totalDuration', label: 'Duration', sortable: true },
 ]
 
 const perDutData = computed(() => {
   if (!selectedService.value) return []
-  const rows: Record<string, any>[] = []
+  const rows: Array<LifecycleDisplayStats & {
+    dutId: string
+    totalDuration: string
+  }> = []
   const duts = dutFilter.value ? manifestStore.duts.filter(d => d.id === dutFilter.value) : manifestStore.duts
   for (const dut of duts) {
-    let success = 0, error = 0, partial = 0, total = 0, dur = 0
+    const statuses: unknown[] = []
+    let duration = 0
     for (const g of dut.collector_groups) {
       if ((g.service_type || g.name) !== selectedService.value) continue
       for (const c of g.collectors) {
-        if (c.status === 'not_ran') continue
-        total++
-        if (c.status === 'success') success++
-        else if (c.status === 'error') error++
-        else if (c.status === 'partial') partial++
-        dur += c.execution_time
+        statuses.push(c.status)
+        if (isTerminalCollectorStatus(c.status)) {
+          duration += c.execution_time
+        }
       }
     }
-    if (total > 0) {
+    const lifecycle = summarizeCollectorStatuses(statuses)
+    if (lifecycle.completedCount > 0 || lifecycle.activeCount > 0) {
       rows.push({
         dutId: dut.id,
-        success,
-        error,
-        partial,
-        total,
-        successRate: ((success / total) * 100).toFixed(1),
-        totalDuration: formatDuration(dur),
+        ...lifecycle.counts,
+        lifecycle,
+        total: lifecycle.completedCount,
+        successRate: lifecycle.passRate,
+        successRateLabel: formatCollectorPassRate(lifecycle, 1),
+        totalDuration: formatDuration(duration),
       })
     }
   }
   return rows
 })
+
+function serviceRateLabel(
+  lifecycle: CollectorLifecycleSummary,
+  fractionDigits = 0,
+) {
+  return formatCollectorPassRate(lifecycle, fractionDigits)
+}
+
+function serviceRateColor(lifecycle: CollectorLifecycleSummary) {
+  if (lifecycle.state === 'in_progress') return 'var(--nv-info)'
+  if (lifecycle.passRate === null) return 'var(--nv-text-tertiary)'
+  if (lifecycle.passRate >= 90) return 'var(--nv-success)'
+  if (lifecycle.passRate >= 50) return 'var(--nv-warning)'
+  return 'var(--nv-error)'
+}
+
+function serviceRateBadge(lifecycle: CollectorLifecycleSummary) {
+  if (lifecycle.state === 'in_progress') return 'nv-badge--running'
+  if (lifecycle.passRate === null) return 'nv-badge--neutral'
+  if (lifecycle.passRate >= 90) return 'nv-badge--success'
+  if (lifecycle.passRate >= 50) return 'nv-badge--warning'
+  return 'nv-badge--error'
+}
 
 function pct(n: number, total: number) {
   return total > 0 ? `${(n / total) * 100}%` : '0%'
@@ -236,8 +322,10 @@ function pct(n: number, total: number) {
 }
 .sh-card__bar-fill { height: 100%; }
 .sh-card__bar-fill--success { background: var(--nv-success); }
+.sh-card__bar-fill--degraded { background: var(--nv-warning); }
 .sh-card__bar-fill--error { background: var(--nv-error); }
 .sh-card__bar-fill--partial { background: var(--nv-warning); }
+.sh-card__bar-fill--cancelled { background: var(--nv-skipped); }
 .sh-card__meta {
   font-size: 0.6875rem;
   color: var(--nv-text-tertiary);

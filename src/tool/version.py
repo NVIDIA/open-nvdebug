@@ -17,15 +17,11 @@
 """
 Version information for Open-NVDebug Tool.
 
-This module contains version metadata for the nvdebug tool including
-version number, build hash, and build timestamp.
-
-Attributes:
-    __version__ (str): Semantic version string.
-    __build_hash__ (str): Git commit hash or 'unknown'.
-    __build_time__ (str): Build timestamp or 'unknown'.
+This module contains version metadata for the nvdebug tool including version
+number, build hash, and build timestamp.
 """
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 __build_hash__ = "unknown"
+__source_revision__ = "unknown"
 __build_time__ = "unknown"

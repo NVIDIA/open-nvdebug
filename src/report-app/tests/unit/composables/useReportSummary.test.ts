@@ -1,3 +1,18 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 import { describe, it, expect } from 'vitest'
 import { generateReportSummary } from '@/composables/useReportSummary'
 import type { Manifest } from '@/types/manifest'
@@ -79,5 +94,74 @@ describe('useReportSummary', () => {
   it('includes pass rate percentage', () => {
     const summary = generateReportSummary(makeManifest())
     expect(summary).toContain('50%')
+  })
+
+  it('reports the selected 63 collectors without including 56 filtered catalog entries', () => {
+    const manifest = makeManifest()
+    manifest.errors = []
+    manifest.collection_summary.total_collectors_executed = 63
+    manifest.collection_summary.total_collectors_in_catalog = 119
+    manifest.collection_summary.total_collectors_filtered_out = 56
+    manifest.collection_summary.status_counts = {
+      success: 63, error: 0, partial: 0, skipped: 0, not_ran: 56,
+    }
+
+    const summary = generateReportSummary(manifest)
+
+    expect(summary).toContain('63/63 collectors passed (100%)')
+    expect(summary).not.toContain('63/119')
+  })
+
+  it('excludes active records and counts cancelled as a non-pass', () => {
+    const manifest = makeManifest()
+    manifest.collection_summary.status_counts = {
+      success: 1,
+      error: 0,
+      partial: 0,
+      skipped: 0,
+      cancelled: 1,
+      running: 20,
+      pending: 30,
+    }
+
+    const summary = generateReportSummary(manifest)
+
+    expect(summary).toContain('1/2 collectors passed (50%)')
+    expect(summary).toContain('1 cancelled')
+    expect(summary).toContain('20 running, 30 pending')
+  })
+
+  it('reports degraded collectors as a distinct non-pass terminal state', () => {
+    const manifest = makeManifest()
+    manifest.collection_summary.status_counts = {
+      success: 1,
+      degraded: 1,
+      error: 0,
+      partial: 0,
+      skipped: 0,
+    }
+
+    const summary = generateReportSummary(manifest)
+
+    expect(summary).toContain('1/2 collectors passed (50%)')
+    expect(summary).toContain('1 degraded, 0 failed')
+  })
+
+  it('labels active-only reports as in progress', () => {
+    const manifest = makeManifest()
+    manifest.collection_summary.status_counts = {
+      success: 0,
+      error: 0,
+      partial: 0,
+      skipped: 0,
+      running: 2,
+      pending: 3,
+    }
+
+    const summary = generateReportSummary(manifest)
+
+    expect(summary).toContain('Overall: In progress.')
+    expect(summary).toContain('2 running, 3 pending')
+    expect(summary).not.toContain('(0%)')
   })
 })

@@ -17,61 +17,115 @@
 """
 Timeout configuration utilities for open-nvdebugtool.
 
-This module provides utilities for handling timeout overrides based on
-collector definitions and DUT configuration.
+This module provides utilities for handling timeout overrides based on collector
+definitions and DUT configuration.
 """
 
 from typing import Any, Dict
 
+from .collector_command_profiles import resolve_collector_command_profiles
+
+# Tool-level values for these catalog ``params.timeout_config`` keys can come
+# from either YAML or BaseSettings environment fallback. Every boundary that
+# projects configuration provenance must use this shared set so the resolver
+# can distinguish those source layers without collector-specific checks.
+TIMEOUT_CONFIG_OVERRIDE_KEYS = frozenset(
+    {
+        "NVOS_TECH_DUMP_TIMEOUT",
+        "REDFISH_DUMP_TIMEOUT",
+    }
+)
+
 
 def _is_positive_number(value: Any) -> bool:
+    """
+    Return whether ``value`` is positive number.
+
+    The implementation uses ``value`` to determine whether ``value`` is positive
+    number.
+
+    Args:
+        value: Value evaluated while performing ``value`` is positive number.
+
+    Returns:
+        Whether ``value`` is positive number.
+    """
     return isinstance(value, (int, float)) and value > 0
 
 
 def _get_positive_int(value: Any) -> int | None:
+    """
+    Return positive int.
+
+    After applying local validation, the function forwards ``value`` to ``int``
+    and preserves its return and exception contract.
+
+    Args:
+        value: Value evaluated while performing positive int.
+
+    Returns:
+        The numeric positive int value, or ``None`` when the requested value is
+        unavailable.
+    """
     if _is_positive_number(value):
         return int(value)
     return None
 
 
-def _resolve_timeout_config_value(
-    timeout_config_key: str,
-    dut_config: Dict[str, Any],
-    tool_config: Dict[str, Any] | None = None,
-    collector_timeout: int | None = None,
-) -> int | None:
-    """Resolve timeout_config while preserving DUT-level overrides.
-
-    ConfigManager may populate tool_config with default values for compatibility.
-    When that value matches the collector timeout, treat it as a default rather
-    than an explicit global override. H14's NVOS tech dump timeout is
-    intentionally per-DUT overridable even when a global tool timeout is set.
+def _iter_hook_params(collector_def: Dict[str, Any]):
     """
-    tool_timeout = None
-    if tool_config and timeout_config_key in tool_config:
-        tool_timeout = _get_positive_int(tool_config[timeout_config_key])
+    Yield each hook's params dict across all stages, in stage/hook order.
 
-    dut_timeout = None
-    if dut_config and timeout_config_key in dut_config:
-        dut_timeout = _get_positive_int(dut_config[timeout_config_key])
+    Tolerates malformed stage/hook entries (skips them) rather than raising.
 
-    if timeout_config_key == "NVOS_TECH_DUMP_TIMEOUT" and dut_timeout is not None:
-        return dut_timeout
+    Args:
+        collector_def: Mapping supplying fields for yield each hook's params
+            dict across all stages, in stage/hook order.
 
-    if (
-        tool_timeout is not None
-        and (
-            dut_timeout is None
-            or collector_timeout is None
-            or tool_timeout != collector_timeout
-        )
-    ):
-        return tool_timeout
+    Yields:
+        Each hook params admitted by the operation, in deterministic iteration
+        order.
+    """
+    if not collector_def:
+        return
+    stages = collector_def.get("stages") or {}
+    if not isinstance(stages, dict):
+        return
+    for stage_config in stages.values():
+        if not isinstance(stage_config, dict):
+            continue
+        hooks = stage_config.get("hooks") or []
+        if not isinstance(hooks, list):
+            continue
+        for hook in hooks:
+            if isinstance(hook, dict) and isinstance(hook.get("params"), dict):
+                yield hook["params"]
 
-    if dut_timeout is not None:
-        return dut_timeout
 
-    return tool_timeout
+def _explicit_tool_config_keys(config: Dict[str, Any]) -> set[str] | None:
+    """
+    Return tool-YAML source metadata, or None for legacy unmarked callers.
+
+    The implementation uses ``config`` to produce tool-YAML source metadata, or
+    None for legacy unmarked callers.
+
+    Args:
+        config: Config governing tool-YAML source metadata, or None for legacy
+            unmarked callers.
+
+    Returns:
+        The unique explicit tool config keys returned by the operation, or
+        ``None`` when the requested value is unavailable.
+    """
+
+    if not isinstance(config, dict) or "__explicit_tool_config_fields" not in config:
+        return None
+    raw = config.get("__explicit_tool_config_fields")
+    if isinstance(raw, dict):
+        return {str(key) for key, value in raw.items() if value}
+    if isinstance(raw, (list, tuple, set, frozenset)):
+        return {str(key) for key in raw}
+    return set()
 
 
 def get_collector_timeout(
@@ -82,73 +136,109 @@ def get_collector_timeout(
     tool_config: Dict[str, Any] = None,
 ) -> int:
     """
-    Get the appropriate timeout for a collector based on configuration.
+    Resolve the effective timeout for a collector.
 
-    Priority order:
-    1. timeout_config override in tool_config (if explicitly set in YAML)
-    2. timeout_config override in dut_config (if explicitly set in YAML)
-    3. Collector's own timeout (from spreadsheet)
-    4. Default timeout
+    Priority (most specific wins; first non-empty positive integer is returned):
 
-    A tool_config value matching the collector's own timeout is treated as a
-    default, not an explicit global override, so DUT-specific overrides still
-    apply.
+    1. DUT config override When a stage hook declares ``params.timeout_config:
+       "<KEY>"`` and ``dut_config[<KEY>]`` is a positive integer, that value
+       wins. This is the operator's per-DUT, per-run knob — most specific.
+    2. Tool config override Same opt-in via ``timeout_config``, but the value is
+       read from ``tool_config``. Useful for CI / lab-wide tuning.
+    3. Spreadsheet timeout ``collector_def["timeout"]`` — the catalog author's
+       reviewed default. Authoritative whenever no DUT/tool override is set, OR
+       when the collector does not declare a ``timeout_config`` opt-in.
+    4. Environment fallback A timeout populated by BaseSettings but absent from
+       the tool YAML. Source-presence metadata keeps this below the spreadsheet.
+    5. Caller default ``default_timeout`` arg — last-resort fallback when
+       neither the catalog nor any operator config specifies a value.
+
+    The opt-in: only hooks with ``params.timeout_config: "<KEY>"`` participate
+    in admin overrides. Collectors without that declaration are
+    spreadsheet-authoritative — no DUT or tool config can change them.
+
+    Catalog command profiles select their authored deadlines before this
+    precedence chain, including during status-plan projection. A caller probing
+    only explicit overrides can still suppress the catalog timeout by omitting it.
 
     Args:
-        collector_id: The collector ID
-        collector_def: Collector definition from spreadsheet
-        dut_config: DUT configuration dictionary
-        default_timeout: Default timeout if no configuration is found
-        tool_config: Tool configuration dictionary (optional)
+        collector_id: Stable collector identifier used to correlate
+            configuration, logs, and results.
+        collector_def: Mapping supplying fields for effective timeout for a
+            collector.
+        dut_config: DUT config governing effective timeout for a collector.
+        default_timeout: Maximum duration in seconds allowed for default
+            timeout.
+        tool_config: Optional Tool config governing effective timeout for a
+            collector.
 
     Returns:
-        int: The timeout value to use
+        The numeric collector timeout value.
     """
+    tool_values = tool_config or {}
+    if collector_def:
+        had_catalog_timeout = "timeout" in collector_def
+        collector_def = resolve_collector_command_profiles(
+            collector_def, dut_config or {}, tool_values
+        )
+        if not had_catalog_timeout and "timeout" in collector_def:
+            collector_def = {
+                key: value for key, value in collector_def.items() if key != "timeout"
+            }
+    explicit_tool_keys = _explicit_tool_config_keys(tool_values)
+    environment_tool_values = tool_values if explicit_tool_keys is not None else {}
+    if explicit_tool_keys is not None:
+        tool_config = {
+            key: value
+            for key, value in tool_values.items()
+            if key in explicit_tool_keys
+        }
+    else:
+        tool_config = tool_values
+
+    # Priority is DUT > tool > spreadsheet > environment > default.
+    # The previous implementation had tool > dut > spreadsheet which inverted the
+    # specificity rule, contradicted tool_config.yaml's "Global defaults — can
+    # be overridden per-DUT" comment, and required a hardcoded
+    # NVOS_TECH_DUMP_TIMEOUT carve-out to compensate.
     if not collector_def:
         return default_timeout
 
-    # First priority: Check collector definition timeout
-    collector_timeout = collector_def.get("timeout")
-    collector_timeout_int = _get_positive_int(collector_timeout)
-    if collector_timeout_int is not None:
-        # Check if there's a timeout_config override that should take precedence
-        stages = collector_def.get("stages", {})
-        for stage_name, stage_config in stages.items():
-            if isinstance(stage_config, dict) and "hooks" in stage_config:
-                for hook in stage_config["hooks"]:
-                    if isinstance(hook, dict) and "params" in hook:
-                        params = hook["params"]
-                        timeout_config_key = params.get("timeout_config")
-                        if timeout_config_key:
-                            timeout_value = _resolve_timeout_config_value(
-                                timeout_config_key,
-                                dut_config,
-                                tool_config,
-                                collector_timeout_int,
-                            )
-                            if timeout_value is not None:
-                                return timeout_value
+    # Resolve the complete DUT source layer before inspecting tool values. A
+    # later hook's DUT override is still more specific than an earlier hook's
+    # tool override.
+    for params in _iter_hook_params(collector_def):
+        key = params.get("timeout_config")
+        if not key:
+            continue
+        dut_val = _get_positive_int((dut_config or {}).get(key))
+        if dut_val is not None:
+            return dut_val
 
-        # No explicit override found, use collector's timeout
-        return collector_timeout_int
+    for params in _iter_hook_params(collector_def):
+        key = params.get("timeout_config")
+        if not key:
+            continue
+        tool_val = _get_positive_int((tool_config or {}).get(key))
+        if tool_val is not None:
+            return tool_val
 
-    # Fallback: Check for timeout_config if collector doesn't have its own timeout
-    stages = collector_def.get("stages", {})
-    for stage_name, stage_config in stages.items():
-        if isinstance(stage_config, dict) and "hooks" in stage_config:
-            for hook in stage_config["hooks"]:
-                if isinstance(hook, dict) and "params" in hook:
-                    params = hook["params"]
-                    timeout_config_key = params.get("timeout_config")
-                    if timeout_config_key:
-                        timeout_value = _resolve_timeout_config_value(
-                            timeout_config_key,
-                            dut_config,
-                            tool_config,
-                        )
-                        if timeout_value is not None:
-                            return timeout_value
+    # 3: spreadsheet timeout.
+    spreadsheet_timeout = _get_positive_int(collector_def.get("timeout"))
+    if spreadsheet_timeout is not None:
+        return spreadsheet_timeout
 
+    # 4: source-aware tool values absent from the YAML marker came from the
+    # environment and participate only after the spreadsheet.
+    for params in _iter_hook_params(collector_def):
+        key = params.get("timeout_config")
+        if not key:
+            continue
+        environment_value = _get_positive_int(environment_tool_values.get(key))
+        if environment_value is not None:
+            return environment_value
+
+    # 5: caller default.
     return default_timeout
 
 
@@ -161,14 +251,20 @@ def get_collector_sleep_duration(
     """
     Get the appropriate sleep duration for a collector based on configuration.
 
+    Check if collector definition specifies a sleep duration config variable.
+
     Args:
-        collector_id: The collector ID
-        collector_def: Collector definition from collector_definitions.yaml
-        dut_config: DUT configuration dictionary
-        default_sleep: Default sleep duration if no configuration is found
+        collector_id: Stable collector identifier used to correlate
+            configuration, logs, and results.
+        collector_def: Mapping supplying fields for get the appropriate sleep
+            duration for a collector based on configuration.
+        dut_config: DUT config governing get the appropriate sleep duration for
+            a collector based on configuration.
+        default_sleep: Numeric default sleep used while the operation performs
+            bounded accounting.
 
     Returns:
-        int: The sleep duration to use
+        The numeric collector sleep duration value.
     """
     if not collector_def or not dut_config:
         return default_sleep
@@ -196,21 +292,32 @@ def get_expand_level(
     collector_def: Dict[str, Any],
     dut_config: Dict[str, Any],
     default_expand_level: int = 1,
+    explicit_config_keys: Dict[str, bool] | None = None,
 ) -> int:
     """
     Get the appropriate expand level for a collector based on configuration.
 
+    Check if collector definition specifies an expand query config variable.
+
     Args:
-        collector_id: The collector ID
-        collector_def: Collector definition from collector_definitions.yaml
-        dut_config: DUT configuration dictionary
-        default_expand_level: Default expand level if no configuration is found
+        collector_id: Stable collector identifier used to correlate
+            configuration, logs, and results.
+        collector_def: Mapping supplying fields for get the appropriate expand
+            level for a collector based on configuration.
+        dut_config: DUT config governing get the appropriate expand level for a
+            collector based on configuration.
+        default_expand_level: Numeric default expand level used while the
+            operation performs bounded accounting.
+        explicit_config_keys: Optional Explicit config keys governing get the
+            appropriate expand level for a collector based on configuration.
 
     Returns:
-        int: The expand level to use
+        The numeric expand level value.
     """
-    if not collector_def or not dut_config:
+    if not collector_def:
         return default_expand_level
+
+    explicit_config_keys = explicit_config_keys or {}
 
     # Check if collector definition specifies an expand query config variable
     stages = collector_def.get("stages", {})
@@ -222,7 +329,12 @@ def get_expand_level(
 
                     # Check for expand_query_config parameter
                     expand_config_key = params.get("expand_query_config")
-                    if expand_config_key and expand_config_key in dut_config:
+                    if (
+                        expand_config_key
+                        and dut_config
+                        and expand_config_key in dut_config
+                        and explicit_config_keys.get(expand_config_key)
+                    ):
                         expand_value = dut_config[expand_config_key]
                         if isinstance(expand_value, bool):
                             # If it's a boolean, use 1 for True, 0 for False
@@ -249,14 +361,21 @@ def get_nvos_tech_dump_timeout(
     """
     Get the NVOS tech dump timeout for H14 collector.
 
+    The implementation uses ``collector_id``, ``collector_def``, ``dut_config``,
+    and ``default_timeout`` to get the NVOS tech dump timeout for H14 collector.
+
     Args:
-        collector_id: The collector ID (should be H14)
-        collector_def: Collector definition from collector_definitions.yaml
-        dut_config: DUT configuration dictionary
-        default_timeout: Default timeout if no configuration is found
+        collector_id: Stable collector identifier used to correlate
+            configuration, logs, and results.
+        collector_def: Mapping supplying fields for get the NVOS tech dump
+            timeout for H14 collector.
+        dut_config: DUT config governing get the NVOS tech dump timeout for H14
+            collector.
+        default_timeout: Maximum duration in seconds allowed for default
+            timeout.
 
     Returns:
-        int: The timeout value to use
+        The numeric nvos tech dump timeout value.
     """
     if not dut_config:
         return default_timeout

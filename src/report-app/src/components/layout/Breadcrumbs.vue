@@ -1,3 +1,20 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 <template>
   <nav class="nv-breadcrumbs">
     <router-link to="/">Dashboard</router-link>
@@ -15,10 +32,12 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useRoute } from 'vue-router'
+import type { RouteLocationRaw } from 'vue-router'
+import { collectorGroupRoute, dutRoute } from '@/utils/reportRoutes'
 
 interface Crumb {
   label: string
-  to?: string
+  to?: RouteLocationRaw
 }
 
 const route = useRoute()
@@ -28,10 +47,10 @@ const crumbs = computed<Crumb[]>(() => {
   const params = route.params
 
   if (params.dutId) {
-    result.push({ label: String(params.dutId), to: `/dut/${params.dutId}` })
+    result.push({ label: String(params.dutId), to: dutRoute(params.dutId) })
   }
   if (params.group) {
-    result.push({ label: String(params.group), to: `/dut/${params.dutId}/${params.group}` })
+    result.push({ label: String(params.group), to: collectorGroupRoute(params.dutId, params.group) })
   }
   if (params.collectorId) {
     result.push({ label: String(params.collectorId) })

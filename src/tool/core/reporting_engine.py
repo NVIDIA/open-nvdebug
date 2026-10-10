@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 """
 Reporting Engine for NVDebug Tool.
 
@@ -33,9 +34,86 @@ from rich.table import Table
 from rich.text import Text
 
 from ..utils.console_output import create_sanitized_console
+from ..utils.sanitizer import neutralize_terminal_text, neutralize_text_controls
+from .async_logger import MAX_DUT_RUNTIME_LOG_ENTRY_BYTES
+from .finalization_receipt import sanitize_finalization_message
 
 logger = logging.getLogger(__name__)
 sanitized_console = create_sanitized_console()
+
+# Leave room for AsyncSafeLogger's timestamp/component prefix so these tables
+# are intentionally bounded before reaching its last-resort entry truncation.
+_FINAL_STATUS_MESSAGE_BUDGET_BYTES = MAX_DUT_RUNTIME_LOG_ENTRY_BYTES - 4096
+_FINAL_STATUS_REASON_PREVIEW_CHARS = 192
+_FULL_REASON_MARKER = "[full reason in status artifacts]"
+
+
+def _bounded_status_reason(reason: Any) -> str:
+    """
+    Return a compact single-line preview for terminal/runtime summaries.
+
+    The implementation uses ``reason`` to produce a compact single-line preview
+    for terminal/runtime summaries.
+
+    Args:
+        reason: Reason consumed while the function attempts to produce a compact
+            single-line preview for terminal/runtime summaries.
+
+    Returns:
+        The canonical bounded status reason text.
+    """
+
+    text = str(reason or "")
+    normalized = " ".join(text.split())
+    if len(normalized) <= _FINAL_STATUS_REASON_PREVIEW_CHARS:
+        return normalized
+    preview = normalized[:_FINAL_STATUS_REASON_PREVIEW_CHARS].rstrip()
+    return f"{preview}… {_FULL_REASON_MARKER}"
+
+
+def _bounded_status_message(message: str) -> str:
+    """
+    Bound a rendered status table without invoking logger truncation.
+
+    The implementation uses ``message`` to bound a rendered status table without
+    invoking logger truncation.
+
+    Args:
+        message: Operator-facing text carried by the reported event or failure.
+
+    Returns:
+        The canonical bounded status message.
+    """
+
+    encoded = message.encode("utf-8")
+    if len(encoded) <= _FINAL_STATUS_MESSAGE_BUDGET_BYTES:
+        return message
+
+    marker = (
+        "\n[runtime status summary shortened to its byte budget; "
+        "full status in status artifacts]\n"
+    ).encode("utf-8")
+    retained = _FINAL_STATUS_MESSAGE_BUDGET_BYTES - len(marker)
+    return encoded[:retained].decode("utf-8", errors="ignore") + marker.decode("utf-8")
+
+
+def _literal_table_text(value: Any, *, style: Any = None) -> Text:
+    """
+    Return control-free literal Rich text for one untrusted table field.
+
+    After applying local validation, the function forwards ``value`` and
+    ``style`` to ``Text`` and preserves its return and exception contract.
+
+    Args:
+        value: Value evaluated while performing control-free literal Rich text
+            for one untrusted table field.
+        style: Optional style; ``None`` selects the function's default behavior.
+
+    Returns:
+        A ``Text`` representing literal table text.
+    """
+
+    return Text(neutralize_text_controls(str(value)), style=style)
 
 
 class ReportingEngine:
@@ -44,21 +122,22 @@ class ReportingEngine:
 
     Handles generation of status tables, HTML reports, and metadata files for
     collection results across multiple DUTs.
-
-    Attributes:
-        config_manager: Configuration manager instance.
-        dut_manager: DUT manager instance.
-        logger: Logger instance.
     """
 
     def __init__(self, config_manager, dut_manager, logger):
         """
         Initialize reporting engine.
 
+        The initializer records ``config_manager``, ``dut_manager``, and
+        ``logger`` for later operations and establishes the instance invariants
+        before any public method runs.
+
         Args:
-            config_manager: Configuration manager.
-            dut_manager: DUT manager.
-            logger: Logger instance.
+            config_manager: Config manager governing initialize reporting
+                engine.
+            dut_manager: DUT manager consumed while the function attempts to
+                initialize reporting engine.
+            logger: Sanitized logger used for operator-visible diagnostics.
         """
         self.config_manager = config_manager
         self.dut_manager = dut_manager
@@ -73,10 +152,18 @@ class ReportingEngine:
         """
         Log collector status table to each DUT's runtime log.
 
+        The implementation uses ``results``, ``dut_ids``, and ``collector_ids``
+        to log collector status table to each DUT's runtime log. Owned
+        asynchronous work is awaited before return, so completion does not leave
+        an unobserved task behind.
+
         Args:
-            results: Collection results dictionary.
-            dut_ids: List of DUT IDs.
-            collector_ids: List of collector IDs.
+            results: Mapping supplying fields for log collector status table to
+                each DUT's runtime log.
+            dut_ids: Entries supplied as ``dut_ids`` without transferring
+                container ownership.
+            collector_ids: Entries supplied as ``collector_ids`` without
+                transferring container ownership.
         """
         # Group collectors by service
         service_groups = {}
@@ -89,8 +176,11 @@ class ReportingEngine:
 
         # Create DUT-specific tables
         for dut_id in dut_ids:
+            reason_previewed = False
             # Create status table for this DUT
-            table = Table(title=f"Collector Execution Status - {dut_id}")
+            table = Table(
+                title=_literal_table_text(f"Collector Execution Status - {dut_id}")
+            )
             table.add_column("Group", style="cyan")
             table.add_column("ID", style="cyan")
             table.add_column("Name", style="cyan")
@@ -142,18 +232,28 @@ class ReportingEngine:
                         else (
                             "red"
                             if status == "error"
-                            else "yellow" if status == "skipped" else "dim"
+                            else (
+                                "yellow"
+                                if status in {"degraded", "partial", "skipped"}
+                                else "dim"
+                            )
                         )
                     )
-                    status_text = f"[{status_color}]{status.upper()}[/{status_color}]"
+                    status_text = _literal_table_text(
+                        str(status).upper(), style=status_color
+                    )
 
                     # Add row to table
+                    bounded_reason = _bounded_status_reason(reason)
+                    reason_previewed = reason_previewed or (
+                        _FULL_REASON_MARKER in bounded_reason
+                    )
                     table.add_row(
-                        group.title(),
-                        collector_id,
-                        f"{formatted_name} ({baseboard})",
+                        _literal_table_text(str(group).title()),
+                        _literal_table_text(collector_id),
+                        _literal_table_text(f"{formatted_name} ({baseboard})"),
                         status_text,
-                        reason,
+                        _literal_table_text(bounded_reason),
                     )
 
             # Capture table for logging only (no console print)
@@ -164,11 +264,15 @@ class ReportingEngine:
             buffer.close()
 
             # Write to DUT-specific runtime log
+            status_header = f"Collector execution status for {dut_id}:"
+            if reason_previewed:
+                status_header += f"\n{_FULL_REASON_MARKER}"
+            status_message = _bounded_status_message(f"{status_header}\n{table_text}")
             await self.logger.write_to_dut_runtime_log(
                 dut_id,
                 "INFO",
                 "CollectorStatus",
-                f"Collector execution status for {dut_id}:\n{table_text}",
+                status_message,
             )
 
     async def log_execution_results_table(
@@ -180,15 +284,26 @@ class ReportingEngine:
         """
         Log execution results summary table to each DUT's runtime log.
 
+        The implementation uses ``results``, ``dut_ids``, and ``collector_ids``
+        to log execution results summary table to each DUT's runtime log. Owned
+        asynchronous work is awaited before return, so completion does not leave
+        an unobserved task behind.
+
         Args:
-            results: Collection results dictionary.
-            dut_ids: List of DUT IDs.
-            collector_ids: Optional list of collector IDs.
+            results: Mapping supplying fields for log execution results summary
+                table to each DUT's runtime log.
+            dut_ids: Entries supplied as ``dut_ids`` without transferring
+                container ownership.
+            collector_ids: Optional collector identifiers; ``None`` selects the
+                function's default behavior.
         """
         # Create DUT-specific tables
         for dut_id in dut_ids:
+            reason_previewed = False
             # Create results table for this DUT
-            table = Table(title=f"Execution Results Summary - {dut_id}")
+            table = Table(
+                title=_literal_table_text(f"Execution Results Summary - {dut_id}")
+            )
             table.add_column("Collector ID", style="cyan")
             table.add_column("Status", style="cyan")
             table.add_column("Reason", style="cyan")
@@ -257,11 +372,16 @@ class ReportingEngine:
                         "red"
                         if collector_info["status"] == "error"
                         else (
-                            "yellow" if collector_info["status"] == "skipped" else "dim"
+                            "yellow"
+                            if collector_info["status"]
+                            in {"degraded", "partial", "skipped"}
+                            else "dim"
                         )
                     )
                 )
-                status_text = f"[{status_color}]{collector_info['status'].upper()}[/{status_color}]"
+                status_text = _literal_table_text(
+                    str(collector_info["status"]).upper(), style=status_color
+                )
 
                 # Format execution time
                 exec_time = (
@@ -270,11 +390,15 @@ class ReportingEngine:
                     else "N/A"
                 )
 
+                bounded_reason = _bounded_status_reason(collector_info["reason"])
+                reason_previewed = reason_previewed or (
+                    _FULL_REASON_MARKER in bounded_reason
+                )
                 table.add_row(
-                    collector_info["collector_id"],
+                    _literal_table_text(collector_info["collector_id"]),
                     status_text,
-                    collector_info["reason"],
-                    exec_time,
+                    _literal_table_text(bounded_reason),
+                    _literal_table_text(exec_time),
                 )
 
             # Capture table for logging only (no console print)
@@ -285,11 +409,15 @@ class ReportingEngine:
             buffer.close()
 
             # Write to DUT-specific runtime log
+            results_header = f"Execution results summary for {dut_id}:"
+            if reason_previewed:
+                results_header += f"\n{_FULL_REASON_MARKER}"
+            results_message = _bounded_status_message(f"{results_header}\n{table_text}")
             await self.logger.write_to_dut_runtime_log(
                 dut_id,
                 "INFO",
                 "ExecutionResults",
-                f"Execution results summary for {dut_id}:\n{table_text}",
+                results_message,
             )
 
     async def display_console_collector_summary(
@@ -301,14 +429,19 @@ class ReportingEngine:
         """
         Display collector execution summary tables on console.
 
-        Args:
-            results: Collection results dictionary.
-            dut_ids: List of DUT IDs.
-            collector_ids: List of collector IDs.
-        """
-        # Use sanitized console for consistent output
-        console = sanitized_console.console
+        The implementation uses ``results``, ``dut_ids``, and ``collector_ids``
+        to display collector execution summary tables on console. Owned
+        asynchronous work is awaited before return, so completion does not leave
+        an unobserved task behind.
 
+        Args:
+            results: Mapping supplying fields for display collector execution
+                summary tables on console.
+            dut_ids: Entries supplied as ``dut_ids`` without transferring
+                container ownership.
+            collector_ids: Entries supplied as ``collector_ids`` without
+                transferring container ownership.
+        """
         # For multi-DUT scenarios, show simplified summary table
         if len(dut_ids) > 1:
             await self._display_multi_dut_summary(results, dut_ids, collector_ids)
@@ -316,16 +449,119 @@ class ReportingEngine:
             # For single DUT, show detailed table
             await self._display_single_dut_summary(results, dut_ids[0], collector_ids)
 
-    def _get_dut_wall_clock_time(self, dut_id: str) -> float:
+    async def display_config_applicability_skip_reasons(
+        self,
+        skipped_collectors_per_dut: Dict[str, List[Dict[str, Any]]],
+    ) -> None:
         """
-        Get actual wall-clock execution time for a DUT from runtime logs.
+        Display explicit configuration-applicability exclusions on the console.
+
+        The caller supplies only explicitly selected collectors so ordinary
+        implicit applicability filtering remains quiet. This method defensively
+        accepts only ``config_applicability`` entries, sanitizes their
+        endpoint-influenced reasons at the run console boundary, and bounds each
+        preview while the full reason remains available in status artifacts.
 
         Args:
-            dut_id: DUT identifier
+            skipped_collectors_per_dut: Explicit configuration-applicability
+                exclusions grouped by stable DUT identifier.
+        """
+
+        console = (
+            getattr(
+                getattr(self, "orchestrator", None),
+                "sanitized_console",
+                sanitized_console,
+            )
+            or sanitized_console
+        )
+        run_sanitizer = getattr(console, "sanitizer", None)
+        rows: List[tuple[str, str, str, str, str]] = []
+
+        for dut_id, skipped_collectors in sorted(skipped_collectors_per_dut.items()):
+            for skipped_info in skipped_collectors:
+                if skipped_info.get("skip_type") != "config_applicability":
+                    continue
+
+                collector_id = str(skipped_info.get("collector_id") or "")
+                if not collector_id:
+                    continue
+                collector_info = self.config_manager.get_collector_info(collector_id)
+                group = str(collector_info.get("group", "unknown"))
+                collector_name = self._format_collector_name(
+                    collector_info.get("name", "Unknown")
+                )
+                reason = str(skipped_info.get("reason") or "")
+                sanitized_reason = (
+                    run_sanitizer.sanitize(reason)
+                    if run_sanitizer is not None
+                    else "<reason withheld: sanitizer unavailable>"
+                )
+                rows.append(
+                    (
+                        str(dut_id),
+                        group.title(),
+                        collector_id,
+                        str(collector_name),
+                        _bounded_status_reason(sanitized_reason),
+                    )
+                )
+
+        if not rows:
+            return
+
+        table = Table(
+            title="Collectors Skipped by Empty Configuration",
+            title_style="bold yellow",
+            border_style="dim",
+            show_lines=True,
+            pad_edge=True,
+        )
+        table.add_column("DUT", style="cyan", min_width=12)
+        table.add_column("Group", style="cyan", min_width=8)
+        table.add_column("Collector", style="magenta", min_width=10)
+        table.add_column("Collector Name", style="green", min_width=20)
+        table.add_column("Reason", style="yellow", max_width=150)
+
+        for dut_id, group, collector_id, collector_name, reason in rows:
+            table.add_row(
+                _literal_table_text(dut_id),
+                _literal_table_text(group),
+                _literal_table_text(collector_id),
+                _literal_table_text(collector_name),
+                _literal_table_text(reason),
+            )
+
+        console.print_renderable(table)
+        console.print()
+
+    def _get_dut_wall_clock_time(self, dut_id: str) -> float:
+        """
+        Return the authoritative collector span for one DUT.
+
+        The collection-status tracker owns per-DUT collector lifecycle timing
+        and is preferred when available. Runtime-log timestamps remain a
+        compatibility fallback for callers that do not attach an orchestrator;
+        those logs describe the broader command lifecycle and are therefore not
+        used when tracker timing exists.
+
+        Args:
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
 
         Returns:
-            float: Wall-clock execution time in seconds, or 0.0 if not found
+            The numeric DUT wall clock time value.
         """
+        tracker = getattr(getattr(self, "orchestrator", None), "status_tracker", None)
+        span_getter = getattr(tracker, "get_dut_collector_span_seconds", None)
+        if callable(span_getter):
+            try:
+                collector_span = span_getter(dut_id)
+            except Exception:
+                collector_span = None
+            if type(collector_span) in {int, float} and float(collector_span) >= 0.0:
+                return float(collector_span)
+
         try:
             runtime_log_path = (
                 Path(self.logger.base_log_dir) / dut_id / "nvdebug_runtime_output.txt"
@@ -336,18 +572,32 @@ class ReportingEngine:
             with runtime_log_path.open("r", encoding="utf-8") as f:
                 content = f.read()
 
-            # Look for start and end timestamps
+            # Look for start and end timestamps. The console summary is emitted
+            # before AsyncSafeLogger appends its final ``Completed at`` marker, so
+            # use the latest timestamped runtime event as the provisional end.
             start_match = re.search(
-                r"Started at:\s*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+)", content
+                r"Started at:\s*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+)",
+                content,
             )
             end_match = re.search(
-                r"Completed at:\s*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+)", content
+                r"Completed at:\s*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+)",
+                content,
             )
 
             if start_match and end_match:
                 start_time = datetime.fromisoformat(start_match.group(1))
                 end_time = datetime.fromisoformat(end_match.group(1))
                 return (end_time - start_time).total_seconds()
+
+            if start_match:
+                runtime_matches = re.findall(
+                    r"(?m)^\[?(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)",
+                    content,
+                )
+                if runtime_matches:
+                    start_time = datetime.fromisoformat(start_match.group(1))
+                    latest_time = datetime.fromisoformat(runtime_matches[-1])
+                    return max(0.0, (latest_time - start_time).total_seconds())
 
             return 0.0
         except Exception:
@@ -362,19 +612,35 @@ class ReportingEngine:
         """
         Display simplified summary table for multi-DUT scenarios.
 
+        The implementation uses ``results``, ``dut_ids``, and ``collector_ids``
+        to display simplified summary table for multi-DUT scenarios. Owned
+        asynchronous work is awaited before return, so completion does not leave
+        an unobserved task behind.
+
         Args:
-            results: Collection results dictionary.
-            dut_ids: List of DUT IDs.
-            collector_ids: List of collector IDs.
+            results: Mapping supplying fields for display simplified summary
+                table for multi-DUT scenarios.
+            dut_ids: Entries supplied as ``dut_ids`` without transferring
+                container ownership.
+            collector_ids: Entries supplied as ``collector_ids`` without
+                transferring container ownership.
         """
-        console = sanitized_console.console
+        console = (
+            getattr(
+                getattr(self, "orchestrator", None),
+                "sanitized_console",
+                sanitized_console,
+            )
+            or sanitized_console
+        )
 
         # Create summary table
         table = Table(title="Multi-DUT Collection Summary")
         table.add_column("DUT ID", style="cyan", no_wrap=True)
-        table.add_column("Duration", style="yellow", no_wrap=True)
+        table.add_column("Collector Span", style="yellow", no_wrap=True)
         table.add_column("Pass", style="green", no_wrap=True)
         table.add_column("Fail", style="red", no_wrap=True)
+        table.add_column("Degraded", style="yellow", no_wrap=True)
         table.add_column("Partial", style="yellow", no_wrap=True)
         table.add_column("Skipped", style="dim", no_wrap=True)
         table.add_column("Total", style="white", no_wrap=True)
@@ -385,6 +651,7 @@ class ReportingEngine:
             status_counts = {
                 "pass": 0,
                 "fail": 0,
+                "degraded": 0,
                 "partial": 0,
                 "skipped": 0,
                 "total": 0,
@@ -402,6 +669,8 @@ class ReportingEngine:
                         status_counts["pass"] += 1
                     elif status == "error":
                         status_counts["fail"] += 1
+                    elif status == "degraded":
+                        status_counts["degraded"] += 1
                     elif status == "partial":
                         status_counts["partial"] += 1
                     elif status == "skipped":
@@ -419,6 +688,8 @@ class ReportingEngine:
                         status_counts["pass"] += 1
                     elif status == "error":
                         status_counts["fail"] += 1
+                    elif status == "degraded":
+                        status_counts["degraded"] += 1
                     elif status == "partial":
                         status_counts["partial"] += 1
                     elif status == "skipped":
@@ -430,23 +701,25 @@ class ReportingEngine:
 
             # Add row to table
             table.add_row(
-                dut_id,
+                neutralize_terminal_text(dut_id),
                 duration,
                 str(status_counts["pass"]),
                 str(status_counts["fail"]),
+                str(status_counts["degraded"]),
                 str(status_counts["partial"]),
                 str(status_counts["skipped"]),
                 str(status_counts["total"]),
             )
 
         # Display the table
-        console.print(table)
+        console.print_renderable(table)
 
         # Add summary statistics
         total_duts = len(dut_ids)
         total_collectors = len(collector_ids)
         console.print(
-            f"\n[bold]Summary:[/bold] {total_duts} DUT(s) × {total_collectors} collector(s)"
+            f"\nSummary: {total_duts} DUT(s) × {total_collectors} collector(s)",
+            style="bold",
         )
         console.print()
 
@@ -459,15 +732,32 @@ class ReportingEngine:
         """
         Display detailed collector execution summary table for single DUT.
 
+        The implementation uses ``results``, ``dut_id``, and ``collector_ids``
+        to display detailed collector execution summary table for single DUT.
+        Owned asynchronous work is awaited before return, so completion does not
+        leave an unobserved task behind.
+
         Args:
-            results: Collection results dictionary.
-            dut_id: DUT ID.
-            collector_ids: List of collector IDs.
+            results: Mapping supplying fields for display detailed collector
+                execution summary table for single DUT.
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+            collector_ids: Entries supplied as ``collector_ids`` without
+                transferring container ownership.
         """
-        console = sanitized_console.console
+        console = (
+            getattr(
+                getattr(self, "orchestrator", None),
+                "sanitized_console",
+                sanitized_console,
+            )
+            or sanitized_console
+        )
 
         # Create collector status table for this DUT
-        table = Table(title=f"Collector Execution Summary - {dut_id}")
+        table = Table(
+            title="Collector Execution Summary - " f"{neutralize_terminal_text(dut_id)}"
+        )
         table.add_column("Group", style="cyan", no_wrap=True)
         table.add_column("ID", style="magenta", no_wrap=True)
         table.add_column("Collector Name", style="green")
@@ -528,7 +818,11 @@ class ReportingEngine:
                     else (
                         "red"
                         if status == "error"
-                        else "yellow" if status == "skipped" else "dim"
+                        else (
+                            "yellow"
+                            if status in {"degraded", "partial", "skipped"}
+                            else "dim"
+                        )
                     )
                 )
                 status_text = Text(status.upper(), style=status_color)
@@ -536,41 +830,42 @@ class ReportingEngine:
                 # Format execution time
                 exec_time = f"{execution_time:.2f}s" if execution_time > 0 else "N/A"
 
-                # Sanitize the reason text before adding to table
-                sanitized_reason = reason
-                if (
-                    hasattr(self, "orchestrator")
-                    and hasattr(self.orchestrator, "sanitized_console")
-                    and self.orchestrator.sanitized_console
-                    and self.orchestrator.sanitized_console.sanitizer
-                ):
-                    sanitized_reason = (
-                        self.orchestrator.sanitized_console.sanitizer.sanitize(reason)
-                    )
+                # Collector reasons are endpoint-influenced. Withhold them when
+                # the run sanitizer is unavailable instead of printing raw text.
+                # The console is created from the run sanitizer and is the
+                # single output boundary used for this table.
+                run_sanitizer = getattr(console, "sanitizer", None)
+                sanitized_reason = (
+                    run_sanitizer.sanitize(str(reason))
+                    if run_sanitizer is not None
+                    else "<reason withheld: sanitizer unavailable>"
+                )
 
                 # Add row to table
                 table.add_row(
-                    group.title(),
-                    collector_id,
-                    formatted_name,
+                    neutralize_terminal_text(group.title()),
+                    neutralize_terminal_text(collector_id),
+                    neutralize_terminal_text(formatted_name),
                     status_text,
                     exec_time,
-                    sanitized_reason,  # Sanitized reason text with word wrapping
+                    neutralize_terminal_text(sanitized_reason),
                 )
 
         # Display the table
-        console.print(table)
+        console.print_renderable(table)
         console.print()  # Add spacing between DUT tables
 
     def _format_collector_name(self, name: str) -> str:
         """
         Format collector name from snake_case to Title Case.
 
+        Replace underscores with spaces and title case each word.
+
         Args:
-            name: Collector name to format.
+            name: Stable name used for lookup and operator-facing diagnostics.
 
         Returns:
-            Formatted collector name with proper casing.
+            The canonical collector name.
         """
         if not name or name == "Unknown":
             return name
@@ -597,14 +892,23 @@ class ReportingEngine:
         """
         Log result for a single collector execution.
 
+        The implementation uses ``collector_id``, ``dut_id``, and ``result`` to
+        log result for a single collector execution. Owned asynchronous work is
+        awaited before return, so completion does not leave an unobserved task
+        behind.
+
         Args:
-            collector_id: Collector ID.
-            dut_id: DUT ID.
-            result: Execution result dictionary.
+            collector_id: Stable collector identifier used to correlate
+                configuration, logs, and results.
+            dut_id: Stable DUT identifier used to correlate configuration, logs,
+                and results.
+            result: Mapping supplying fields for log result for a single
+                collector execution.
         """
         status = result.get("status", "unknown")
         reason = result.get("reason", "")
         execution_time = result.get("execution_time", 0.0)
+        failure_category = result.get("failure_category")
 
         # Log to DUT runtime
         await self.logger.write_to_dut_runtime_log(
@@ -616,13 +920,23 @@ class ReportingEngine:
 
         # Create separate status.json file in collector directory
         await self.logger.write_collector_status_file(
-            collector_id, dut_id, status, reason
+            collector_id,
+            dut_id,
+            status,
+            reason,
+            failure_category=failure_category,
+            authoritative_projection=True,
         )
 
         # Update collector status in group metadata
         try:
             await self.logger._update_collector_status(
-                dut_id, collector_id, status, reason, execution_time
+                dut_id,
+                collector_id,
+                status,
+                reason,
+                execution_time,
+                failure_category=failure_category,
             )
         except Exception as e:
             await self.logger.log_runtime(
@@ -637,9 +951,16 @@ class ReportingEngine:
         """
         Log all execution results for sequential and parallel collectors.
 
+        The implementation uses ``results`` and ``dut_ids`` to log all execution
+        results for sequential and parallel collectors. Owned asynchronous work
+        is awaited before return, so completion does not leave an unobserved
+        task behind.
+
         Args:
-            results: Dictionary of all collector results.
-            dut_ids: List of DUT IDs.
+            results: Mapping supplying fields for log all execution results for
+                sequential and parallel collectors.
+            dut_ids: Entries supplied as ``dut_ids`` without transferring
+                container ownership.
         """
         # Process sequential results
         sequential_results = results.get("sequential_results", {})
@@ -660,14 +981,28 @@ class ReportingEngine:
                     )
 
     async def log_preflight_results_table(
-        self, preflight_results: Dict[str, Any]
+        self,
+        preflight_results: Dict[str, Any],
+        *,
+        preflight_label: str = "Preflight",
     ) -> None:
         """
         Log preflight results table to console and DUT runtime logs.
 
+        The implementation uses ``preflight_results`` and ``preflight_label``
+        to log a purpose-specific preflight results table to console and DUT
+        runtime logs. Owned asynchronous work is awaited before return, so
+        completion does not leave an unobserved task behind.
+
         Args:
-            preflight_results: Dictionary of preflight check results per DUT.
+            preflight_results: Mapping supplying fields for log preflight
+                results table to console and DUT runtime logs.
+            preflight_label: Operator-facing label for the preflight phase.
         """
+        normalized_label = neutralize_terminal_text(
+            str(preflight_label).strip() or "Preflight"
+        )
+
         # Get all unique collector groups from the results
         all_groups = set()
         for dut_results in preflight_results.values():
@@ -678,19 +1013,21 @@ class ReportingEngine:
         sorted_groups = sorted(all_groups)
 
         # Create the matrix-style table: DUT | Redfish | IPMI | SSH | Host | ...
-        matrix_table = Table(title="Preflight Results Summary")
+        matrix_table = Table(title=f"{normalized_label} Results Summary")
         matrix_table.add_column("DUT", style="cyan", width=20)
 
         # Add a column for each collector group
         for group in sorted_groups:
-            matrix_table.add_column(group.title(), justify="center", width=10)
+            matrix_table.add_column(
+                neutralize_terminal_text(group.title()), justify="center", width=10
+            )
 
         # Create rows for each DUT
         failure_details = []  # Store failure details for the second table
 
         for dut_id, dut_results in preflight_results.items():
             services = dut_results.get("services", {})
-            row_data = [dut_id]
+            row_data = [neutralize_terminal_text(dut_id)]
 
             # Add status for each collector group
             for group in sorted_groups:
@@ -706,6 +1043,9 @@ class ReportingEngine:
                     and self.orchestrator.sanitizer
                 ):
                     message = self.orchestrator.sanitizer.sanitize(message)
+                else:
+                    message = "<reason withheld: sanitizer unavailable>"
+                message = neutralize_terminal_text(message)
 
                 # Color code the status using Rich Text objects
                 if status == "pass":
@@ -713,11 +1053,25 @@ class ReportingEngine:
                 elif status == "fail":
                     status_text = Text("FAIL", style="red")
                     # Store failure details with status for color coding
-                    failure_details.append((dut_id, group.title(), message, "fail"))
+                    failure_details.append(
+                        (
+                            neutralize_terminal_text(dut_id),
+                            neutralize_terminal_text(group.title()),
+                            message,
+                            "fail",
+                        )
+                    )
                 elif status == "skip":
                     status_text = Text("SKIP", style="yellow")
                     # Store skip details with status for color coding
-                    failure_details.append((dut_id, group.title(), message, "skip"))
+                    failure_details.append(
+                        (
+                            neutralize_terminal_text(dut_id),
+                            neutralize_terminal_text(group.title()),
+                            message,
+                            "skip",
+                        )
+                    )
                 elif status == "interrupted":
                     status_text = Text("STOP", style="magenta")
                 else:
@@ -745,9 +1099,23 @@ class ReportingEngine:
 
         # Create failure/skip details table if there are any failures or skips
         if failure_details:
+            diagnostic_console = (
+                getattr(
+                    getattr(self, "orchestrator", None),
+                    "sanitized_console",
+                    sanitized_console,
+                )
+                or sanitized_console
+            )
+            for dut_id, service, reason, status in failure_details:
+                diagnostic_console.print(
+                    f"{normalized_label} {status} ({dut_id}/{service}): {reason}",
+                    "bold yellow" if status == "skip" else "bold red",
+                    soft_wrap=True,
+                )
             console.print("")  # Add spacing
 
-            failure_table = Table(title="Preflight Failure/Skip Details")
+            failure_table = Table(title=f"{normalized_label} Failure/Skip Details")
             failure_table.add_column("DUT", style="cyan", width=20)
             failure_table.add_column("Service", style="cyan", width=12)
             failure_table.add_column("Failure/Skip Reason")
@@ -780,9 +1148,14 @@ class ReportingEngine:
         """
         Log dependency check results table to console and DUT runtime logs.
 
+        The implementation uses ``dependency_results`` to log dependency check
+        results table to console and DUT runtime logs. Owned asynchronous work
+        is awaited before return, so completion does not leave an unobserved
+        task behind.
+
         Args:
-            dependency_results: Dictionary mapping DUT ID to list of dicts with keys:
-                'dependency', 'type', 'collector_id', 'collector_name', 'target'.
+            dependency_results: Mapping supplying fields for log dependency
+                check results table to console and DUT runtime logs.
         """
         # Filter to only show DUTs with missing dependencies
         duts_with_missing = {
@@ -807,25 +1180,39 @@ class ReportingEngine:
             missing_deps = duts_with_missing[dut_id]
 
             dep_table = Table(
-                title=f"Missing Dependencies — {dut_id}",
+                title="Dependency Issues — " f"{neutralize_terminal_text(dut_id)}",
                 title_style="bold red",
                 border_style="dim",
                 show_lines=True,
                 pad_edge=True,
             )
-            dep_table.add_column("Dependency", style="red", min_width=20)
-            dep_table.add_column("Type", style="yellow", min_width=10)
-            dep_table.add_column("Checked On", style="magenta", min_width=8)
-            dep_table.add_column("Collector", style="cyan", min_width=10)
-            dep_table.add_column("Collector Name", style="dim", min_width=20)
+            dep_table.add_column("Collector", style="cyan", overflow="fold")
+            dep_table.add_column("Dependency", style="red", overflow="fold")
+            dep_table.add_column("Status / Reason", ratio=2, overflow="fold")
 
+            sanitize = getattr(
+                getattr(self.logger, "sanitizer", None), "sanitize", None
+            )
             for dep in missing_deps:
+                reason = (
+                    sanitize_finalization_message(
+                        dep.get("reason", ""),
+                        sanitizer=sanitize if callable(sanitize) else None,
+                    )
+                    if dep.get("reason")
+                    else ""
+                )
+                result_label = (
+                    "Probe failed" if dep.get("status") == "error" else "Unavailable"
+                )
                 dep_table.add_row(
-                    dep["dependency"],
-                    dep["type"],
-                    dep["target"],
-                    dep["collector_id"],
-                    dep["collector_name"],
+                    _literal_table_text(
+                        f"{dep['collector_id']}\n{dep['collector_name']}"
+                    ),
+                    _literal_table_text(
+                        f"{dep['dependency']}\n{dep['type']} on {dep['target']}"
+                    ),
+                    _literal_table_text(f"{result_label}\n{reason}"),
                 )
 
             console.print(dep_table)
@@ -849,8 +1236,13 @@ class ReportingEngine:
         """
         Log preflight results to metadata.
 
+        The implementation uses ``preflight_results`` to log preflight results
+        to metadata. Owned asynchronous work is awaited before return, so
+        completion does not leave an unobserved task behind.
+
         Args:
-            preflight_results: Dictionary of preflight results per DUT.
+            preflight_results: Mapping supplying fields for log preflight
+                results to metadata.
         """
         for dut_id, dut_results in preflight_results.items():
             await self.logger.write_preflight_metadata(dut_id, dut_results)
@@ -859,7 +1251,8 @@ class ReportingEngine:
         """
         Create metadata files for each DUT.
 
-        Generates DUT-level metadata files with configuration and system information.
+        Generates DUT-level metadata files with configuration and system
+        information.
         """
         # Start timing for metadata creation
         if (
@@ -913,10 +1306,26 @@ class ReportingEngine:
                 and self.orchestrator
                 and hasattr(self.orchestrator, "timing_manager")
             ):
-                timing_summary = (
-                    self.orchestrator.timing_manager.get_timing_summary_for_metadata()
+                timing_manager = self.orchestrator.timing_manager
+                timing_reference_getter = getattr(
+                    type(timing_manager), "get_timing_reference_for_metadata", None
                 )
+                if callable(timing_reference_getter):
+                    timing_summary = timing_manager.get_timing_reference_for_metadata(
+                        dut_id
+                    )
+                else:
+                    # Compatibility for externally supplied timing managers.
+                    timing_getter = timing_manager.get_timing_summary_for_metadata
+                    try:
+                        timing_summary = timing_getter(dut_id=dut_id)
+                    except TypeError as exc:
+                        if "unexpected keyword argument 'dut_id'" not in str(exc):
+                            raise
+                        timing_summary = timing_getter()
                 if timing_summary:
+                    # Detailed operations and artifacts remain canonical in
+                    # .metadata/timing.json; metadata.json carries this index.
                     metadata["timing_data"] = timing_summary
 
             # Write metadata file

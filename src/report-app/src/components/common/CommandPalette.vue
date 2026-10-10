@@ -1,3 +1,20 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 <template>
   <Teleport to="body">
     <div v-if="open" @click.self="close" @keydown.escape="close" tabindex="-1" ref="overlayRef"
@@ -52,6 +69,7 @@
 <script setup lang="ts">
 import { ref, computed, watch, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
+import type { RouteLocationRaw } from 'vue-router'
 import { useSearch, type SearchResult } from '@/composables/useSearch'
 import { useThemeStore } from '@/stores/theme'
 import { useSearchStore } from '@/stores/search'
@@ -86,7 +104,7 @@ const placeholder = computed(() => {
   return 'Search files, collectors, DUTs... (> for commands)'
 })
 
-const filteredResults = computed<Array<SearchResult | { type: string; label: string; sublabel: string; path: string; action?: () => void }>>(() => {
+const filteredResults = computed<Array<SearchResult | { type: string; label: string; sublabel: string; path: RouteLocationRaw | ''; action?: () => void }>>(() => {
   const q = query.value.trim()
 
   // > prefix: commands

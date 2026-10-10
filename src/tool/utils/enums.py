@@ -13,11 +13,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 """
 Enums for the NVDebug Tool.
 
-This module defines enumerations used throughout the tool for type safety
-and standardization of values.
+This module defines enumerations used throughout the tool for type safety and
+standardization of values.
 """
 
 from enum import Enum
@@ -28,10 +29,6 @@ class DutExecutionMode(Enum):
     DUT execution modes.
 
     Defines where the tool is executed relative to the DUT.
-
-    Attributes:
-        LOCAL: Tool runs locally on the DUT.
-        REMOTE_CLIENT: Tool runs on remote client machine.
     """
 
     LOCAL = "Local"
@@ -44,9 +41,9 @@ class NetworkType(Enum):
 
     Defines the IP protocol version.
 
-    Attributes:
-        IPV4: IPv4 addressing.
-        IPV6: IPv6 addressing.
+    Its serialized members form a shared vocabulary for configuration, runtime
+    state, logs, and reports. Renaming or renumbering a member is therefore a
+    compatibility change.
     """
 
     IPV4 = "ipv4"
@@ -58,12 +55,6 @@ class CollectionLevel(Enum):
     Collection levels.
 
     Defines the depth/completeness of log collection.
-
-    Attributes:
-        L0: Special collectors - require explicit specification, may interrupt system/require reboot.
-        L1: Basic collection - minimal essential logs.
-        L2: Standard collection - typical debugging logs.
-        L3: Comprehensive collection - complete system dump.
     """
 
     L0 = "L0"  # Special collectors - only run when explicitly specified
@@ -115,7 +106,15 @@ class ResourceType(Enum):
 # Used for output pattern substitution (e.g., {chassis_id}, {system_id}, {task_id})
 # Note: Must be defined after ResourceType enum to reference its values
 def _create_entity_uri_mapping():
-    """Create the entity URI to placeholder mapping using ResourceType enum."""
+    """
+    Create the entity URI to placeholder mapping using ResourceType enum.
+
+    The implementation uses current instance state to create the entity URI to
+    placeholder mapping using ResourceType enum.
+
+    Returns:
+        A mapping from entity names to their canonical Redfish URI categories.
+    """
     return {
         # Core collections
         f"/{ResourceType.CHASSIS.value}/": "chassis_id",
@@ -144,13 +143,6 @@ class PreflightChecks(Enum):
     Options supported for preflight check.
 
     Defines the available preflight checks for verifying system readiness.
-
-    Attributes:
-        HOST: Host OS accessibility check.
-        REDFISH: Redfish service availability check.
-        IPMI: IPMI service availability check.
-        SSH: BMC SSH access check.
-        HMC: HMC service availability check.
     """
 
     HOST = "Host-OS"
@@ -169,13 +161,6 @@ class CollectorServiceMapping(Enum):
     Mapping from collector ID prefixes to service names.
 
     Provides utilities to map collector IDs and group names to service types.
-
-    Attributes:
-        REDFISH: Redfish API service.
-        IPMI: IPMI command service.
-        SSH: SSH access service.
-        HOST: Host system service.
-        HEALTH_CHECK: Health check service.
     """
 
     REDFISH = "redfish"
@@ -189,11 +174,15 @@ class CollectorServiceMapping(Enum):
         """
         Get service name from collector ID prefix.
 
+        The implementation uses ``collector_id`` to get service name from
+        collector ID prefix.
+
         Args:
-            collector_id (str): Collector ID string.
+            collector_id: Stable collector identifier used to correlate
+                configuration, logs, and results.
 
         Returns:
-            str: Service name or 'unknown'.
+            The canonical service from collector identifier text.
         """
         if not collector_id:
             return "unknown"
@@ -213,11 +202,15 @@ class CollectorServiceMapping(Enum):
         """
         Get service name from collector group name.
 
+        The implementation uses ``group_name`` to get service name from
+        collector group name.
+
         Args:
-            group_name (str): Collector group name.
+            group_name: Stable group name used for lookup and operator-facing
+                diagnostics.
 
         Returns:
-            str: Service name or 'unknown'.
+            The canonical service from group name.
         """
         if not group_name:
             return "unknown"
@@ -239,11 +232,15 @@ class CollectorServiceMapping(Enum):
         """
         Get display name from collector group name.
 
+        The implementation uses ``group_name`` to get display name from
+        collector group name.
+
         Args:
-            group_name (str): Collector group name.
+            group_name: Stable group name used for lookup and operator-facing
+                diagnostics.
 
         Returns:
-            str: Display name for the group.
+            The canonical display name from group name.
         """
         if not group_name:
             return "Unknown"
@@ -263,13 +260,17 @@ class CollectorServiceMapping(Enum):
 
 def get_preflight_enum_from_service(service_name: str) -> PreflightChecks:
     """
-    Get preflight check enum from service name
+    Get preflight check enum from service name.
+
+    After applying local validation, the function forwards ``service_name`` to
+    ``service_mapping.get`` and preserves its return and exception contract.
 
     Args:
-        service_name: Service name (e.g., "redfish", "ipmi", "ssh", "host", "health_check")
+        service_name: Stable service name used for lookup and operator-facing
+            diagnostics.
 
     Returns:
-        PreflightChecks enum value
+        A ``PreflightChecks`` representing preflight enum from service.
     """
     service_mapping = {
         CollectorServiceMapping.REDFISH.value: PreflightChecks.REDFISH,
@@ -285,8 +286,11 @@ def get_main_preflight_names() -> list:
     """
     Get list of main preflight check names.
 
+    The implementation uses current instance state to get list of main preflight
+    check names.
+
     Returns:
-        list: List of preflight check enum names.
+        The main preflight names returned in operation-defined order.
     """
     return [
         PreflightChecks.HOST.name,

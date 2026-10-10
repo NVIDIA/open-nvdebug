@@ -1,3 +1,20 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 <template>
   <div style="min-height: calc(100vh - 88px);">
     <div class="nv-sidebar"><AnalysisNav /></div>
@@ -10,8 +27,12 @@
           Identifies collectors that frequently fail together across DUTs, suggesting shared root causes.
         </p>
 
+        <div v-if="result.limited" class="cf-limit nv-glass--accent" role="alert">
+          {{ result.limitReason }}
+        </div>
+
         <!-- Empty state -->
-        <div v-if="result.clusters.length === 0 && result.pairs.length === 0" class="nv-glass" style="padding: 40px; text-align: center; border-radius: var(--nv-radius-lg);">
+        <div v-if="!result.limited && result.clusters.length === 0 && result.pairs.length === 0" class="nv-glass" style="padding: 40px; text-align: center; border-radius: var(--nv-radius-lg);">
           <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="var(--nv-success)" stroke-width="1.5" stroke-linecap="round" style="margin-bottom: 12px;">
             <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/>
           </svg>
@@ -19,7 +40,7 @@
           <p style="font-size: 0.8125rem; color: var(--nv-text-secondary); margin: 0;">No collector pairs consistently fail together across multiple DUTs.</p>
         </div>
 
-        <template v-else>
+        <template v-else-if="!result.limited">
           <!-- Failure Clusters -->
           <div v-if="result.clusters.length > 0" style="margin-bottom: 24px;">
             <h3 class="nv-section-title" style="margin-bottom: 12px;">
@@ -46,7 +67,7 @@
                 </div>
                 <div>
                   <strong style="font-size: 0.6875rem; color: var(--nv-text-tertiary);">Affected DUTs:</strong>
-                  <span v-for="d in cl.dutIds" :key="d" class="cf-dut-link" @click="router.push(`/dut/${encodeURIComponent(d)}`)">{{ d }}</span>
+                  <span v-for="d in cl.dutIds" :key="d" class="cf-dut-link" @click="router.push(dutRoute(d))">{{ d }}</span>
                 </div>
               </div>
             </div>
@@ -85,13 +106,16 @@ import Breadcrumbs from '@/components/common/Breadcrumbs.vue'
 import PageLoader from '@/components/common/PageLoader.vue'
 import DataTable from '@/components/common/DataTable.vue'
 import AnalysisNav from '@/components/common/AnalysisNav.vue'
+import { dutRoute } from '@/utils/reportRoutes'
 
 const router = useRouter()
 const manifestStore = useManifestStore()
 const expandedClusters = ref(new Set<number>())
 
 const result = computed(() =>
-  manifestStore.manifest ? analyzeCoFailures(manifestStore.manifest) : { pairs: [], clusters: [] }
+  manifestStore.manifest
+    ? analyzeCoFailures(manifestStore.manifest)
+    : { pairs: [], clusters: [], limited: false, limitReason: null }
 )
 
 function toggleCluster(id: number) {
@@ -121,6 +145,14 @@ const pairRows = computed(() =>
 </script>
 
 <style scoped>
+.cf-limit {
+  padding: 12px 14px;
+  margin-bottom: 16px;
+  border: 1px solid var(--nv-warning);
+  border-radius: var(--nv-radius-md);
+  color: var(--nv-text-primary);
+  font-size: 0.8125rem;
+}
 .cf-cluster {
   border-radius: var(--nv-radius-lg);
   margin-bottom: 10px;

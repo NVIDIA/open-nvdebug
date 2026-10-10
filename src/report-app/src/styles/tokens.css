@@ -1,3 +1,20 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 /* ============================================
    NVIDIA NVDebug Report — Design System Tokens
    Kaizen-Aligned · Modern Glass UI
@@ -147,6 +164,7 @@
   --nv-info: #2378ca;            /* feedbackFgInfo */
   --nv-info-muted: rgba(35, 120, 202, 0.15);
   --nv-info-bg: #cde6fa;         /* feedbackBgInfo */
+  --nv-action-view: #8ac6ff;     /* navigation controls on dark surfaces */
 
   /* ── Shadows (Kaizen dark elevation) ── */
   --nv-shadow-xs: 0 1px 3px rgba(0, 0, 0, 0.40);
@@ -267,6 +285,7 @@
   --nv-info: #2378ca;            /* feedbackFgInfo */
   --nv-info-muted: rgba(35, 120, 202, 0.10);
   --nv-info-bg: #e9f4fb;         /* feedbackBgInfo light */
+  --nv-action-view: #155c9e;     /* navigation controls on light surfaces */
 
   /* ── Shadows (Kaizen light elevation) ── */
   --nv-shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.04);

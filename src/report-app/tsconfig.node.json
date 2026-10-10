@@ -3,8 +3,9 @@
   "compilerOptions": {
     "composite": true,
     "allowJs": true,
+    "allowImportingTsExtensions": true,
     "module": "ESNext",
     "types": ["node"]
   },
-  "include": ["vite.config.ts"]
+  "include": ["vite.config.ts", "singleFileReportPlugin.ts"]
 }

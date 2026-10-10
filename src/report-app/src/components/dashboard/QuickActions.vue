@@ -1,11 +1,32 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 <template>
   <div class="nv-card">
     <h4 class="nv-section-title" style="margin-bottom: 12px;">Quick Actions &amp; Tools</h4>
 
-    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 16px;">
+    <div class="qa-tools">
       <router-link to="/timing" class="qa-link">
         <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="7" stroke="currentColor" stroke-width="1.5"/><path d="M8 4v4l3 2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
         Timing Analysis
+      </router-link>
+      <router-link to="/resources" class="qa-link">
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M2 13V8m4 5V3m4 10V6m4 7V1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+        Resource Usage
       </router-link>
       <router-link to="/file-map" class="qa-link">
         <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M2 2h5l2 2h5v10H2V2z" stroke="currentColor" stroke-width="1.5"/></svg>
@@ -27,28 +48,34 @@
         <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><circle cx="4" cy="4" r="2" stroke="currentColor" stroke-width="1.5"/><circle cx="12" cy="12" r="2" stroke="currentColor" stroke-width="1.5"/><path d="M6 6l4 4" stroke="currentColor" stroke-width="1.5"/></svg>
         Dependencies
       </router-link>
+      <router-link to="/coredumps" class="qa-link">
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M3 2h10v12H3V2zM5 5h6M5 8h6M5 11h3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" /></svg>
+        BMC Core Dump Handoff
+      </router-link>
     </div>
 
-    <h6 class="qa-section-label">Runtime Logs</h6>
-    <div style="display: flex; flex-direction: column; gap: 4px;">
-      <template v-if="runtimeLogFiles.length > 0">
-        <div v-for="group in groupedRuntimeLogs" :key="group.dutId">
-          <div v-if="group.dutId" style="font-size: 0.6875rem; color: var(--nv-text-tertiary); margin: 6px 0 2px; text-transform: uppercase; letter-spacing: 0.04em;">
-            {{ group.dutId }}
+    <details class="qa-runtime-logs">
+      <summary class="qa-section-label">Runtime Logs ({{ runtimeLogFiles.length }})</summary>
+      <div class="qa-runtime-logs__groups">
+        <template v-if="runtimeLogFiles.length > 0">
+          <div v-for="group in groupedRuntimeLogs" :key="group.dutId" class="qa-runtime-logs__group">
+            <div v-if="group.dutId" style="font-size: 0.6875rem; color: var(--nv-text-tertiary); margin: 6px 0 2px; text-transform: uppercase; letter-spacing: 0.04em;">
+              {{ group.dutId }}
+            </div>
+            <router-link
+              v-for="file in group.files"
+              :key="file.path"
+              :to="`/file/${encodeURIComponent(file.path)}`"
+              class="qa-file-link"
+            >
+              <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2 1h5l3 3v7H2V1z" stroke="currentColor" stroke-width="1"/></svg>
+              {{ file.label }}
+            </router-link>
           </div>
-          <router-link
-            v-for="file in group.files"
-            :key="file.path"
-            :to="`/file/${encodeURIComponent(file.path)}`"
-            class="qa-file-link"
-          >
-            <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2 1h5l3 3v7H2V1z" stroke="currentColor" stroke-width="1"/></svg>
-            {{ file.label }}
-          </router-link>
-        </div>
-      </template>
-      <span v-else style="font-size: 0.75rem; color: var(--nv-text-tertiary);">No runtime logs found</span>
-    </div>
+        </template>
+        <span v-else style="font-size: 0.75rem; color: var(--nv-text-tertiary);">No runtime logs found</span>
+      </div>
+    </details>
   </div>
 </template>
 
@@ -115,6 +142,27 @@ const groupedRuntimeLogs = computed(() => {
 </script>
 
 <style scoped>
+.qa-tools {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 210px), 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.qa-runtime-logs {
+  border-top: 1px solid var(--nv-glass-border);
+  padding-top: 12px;
+}
+.qa-runtime-logs summary { cursor: pointer; }
+.qa-runtime-logs__groups {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr));
+  align-items: start;
+  gap: 12px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+.qa-runtime-logs__group { min-width: 0; overflow-wrap: anywhere; }
+.qa-file-link svg { flex-shrink: 0; }
 .qa-link {
   display: flex;
   align-items: center;

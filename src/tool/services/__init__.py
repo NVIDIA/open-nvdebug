@@ -17,12 +17,13 @@
 Services module for the NVDebug Tool.
 
 This module provides service implementations for different collection methods:
-    - BaseService: Abstract base class for all services
-    - RedfishService: Redfish API data collection
-    - IPMIService: IPMI-based log collection
-    - HostService: Host system data collection
-    - BMCSSHService: BMC SSH access service
-    - HealthCheckService: System health verification
+
+- BaseService: Abstract base class for all services.
+- RedfishService: Redfish API data collection.
+- IPMIService: IPMI-based log collection.
+- HostService: Host system data collection.
+- BMCSSHService: BMC SSH access service.
+- HealthCheckService: System health verification.
 """
 
 # Import services individually to avoid circular imports
