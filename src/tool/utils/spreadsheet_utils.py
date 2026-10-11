@@ -149,6 +149,9 @@ def _config_search_dirs() -> list[Path]:
     1. CWD/config (original behaviour).
     2. Directory containing the binary + /config (frozen mode).
     3. get_base_path()/config (frozen extraction dir).
+    4. The installed package's config directory when a non-frozen invocation
+       has no working-directory catalog. Packaged data must not hide an operator's
+       local catalog merely because the packaged version number is higher.
 
     Returns:
         The validated ``dirs``.
@@ -161,6 +164,10 @@ def _config_search_dirs() -> list[Path]:
             dirs.append(binary_dir)
         if base_dir not in dirs:
             dirs.append(base_dir)
+    elif not any(dirs[0].glob("Telemetry_Catalog_*.xlsx")):
+        packaged = Path(__file__).resolve().parents[1] / "config"
+        if packaged.is_dir():
+            dirs.append(packaged)
     return dirs
 
 

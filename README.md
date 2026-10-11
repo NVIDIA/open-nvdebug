@@ -64,6 +64,26 @@ dependencies through `requirements-build.lock`. The report build installs its
 JavaScript dependencies from `src/report-app/package-lock.json` and generates the
 validated assets required for collection. Installation requires internet access.
 
+### Install the Python command
+
+After the setup above, install the application into the active virtual environment:
+
+```shell
+python -m pip install --no-build-isolation .
+python -m pip check
+nvdebug --help
+nvdebug list-baseboards
+nvdebug list-collectors
+```
+
+The installed `nvdebug` command works outside the checkout without `PYTHONPATH`.
+Its wheel includes the catalog, default configuration, and validated report assets.
+`pyproject.toml` declares the runtime dependencies and console entry point;
+`requirements.txt` supplies the pinned runtime and build environment. With setup
+complete, `make install` rebuilds report assets and installs the command in one step.
+Plain `python -m pip install .` also works after `make build-report-app`, using
+pip's isolated Python build environment. Package builds do not run npm themselves.
+
 ### Run with Python
 
 Keep the virtual environment active and run from the repository root:
@@ -189,6 +209,11 @@ For Python source runs, start from `default_config/dut_config.yaml` and
 `nvdebug`, with the Telemetry Catalog in `config/`. After extracting the binary
 archive, run `./nvdebug` from its versioned directory. Use `--dut-config`,
 `--tool-config`, or `--spreadsheet` to select a particular file explicitly.
+
+For an installed Python package, copy the templates from the checkout or access
+them with `importlib.resources.files("tool").joinpath("default_config")`. Keep
+operator configuration outside the installed package and select it with the same
+CLI options. Packaged defaults are fallbacks for trusted operator configuration.
 
 Keep credentials empty in any file that may be shared and provide them through
 the documented environment variables where practical. Relevant variables include:
