@@ -1,0 +1,80 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[build-system]
+requires = ["setuptools==83.0.0"]
+build-backend = "package_backend"
+backend-path = ["build_scripts"]
+
+[project]
+name = "open-nvdebug"
+dynamic = ["version"]
+description = "Collect diagnostic data from NVIDIA server platforms"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["License.txt", "Third-party-licenses.md"]
+requires-python = ">=3.12,<3.13"
+authors = [{name = "NVIDIA"}]
+classifiers = [
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Hardware",
+]
+dependencies = [
+    "typer>=0.18.0,<0.26",
+    "click>=8.3.3,<8.4",
+    "rich>=13.0.0,<16.0",
+    "pydantic>=2.4.0,<3.0",
+    "pydantic-settings>=2.14.2,<3.0",
+    "PyYAML>=6.0,<7.0",
+    "python-dotenv>=1.0.0,<2.0",
+    "httpx>=0.24.0,<1.0",
+    "asyncssh[bcrypt]>=2.23.0,<3.0",
+    "aiohttp>=3.14.3,<4.0",
+    "psutil>=5.9.0,<8.0",
+    "aiofiles>=23.0.0,<26.0",
+    "openpyxl>=3.1.0,<4.0",
+    "defusedxml>=0.7.1,<1.0",
+    "jinja2>=3.1.6,<4.0",
+    "markdown>=3.4.0,<4.0",
+    "colorama>=0.4.6,<1.0",
+    "tqdm>=4.66.3,<5.0",
+    "tabulate>=0.9.0,<1.0",
+    "requests>=2.33.0,<3.0",
+    "anyio>=4.14.2,<5.0",
+    "cryptography>=50.0.0,<51.0",
+    "idna>=3.15,<4.0",
+    "multidict>=6.9.1,<7.0",
+    "pygments>=2.20.0,<3.0",
+    "urllib3>=2.8.0,<3.0",
+    "certifi>=2024.2.2,<2027.0",
+    "zstandard>=0.22.0,<1.0",
+]
+
+[project.scripts]
+nvdebug = "tool.main:cli"
+
+[project.urls]
+Repository = "https://github.com/NVIDIA/open-nvdebug"
+Issues = "https://github.com/NVIDIA/open-nvdebug/issues"
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["tool", "tool.*"]
+namespaces = false
+
+[tool.setuptools.dynamic]
+version = {attr = "tool.version.__version__"}
+
+[tool.setuptools.package-data]
+tool = [
+    "config/Telemetry_Catalog_v*.xlsx",
+    "default_config/dut_config.yaml",
+    "default_config/tool_config.yaml",
+    "report_app_dist/*",
+    "report_app_dist/.gitkeep",
+    "report_app_dist/**/*",
+]

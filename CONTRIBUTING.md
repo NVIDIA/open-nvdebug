@@ -69,6 +69,24 @@ python -m src.tool.main --help
 python -m src.tool.main list-baseboards
 ```
 
+To install the Python command after setup, run `make install`. The resulting
+`nvdebug` command is available while the virtual environment is active, including
+outside this checkout. Python package metadata lives in `pyproject.toml`; keep its
+runtime requirements compatible with the pinned `requirements-build.lock`.
+
+To build an installable wheel after `make build-report-app`:
+
+```bash
+python -m pip wheel --no-deps --no-build-isolation . --wheel-dir dist/python
+```
+
+The package backend stages only files named by `PUBLIC_SOURCE_SHA256SUMS` plus
+validated report assets. Local edits to listed files are supported; new source
+paths must be included in the export inventory. Wheels include runtime resources;
+source distributions also include the authored report sources and built assets so
+their wheels can be built without Node.js. Test installed wheels from an empty
+directory outside the checkout, including catalog listing and report validation.
+
 Report changes should pass `make report-app-ci`, which audits dependencies, lints,
 tests, and builds the application. Run `make audit-report-app` for a dependency
 audit alone. Binary builds validate that report assets match the source tree.

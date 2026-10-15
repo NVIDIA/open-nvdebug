@@ -15,12 +15,13 @@
 
 PYTHON ?= python3.12
 .DEFAULT_GOAL := help
-.PHONY: help setup build build-report-app test-report-app lint-report-app audit-report-app report-app-ci
+.PHONY: help setup install build build-report-app test-report-app lint-report-app audit-report-app report-app-ci
 # These targets share node_modules and generated report assets.
 .NOTPARALLEL:
 
 help:
 	@echo 'setup            Create .venv and install pinned public build dependencies'
+	@echo 'install          Build report assets and install the nvdebug Python command'
 	@echo 'build            Build report assets and a native Linux package in dist/<arch>/'
 	@echo 'build-report-app Build validated report assets for running from source'
 	@echo 'audit-report-app Check locked report dependencies for known vulnerabilities'
@@ -32,6 +33,9 @@ setup:
 
 build: build-report-app
 	$(PYTHON) -I scripts/build_binary.py
+
+install: build-report-app
+	$(PYTHON) -m pip install --no-build-isolation .
 
 build-report-app:
 	@bash scripts/build_report_app.sh

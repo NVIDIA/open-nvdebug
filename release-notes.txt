@@ -27,6 +27,8 @@ Release Highlights
   Vera Rubin NVL72, and Vera Rubin NVL72-N6100-LD.
 - Complete pinned Python 3.12 installation and corrected source module startup
   and catalog-listing commands.
+- Added Python package metadata and an installed ``nvdebug`` command, including
+  the catalog, default configuration, and validated report assets.
 - Added native Linux amd64/arm64 build scripts that package the catalog,
   default configuration, and validated report application for local use.
 - Updated report dependencies to resolve known security advisories and added
@@ -39,6 +41,8 @@ For source execution, install requirements.txt in a Python 3.12 virtual
 environment and run ``make build-report-app`` before collecting data. The
 README documents both ``python -m src.tool.main`` and the locally built
 ``nvdebug`` executable, including startup and catalog checks.
+After preparing the source environment, ``make install`` installs the Python
+command for use outside the checkout. See the README for pip installation.
 
 Existing 2.x ``config.yaml`` discovery and documented field aliases,
 ``execution_scheduler=legacy_global``, ``report_format=legacy`` and

@@ -367,12 +367,14 @@ def _find_config_files(
     filenames: Tuple[str, ...], *, rejections: dict[Path, str] | None = None
 ) -> Tuple[Optional[Path], ...]:
     """
-    Discover trusted operator configuration before frozen packaged defaults.
+    Discover trusted operator configuration before packaged defaults.
 
     External search roots retain their established order. Frozen extraction
     files are fallback templates, so they cannot hide an operator's DUT targets
     or tool settings. Source-tree discovery is limited to development runs;
     catalog/resource discovery uses its separate package-integrity boundary.
+    Installed wheels keep defaults in the package's ``default_config`` directory;
+    these templates are consulted only after all operator search roots.
 
     Args:
         filenames: Configuration basenames to resolve independently.
@@ -474,12 +476,16 @@ def _find_config_files(
         if config_paths[index] is not None:
             continue
 
-        try:
-            config_paths[index] = _discover_config_file(
-                Path(ResourceManager.get_resource_path("tool", filename)), rejections
-            )
-        except (FileNotFoundError, ModuleNotFoundError):
-            pass
+        for resource_name in (f"default_config/{filename}", filename):
+            try:
+                config_paths[index] = _discover_config_file(
+                    Path(ResourceManager.get_resource_path("tool", resource_name)),
+                    rejections,
+                )
+            except (FileNotFoundError, ModuleNotFoundError):
+                continue
+            if config_paths[index] is not None:
+                break
 
     return tuple(config_paths)
 
